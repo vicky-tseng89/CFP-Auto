@@ -6,6 +6,7 @@ __pycache__/
 
 # Jupyter Notebook 檔案（可視需求決定是否忽略）
 .ipynb_checkpoints/
+*.ipynb
 
 # Excel 或暫存檔
 *.xlsx
@@ -13,6 +14,11 @@ __pycache__/
 *.xlsb
 *.xls
 *.csv
+
+# 圖片檔
+*.ico
+*.gif
+*.jpg
 
 # Windows 常見暫存
 Thumbs.db
