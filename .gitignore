@@ -1,0 +1,31 @@
+# Python 常見忽略
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter Notebook 檔案（可視需求決定是否忽略）
+.ipynb_checkpoints/
+
+# Excel 或暫存檔
+*.xlsx
+*.xlsm
+*.xlsb
+*.xls
+*.csv
+
+# Windows 常見暫存
+Thumbs.db
+~$*
+
+# PyInstaller 打包生成的 exe/暫存目錄
+dist/
+build/
+*.spec
+
+# IDE 或編輯器的設定
+.vscode/
+.idea/
+
+# 作業系統暫存
+.DS_Store
