@@ -78,8 +78,8 @@ class ExcelApp:
             sheet_F_tables = self.read_multiple_tables('Usage', self.file_path)
             
             self.update_progress_smooth(10, 40, step=1, delay=0.05) # 階段2：讀取工作表B，處理工作表並計算數值，模擬進度從 10% 到 40%
-            # 以 pandas 讀入另一張關鍵對照表（sheet_B，如 simapro9.3）
-            sheet_B = pd.read_excel(self.file_path, sheet_name='simapro9.3', usecols=['單位對照', 'fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)', 'unit']).dropna(subset=['單位對照'])
+            # 以 pandas 讀入另一張關鍵對照表（sheet_B，如 simapro10.2.0.0）
+            sheet_B = pd.read_excel(self.file_path, sheet_name='simapro10.2.0.0', usecols=['單位對照', 'fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)', 'unit']).dropna(subset=['單位對照'])
             self.status_callback("處理工作表並獲取總值...")
             print("處理工作表並獲取總值...")
             total_A = self.process_tables(sheet_A_tables, 'Raw Material', 'W', result_workbook, sheet_B)
@@ -619,7 +619,7 @@ class ExcelApp:
                               IgnoreReadOnlyRecommended=True)
             wb_new = excel.Workbooks.Open(new_file_path, CorruptLoad=1)
             print("============2============")
-            static_sheets = ['Instruction', 'overview', 'Process flow chart', 'simapro9.3']
+            static_sheets = ['Instruction', 'overview', 'Process flow chart', 'simapro10.2.0.0']
             for sheet_name in static_sheets:
                 try:
                     # 把範本的這張 Copy 到新檔，放在第一張動態頁前面
@@ -1426,7 +1426,7 @@ class ExcelApp:
             self.context[f'Manufacturing_percentage_{i}']        = ""
 
 
-        remaining_val = Manu_data['Damage Assessment'][10:].sum()
+        remaining_val = round(Manu_data['Damage Assessment'][10:].sum(), 4)
         self.context['Remaining_processes_2'] = remaining_val
         total_dmg = Manu_data['Damage Assessment'].sum()
         if total_dmg > 0:
