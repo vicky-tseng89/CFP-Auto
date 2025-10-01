@@ -18,14 +18,16 @@ import time
 import tkinter as tk
 import win32com.client as win32
 import xlsxwriter
-
-
+from openpyxl.styles.colors import Color
+import traceback
 
 class ExcelApp:
     def __init__(self, status_callback=None, progress_callback=None):
         self.status_callback = status_callback
         self.progress_callback = progress_callback
         self.file_path = None
+        self.last_error = None
+        self.error_callback = None
         self._format_cache = {}
         # ──────────────────────────────────────────────────────────
         # 自動在程式路徑下建立「結果」資料夾
@@ -85,8 +87,9 @@ class ExcelApp:
             total_A = self.process_tables(sheet_A_tables, 'Raw Material', 'W', result_workbook, sheet_B)
             total_C = self.process_tables(sheet_C_tables, 'Manufacturing', 'W', result_workbook, sheet_B)
             total_D = self.process_tables(sheet_D_tables, 'Distribution', 'U', result_workbook, sheet_B)
-            total_E = self.process_tables(sheet_E_tables, 'Recycling', 'Q', result_workbook, sheet_B)
-            total_F = self.process_tables(sheet_F_tables, 'Usage', 'Q', result_workbook, sheet_B)
+            total_E = self.process_tables(sheet_F_tables, 'Usage', 'Q', result_workbook, sheet_B)
+            total_F = self.process_tables(sheet_E_tables, 'Recycling', 'Q', result_workbook, sheet_B)
+
 
             self.update_progress_smooth(40, 70, step=1, delay=0.02) # 階段3：更新報告模板，模擬進度從 40% 到 70%
             self.status_callback("讀取報告模板並寫入計算的數值...")
@@ -126,28 +129,57 @@ class ExcelApp:
 
         #    3. 用 Excel COM 自動修復並輸出最終結果
             pythoncom.CoInitialize()
-            excel = DispatchEx("Excel.Application")
-            excel.Visible = False  # 背後跑就好
-            excel.DisplayAlerts = False
-            # CorruptLoad=1: 自動嘗試修復任何架構問題；UpdateLinks=0: 不更新外部連結
-            com_wb = excel.Workbooks.Open(
-                os.path.abspath(self.result_file),
-                CorruptLoad=1,
-                UpdateLinks=0,
-                ReadOnly=False
-            )           
-            com_wb.Save() 
-            com_wb.Close(False)
-            excel.Quit()
+            try:
+                excel = DispatchEx("Excel.Application")
+                excel.Visible = False
+                excel.DisplayAlerts = False
+                excel.EnableEvents = False
 
-            if self.update_progress_smooth: # 更新進度至 100%
-                self.update_progress_smooth(95, 100, step=1, delay=0.05)
-            messagebox.showinfo("完成", f"完成合併並計算碳排數值，結果已保存為 {self.result_file} 和 {self.report_file}")
-            return True   # 告知呼叫方：成功
-        except Exception as e:
-            messagebox.showerror("錯誤", f"處理文件時出錯：{e}")
-            print(f"處理文件時出錯：{e}")
-            return False  # 告知呼叫方：失敗``
+                path = os.path.abspath(self.result_file)
+                # CorruptLoad=1: 自動嘗試修復任何架構問題；UpdateLinks=0: 不更新外部連結
+                # 小延遲 + 確認檔案存在
+                for _ in range(5):
+                    if os.path.exists(path):
+                        try:
+                            com_wb = excel.Workbooks.Open(
+                                path,
+                                CorruptLoad=1,
+                                UpdateLinks=0,
+                                ReadOnly=False,
+                                IgnoreReadOnlyRecommended=True
+                            )
+                            break     
+                        except Exception:
+                            time.sleep(0.3)
+                    time.sleep(0.2)
+
+                if com_wb is None:
+                    raise RuntimeError(f"Excel 無法開啟結果檔：{path}")  
+                excel.CalculateUntilAsyncQueriesDone()                
+                com_wb.Save() 
+
+                if self.update_progress_smooth: # 更新進度至 100%
+                    self.update_progress_smooth(95, 100, step=1, delay=0.05)
+                return {"ok": True, "result_file": self.result_file, "report_file": self.report_file}
+            
+            except Exception as e:
+                print(f"處理文件時出錯：{e}")
+            return {"ok": False, "error": str(e)}  # 告知呼叫方：失敗``
+        
+        finally:
+            try:
+                if com_wb: com_wb.Close(False)
+            except Exception:
+                pass
+            try:
+                if excel: excel.Quit()
+            except Exception:
+                pass
+    pythoncom.CoUninitialize()
+
+
+
+
 
     def read_multiple_tables(self, sheet_name, file_path):
         """
@@ -192,6 +224,13 @@ class ExcelApp:
         total_biogenic = 0
         total_land_transformation = 0
         for i, (start_idx, sheet_data) in enumerate(sheet_tables):
+            required_cols = ['name of database']
+            missing = [c for c in required_cols if c not in sheet_data.columns]
+            if missing:
+                raise ValueError(
+                    f"【{sheet_name} 第 {i+1} 個表格】缺少必要欄位: {missing}。\n"
+                    f"實際欄位有: {list(sheet_data.columns)}"
+                )
             # 使用 merge 函數來進行類似 VLOOKUP 的合併
             merged_df = sheet_data.merge(sheet_B, left_on='name of database', right_on='單位對照', how='left', suffixes=('', '_y'))
 
@@ -205,8 +244,11 @@ class ExcelApp:
             elif sheet_name in ['Recycling', 'Usage'] and 'total amount' in sheet_data.columns:
                 quantity_column = 'total amount'
             else:
-                raise ValueError("表格中缺少必要的計算欄位 ('total'、'Ton‧Km'、'consumed amount allocated to single product (energy/product unit)'或 'total amount')")
-            
+                raise ValueError(            
+                    f"【{sheet_name} 第 {i+1} 個表格】缺少必要的數量欄位。\n"
+                    f"需包含 'total'、'Ton‧Km'、'consumed amount allocated to single product (energy/product unit)' 或 'total amount'。\n"
+                    f"實際欄位有: {list(sheet_data.columns)}"
+                )
             # 判斷工作表和工作表B的單位是否一致
             for idx, row in merged_df.iterrows():
                 if pd.notna(row['Unit']) and pd.notna(row['unit']):
@@ -316,12 +358,35 @@ class ExcelApp:
                     insert_positions.append(row_num - 1) # 轉換成 xlsxwriter 0起始索引
                     break
         return insert_positions
+    
 
+
+    def _hex6_from_openpyxl_color(self, col) -> str | None:
+        """
+        將 openpyxl 的 Color 物件或 rgb 值安全轉為 '#RRGGBB'，失敗回傳 None
+        """
+        if not col:
+            return None
+        # col 可能是 Color，也可能直接是字串/ RGB 物件
+        raw = col.rgb if isinstance(col, Color) else col
+        if raw is None:
+            return None
+        s = str(raw).strip()        # 有些情況是 RGB 物件，轉字串最保險
+        if len(s) == 8:     # ARGB → RGB
+            s = s[2:]
+        # 也可能本來就 6 碼；若有 '#', 去掉
+        if s.startswith('#'):
+            s = s[1:]
+        if re.fullmatch(r'[0-9A-Fa-f]{6}', s):
+            return f'#{s}'
+        return None
+    
     def get_format_dict(self, cell):
         """
         讀取 openpyxl cell 的字體與填充設定，並轉換為 xlsxwriter 格式字典
         """
         fmt = {}
+        # ---------- 字體 ----------
         font = cell.font
         if font.name:
             fmt['font_name'] = font.name
@@ -331,74 +396,152 @@ class ExcelApp:
             fmt['bold'] = True
         if font.italic:
             fmt['italic'] = True
+        if font.strike:
+            fmt['font_strikeout'] = True
 
-        # 處理字體顏色：只接受 6 碼 hex
-        if font.color and font.color.rgb:
-            c = font.color.rgb
-            if isinstance(c, str):
-                # ARGB 轉成 RGB
-                if len(c) == 8:
-                    c = c[2:]
-                # 檢查是否真的是 6 個 0-9A-F
-                if re.fullmatch(r'[0-9A-Fa-f]{6}', c):
-                    fmt['font_color'] = f'#{c}'
+        # 底線：openpyxl 可能是 'single' / 'double' / 'singleAccounting' / 'doubleAccounting' / True
+        if font.underline:
+            ul = str(font.underline).lower()
+            if ul in ('single', 'true'):
+                fmt['underline'] = 1            # xlsxwriter 單底線
+            elif ul == 'double':
+                fmt['underline'] = 'double'
+            elif ul == 'singleaccounting':
+                fmt['underline'] = 'single_accounting'
+            elif ul == 'doubleaccounting':
+                fmt['underline'] = 'double_accounting'
+            else:
+                fmt['underline'] = 1
+        # 字體顏色
+        col = self._hex6_from_openpyxl_color(font.color)
+        if col:
+            fmt['font_color'] = col
 
-        # 處理背景色（solid 填充）
+        # 背景色
+        # ---------- 填充（僅處理 solid） ----------
         fill = cell.fill
-        if fill.fill_type == 'solid' and fill.fgColor and fill.fgColor.rgb:
-            c = fill.fgColor.rgb
-            if isinstance(c, str):
-                if len(c) == 8:
-                    c = c[2:]
-                if re.fullmatch(r'[0-9A-Fa-f]{6}', c):
-                    fmt['bg_color'] = f'#{c}'
+        if getattr(fill, 'fill_type', None) == 'solid':
+            c = self._hex6_from_openpyxl_color(fill.fgColor)
+            if c:
+                fmt['bg_color'] = c
+                fmt['pattern'] = 1  # xlsxwriter 設 bg_color 通常也要給 pattern
 
-        # 對齊
+        # ---------- 對齊 ----------
+        # 水平對齊：mapping 到 xlsxwriter
         h = cell.alignment.horizontal
-        if h in ('left','center','right','fill','justify','center_across'):
-            fmt['align'] = h
-        v = cell.alignment.vertical
-        if v in ('top','bottom','center','distributed','justify'):
-            fmt['valign'] = v
-        if cell.alignment.wrap_text:
-            fmt['text_wrap'] = True
+        if h:
+            h_map = {
+                'general': None,
+                'left': 'left',
+                'center': 'center',
+                'centercontinuous': 'center_across',  # Excel 的 centerContinuous
+                'right': 'right',
+                'fill': 'fill',
+                'justify': 'justify',
+                'distributed': 'distributed',
+            }
+            h_xl = h_map.get(h.lower())
+            if h_xl:
+                fmt['align'] = h_xl
 
-        # # —————— 新增：邊框設定 ——————
-        # b = cell.border
-        # # 判斷四邊是否同樣 style，若是就用簡單 'border'
-        # styles = {b.left.style, b.right.style, b.top.style, b.bottom.style}
-        # # openpyxl style 可能是 'thin','medium','dashed'…，只要非 None 就取出
-        # style_map = {
-        #     'thin': 1, 'medium': 2, 'thick': 4,
-        #     # 如果有更多需求可擴充對應
-        # }
-        # # 同邊框
-        # if len(styles) == 1 and None not in styles:
-        #     sty = styles.pop()
-        #     fmt['border'] = style_map.get(sty, 1)
-        #     # 邊框顏色（若都有同色可讀出）
-        #     color = b.left.color
-        #     if color and color.rgb:
-        #         c = color.rgb
-        #         if isinstance(c, str) and len(c) in (6,8):
-        #             c = c[-6:]
-        #             fmt['border_color'] = f'#{c}'
-        # else:
-        #     # 若四邊不同，就分別處理
-        #     if b.top.style:
-        #         fmt['border_top'] = style_map.get(b.top.style, 1)
-        #     if b.bottom.style:
-        #         fmt['border_bottom'] = style_map.get(b.bottom.style, 1)
-        #     if b.left.style:
-        #         fmt['border_left'] = style_map.get(b.left.style, 1)
-        #     if b.right.style:
-        #         fmt['border_right'] = style_map.get(b.right.style, 1)
-        #     # 可同時讀色
-        #     if b.top.color and b.top.color.rgb:
-        #         c = b.top.color.rgb[-6:]
-        #         fmt['border_color'] = f'#{c}'
+        # 垂直對齊：xlsxwriter 使用 vcenter/vjustify/vdistributed
+        v = cell.alignment.vertical
+        if v:
+            v_map = {
+                'top': 'top',
+                'center': 'vcenter',
+                'bottom': 'bottom',
+                'justify': 'vjustify',
+                'distributed': 'vdistributed',
+            }
+            v_xl = v_map.get(v.lower())
+            if v_xl:
+                fmt['valign'] = v_xl
+
+        # 自動換行（openpyxl 可能是 wrap_text 或 wrapText）
+        wrap_val = getattr(cell.alignment, 'wrap_text', None)
+        if wrap_val is None:
+            wrap_val = getattr(cell.alignment, 'wrapText', None)
+        if wrap_val:
+            fmt['text_wrap'] = False
+
+
+        # —— 邊框設定 ——
+        b = cell.border
+        styles = {b.left.style, b.right.style, b.top.style, b.bottom.style}
+        style_map = {
+        'hair': 1,      # xlsxwriter 沒有 hair，退而用最細
+        'thin': 1,
+        'dotted': 1,
+        'dashdotdot': 1,
+        'dashdot': 1,
+        'dashed': 1,
+        'medium': 2,
+        'mediumDashed': 2,
+        'mediumDashDot': 2,
+        'mediumDashDotDot': 2,
+        'double': 6,    # xlsxwriter 的 double 是 6（可用）
+        'thick': 4,
+        'slantDashDot': 2,
+    }
+        # 把 openpyxl 異大小寫樣式轉一致 key
+        def _sty(s):
+            return style_map.get(str(s), style_map.get(str(s).lower()))
+
+        sides = {
+            'top': b.top,
+            'bottom': b.bottom,
+            'left': b.left,
+            'right': b.right,
+        }
+
+        side_styles = {side: (sides[side].style or None) for side in sides}
+        style_set = {v for v in side_styles.values()}
+
+        # 顏色：各邊採集 hex6，供後續判斷是否同色
+        side_colors = {side: self._hex6_from_openpyxl_color(sides[side].color) for side in sides}
+        color_set = {c for c in side_colors.values() if c}
+
+        all_have_style = all(side_styles[s] is not None for s in sides)
+        # 同邊框樣式
+        if all_have_style and len(style_set) == 1:
+            sty = next(iter(style_set))
+            fmt['border'] = _sty(sty) or 1
+            # 同色就給 border_color，不同就個別給
+            if len(color_set) == 1:
+                only = next(iter(color_set))
+                if only:
+                    fmt['border_color'] = only
+            else:
+                if side_colors['top']:
+                    fmt['top_color'] = side_colors['top']
+                if side_colors['bottom']:
+                    fmt['bottom_color'] = side_colors['bottom']
+                if side_colors['left']:
+                    fmt['left_color'] = side_colors['left']
+                if side_colors['right']:
+                    fmt['right_color'] = side_colors['right']
+        else:
+            # 各邊分別處理
+            if side_styles['top']:
+                fmt['top'] = _sty(side_styles['top']) or 1
+                if side_colors['top']:
+                    fmt['top_color'] = side_colors['top']
+            if side_styles['bottom']:
+                fmt['bottom'] = _sty(side_styles['bottom']) or 1
+                if side_colors['bottom']:
+                    fmt['bottom_color'] = side_colors['bottom']
+            if side_styles['left']:
+                fmt['left'] = _sty(side_styles['left']) or 1
+                if side_colors['left']:
+                    fmt['left_color'] = side_colors['left']
+            if side_styles['right']:
+                fmt['right'] = _sty(side_styles['right']) or 1
+                if side_colors['right']:
+                    fmt['right_color'] = side_colors['right']
 
         return fmt
+
 
     def _get_format(self, fmt_dict, workbook):
         # 將 fmt_dict 轉成 tuple-of-tuples 作為 key（因為 dict 本身不可 hash）
@@ -423,6 +566,8 @@ class ExcelApp:
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return
         
+        ok = False
+        err_msg = None
         try:
             self._format_cache.clear()  # 清空格式快取
             self.status_callback("開始執行 Transform Sheet")
@@ -638,30 +783,69 @@ class ExcelApp:
                 # overview.Range("H2").FormulaLocal = "=SUM(AB2:AE2)"
                 print("已在 overview 工作表寫入公式")
             except Exception as e:
-                excel.Quit()
+                err_msg = f"設定 overview 工作表公式失敗：{e}"
                 print(f"設定 overview 工作表公式失敗：{e}")
                 return False
-
-            # 然後再執行 RefreshAll 並存檔
-            wb_tpl.RefreshAll()
-            print("靜態頁複製完成")
-            self.status_callback("靜態頁複製完成")
-            if self.update_progress_smooth:
-                self.update_progress_smooth(95, 100, step=1, delay=0.01) # 第6階段完成：100%
-            # 存檔、關檔、退出
-            wb_new.Save()
-            wb_tpl.Close(False)
-            wb_new.Close(False)
-            excel.Quit()
-            # pythoncom.CoUninitialize()    
-
+            
+            
+            try:
+                # 然後再執行 RefreshAll 並存檔
+                wb_tpl.RefreshAll()
+                print("靜態頁複製完成")
+                self.status_callback("靜態頁複製完成")
+                if self.update_progress_smooth:
+                    self.update_progress_smooth(95, 100, step=1, delay=0.01) # 第6階段完成：100%
+                # 存檔、關檔、退出
+                wb_new.Save()
+                wb_tpl.Close(False)
+                wb_new.Close(False)
+                # pythoncom.CoUninitialize()    
+                ok = True
+            except Exception as e:
+                print(f"存檔失敗：{e}")
+                err_msg = f"存檔失敗：{e}"
+                return False
+            # 成功的回傳值
             return new_file_path
-    
         except Exception as e:
-            excel.Quit()
-            print(f"處理 Transform Sheet 時出錯：{e}")
-            messagebox.showerror("錯誤", f"處理 Transform Sheet 時出錯：{e}")
-            return
+            # 捕捉其他未預期錯誤
+            tb = traceback.format_exc()
+            err_msg = f"處理 Transform Sheet 時出錯：{e}\n{tb}"
+            print(f"處理 Transform Sheet 時出錯：{e}\n{tb}")
+            return False
+        finally:
+            # ── 集中清理（不論成功/失敗/何處 return 都會執行）──
+            try:
+                if wb_tpl is not None:
+                    wb_tpl.Close(SaveChanges=False)
+            except Exception:
+                pass
+            try:
+                if wb_new is not None:
+                    # 如果成功已經存檔，這裡關閉就好
+                    wb_new.Close(SaveChanges=False)
+            except Exception:
+                pass
+            try:
+                if excel is not None:
+                    excel.Quit()
+            except Exception:
+                pass
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+            # 把錯誤訊息傳回去（可用屬性或 callback）
+            if not ok:
+                # 方式 1：設成實例屬性，讓 GUI 執行緒讀取
+                self.last_error = err_msg
+                # 方式 2：有提供錯誤回呼就通知
+                if getattr(self, "error_callback", None) and err_msg:
+                    try:
+                        self.error_callback(err_msg)
+                    except Exception:
+                        pass
 
 
     def process_all(self):
@@ -688,11 +872,14 @@ class ExcelApp:
         if result_file is None:
             result_file = getattr(self, "result_file", None)
         if not result_file or not os.path.exists(result_file):
-            messagebox.showerror("錯誤", f"找不到檔案：{result_file}")
+            err_msg = f"找不到檔案：{result_file}"
             return False
 
         excel = None
         wb = None
+        ok = False
+        err_msg = None  
+
         try:
             pythoncom.CoInitialize()
             # 建立 Excel 應用程式實例（不顯示）
@@ -709,15 +896,41 @@ class ExcelApp:
             # 儲存並關閉工作簿
             wb.Save() 
             wb.Close(SaveChanges=True)
-            excel.Quit()
             pythoncom.CoUninitialize()
+            ok = True
             return True
         
         except Exception as e:
-            excel.Quit()
+            err_msg = f"更新 Excel 快取值時發生錯誤：{e}"
             print(f"更新 Excel 快取值時發生錯誤：{e}")
-            messagebox.showerror("錯誤", f"更新 Excel 快取值時發生錯誤：{e}")
             return False
+        finally:
+            # ── 集中清理（不論成功/失敗/何處 return 都會執行）──
+            try:
+                if wb is not None:
+                    wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+            try:
+                if excel is not None:
+                    excel.Quit()
+            except Exception:
+                pass
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+            # 把錯誤訊息傳回去（可用屬性或 callback）
+            if not ok:
+                # 方式 1：設成實例屬性，讓 GUI 執行緒讀取
+                self.last_error = err_msg
+                # 方式 2：有提供錯誤回呼就通知
+                if getattr(self, "error_callback", None) and err_msg:
+                    try:
+                        self.error_callback(err_msg)
+                    except Exception:
+                        pass
 
     def generate_report(self, template_choice):
         """
