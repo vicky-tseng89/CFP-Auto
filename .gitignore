@@ -9,7 +9,6 @@ __pycache__/
 *.ipynb
 
 # Excel 或暫存檔
-*.xlsx
 *.xlsm
 *.xlsb
 *.xls
