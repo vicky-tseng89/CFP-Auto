@@ -87,8 +87,8 @@ class ExcelApp:
             total_A = self.process_tables(sheet_A_tables, 'Raw Material', 'W', result_workbook, sheet_B)
             total_C = self.process_tables(sheet_C_tables, 'Manufacturing', 'W', result_workbook, sheet_B)
             total_D = self.process_tables(sheet_D_tables, 'Distribution', 'U', result_workbook, sheet_B)
-            total_E = self.process_tables(sheet_F_tables, 'Usage', 'Q', result_workbook, sheet_B)
-            total_F = self.process_tables(sheet_E_tables, 'Recycling', 'Q', result_workbook, sheet_B)
+            total_E = self.process_tables(sheet_E_tables, 'Recycling', 'Q', result_workbook, sheet_B)
+            total_F = self.process_tables(sheet_F_tables, 'Usage', 'Q', result_workbook, sheet_B)
 
 
             self.update_progress_smooth(40, 70, step=1, delay=0.02) # 階段3：更新報告模板，模擬進度從 40% 到 70%
@@ -129,6 +129,8 @@ class ExcelApp:
 
         #    3. 用 Excel COM 自動修復並輸出最終結果
             pythoncom.CoInitialize()
+            excel = None
+            com_wb = None
             try:
                 excel = DispatchEx("Excel.Application")
                 excel.Visible = False
@@ -154,28 +156,30 @@ class ExcelApp:
                     time.sleep(0.2)
 
                 if com_wb is None:
-                    raise RuntimeError(f"Excel 無法開啟結果檔：{path}")  
-                excel.CalculateUntilAsyncQueriesDone()                
-                com_wb.Save() 
+                    raise RuntimeError(f"Excel 無法開啟結果檔：{path}")
+                excel.CalculateUntilAsyncQueriesDone()
+                com_wb.Save()
 
                 if self.update_progress_smooth: # 更新進度至 100%
                     self.update_progress_smooth(95, 100, step=1, delay=0.05)
                 return {"ok": True, "result_file": self.result_file, "report_file": self.report_file}
-            
+
             except Exception as e:
                 print(f"處理文件時出錯：{e}")
-            return {"ok": False, "error": str(e)}  # 告知呼叫方：失敗``
-        
+                return {"ok": False, "error": str(e)}  # 告知呼叫方：失敗
+
         finally:
             try:
-                if com_wb: com_wb.Close(False)
+                if com_wb:
+                    com_wb.Close(False)
             except Exception:
                 pass
             try:
-                if excel: excel.Quit()
+                if excel:
+                    excel.Quit()
             except Exception:
                 pass
-    pythoncom.CoUninitialize()
+            pythoncom.CoUninitialize()
 
 
 
