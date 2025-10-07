@@ -67,6 +67,10 @@ class ExcelApp:
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return
 
+        excel = None
+        com_wb = None
+        com_initialized = False
+
         try:
             self.update_progress_smooth(0, 10, step=1, delay=0.5) # 階段1：讀取 Excel 檔案與資料準備，模擬從 0% 到 10%
             # 使用 openpyxl 讀取原始的 Excel 文件，保留原始格式和樣式
@@ -129,8 +133,7 @@ class ExcelApp:
 
         #    3. 用 Excel COM 自動修復並輸出最終結果
             pythoncom.CoInitialize()
-            excel = None
-            com_wb = None
+            com_initialized = True
             try:
                 excel = DispatchEx("Excel.Application")
                 excel.Visible = False
@@ -150,7 +153,7 @@ class ExcelApp:
                                 ReadOnly=False,
                                 IgnoreReadOnlyRecommended=True
                             )
-                            break     
+                            break
                         except Exception:
                             time.sleep(0.3)
                     time.sleep(0.2)
@@ -166,20 +169,30 @@ class ExcelApp:
 
             except Exception as e:
                 print(f"處理文件時出錯：{e}")
+                self.last_error = str(e)
                 return {"ok": False, "error": str(e)}  # 告知呼叫方：失敗
 
-        finally:
-            try:
-                if com_wb:
-                    com_wb.Close(False)
-            except Exception:
-                pass
-            try:
-                if excel:
-                    excel.Quit()
-            except Exception:
-                pass
-            pythoncom.CoUninitialize()
+            finally:
+                try:
+                    if com_wb:
+                        com_wb.Close(False)
+                except Exception:
+                    pass
+                try:
+                    if excel:
+                        excel.Quit()
+                except Exception:
+                    pass
+                if com_initialized:
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            self.last_error = str(e)
+            return {"ok": False, "error": str(e)}
+
 
 
 
