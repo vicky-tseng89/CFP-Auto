@@ -23,7 +23,14 @@ import traceback
 
 class ExcelApp:
     def __init__(self, status_callback=None, progress_callback=None):
-        self.status_callback = status_callback
+        self._no_op_status_callback = lambda *_, **__: None
+        self._original_status_callback = status_callback
+        if callable(status_callback):
+            self.status_callback = status_callback
+            self._has_status_callback = True
+        else:
+            self.status_callback = self._no_op_status_callback
+            self._has_status_callback = False
         self.progress_callback = progress_callback
         self.file_path = None
         self.last_error = None
@@ -35,6 +42,17 @@ class ExcelApp:
         self.output_dir = os.path.join(base_dir, "結果")    # 程式路徑
         os.makedirs(self.output_dir, exist_ok=True)
         # ──────────────────────────────────────────────────────────
+
+    def _notify_status(self, message):
+        """Safely invoke the status callback if it is available."""
+        callback = self.status_callback
+        if callable(callback):
+            self._has_status_callback = callback is not self._no_op_status_callback
+        else:
+            callback = self._no_op_status_callback
+            self._has_status_callback = False
+        callback(message)
+
     def get_base_dir(self):
         """
         如果是 PyInstaller 打包後的 single-file exe，
@@ -67,10 +85,14 @@ class ExcelApp:
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return
 
+        excel = None
+        com_wb = None
+        com_initialized = False
+
         try:
             self.update_progress_smooth(0, 10, step=1, delay=0.5) # 階段1：讀取 Excel 檔案與資料準備，模擬從 0% 到 10%
             # 使用 openpyxl 讀取原始的 Excel 文件，保留原始格式和樣式
-            self.status_callback("讀取 Excel 文件...")
+            self._notify_status("讀取 Excel 文件...")
             print("讀取 Excel 文件...")
             result_workbook = openpyxl.load_workbook(self.file_path, keep_vba=False, keep_links=False)
             sheet_A_tables = self.read_multiple_tables('Raw Material', self.file_path)      #呼叫 read_multiple_tables(sheet_name, file_path) 
@@ -82,7 +104,7 @@ class ExcelApp:
             self.update_progress_smooth(10, 40, step=1, delay=0.05) # 階段2：讀取工作表B，處理工作表並計算數值，模擬進度從 10% 到 40%
             # 以 pandas 讀入另一張關鍵對照表（sheet_B，如 simapro10.2.0.0）
             sheet_B = pd.read_excel(self.file_path, sheet_name='simapro10.2.0.0', usecols=['單位對照', 'fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)', 'unit']).dropna(subset=['單位對照'])
-            self.status_callback("處理工作表並獲取總值...")
+            self._notify_status("處理工作表並獲取總值...")
             print("處理工作表並獲取總值...")
             total_A = self.process_tables(sheet_A_tables, 'Raw Material', 'W', result_workbook, sheet_B)
             total_C = self.process_tables(sheet_C_tables, 'Manufacturing', 'W', result_workbook, sheet_B)
@@ -92,7 +114,7 @@ class ExcelApp:
 
 
             self.update_progress_smooth(40, 70, step=1, delay=0.02) # 階段3：更新報告模板，模擬進度從 40% 到 70%
-            self.status_callback("讀取報告模板並寫入計算的數值...")
+            self._notify_status("讀取報告模板並寫入計算的數值...")
             print("讀取報告模板並寫入計算的數值...")
             base_dir = os.path.dirname(os.path.abspath(__file__))       # Temp檔路徑下
             report_path = os.path.join(base_dir, 'report_temp.xlsx')    # 將結果寫入報告範本 Excel (report_temp.xlsx) 中預定的儲存格
@@ -103,7 +125,7 @@ class ExcelApp:
             else:
                 raise ValueError("報告模板中未找到名為 'general' 的工作表。")
 
-            self.status_callback("每個工作表的加總值寫入指定的單元格...")
+            self._notify_status("每個工作表的加總值寫入指定的單元格...")
             print("每個工作表的加總值寫入指定的單元格...")
             # 將每個工作表的加總值寫入指定的單元格
             report_sheet['B2'], report_sheet['B3'], report_sheet['B4'] = total_A
@@ -114,7 +136,7 @@ class ExcelApp:
             self.update_progress_smooth(70, 95, step=1, delay=0.05) # 階段4：儲存結果，模擬進度從 70% 到 99%
             # 獲取當前的日期和時間，用於生成檔案名稱
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.status_callback("保存更新後的報告，附上日期和時間...")
+            self._notify_status("保存更新後的報告，附上日期和時間...")
             print("保存更新後的報告，附上日期和時間...")
             # 保存更新後的報告，附上日期和時間
             self.report_file = f'report_{current_time}.xlsx'
@@ -129,8 +151,7 @@ class ExcelApp:
 
         #    3. 用 Excel COM 自動修復並輸出最終結果
             pythoncom.CoInitialize()
-            excel = None
-            com_wb = None
+            com_initialized = True
             try:
                 excel = DispatchEx("Excel.Application")
                 excel.Visible = False
@@ -150,7 +171,7 @@ class ExcelApp:
                                 ReadOnly=False,
                                 IgnoreReadOnlyRecommended=True
                             )
-                            break     
+                            break
                         except Exception:
                             time.sleep(0.3)
                     time.sleep(0.2)
@@ -166,20 +187,30 @@ class ExcelApp:
 
             except Exception as e:
                 print(f"處理文件時出錯：{e}")
+                self.last_error = str(e)
                 return {"ok": False, "error": str(e)}  # 告知呼叫方：失敗
 
-        finally:
-            try:
-                if com_wb:
-                    com_wb.Close(False)
-            except Exception:
-                pass
-            try:
-                if excel:
-                    excel.Quit()
-            except Exception:
-                pass
-            pythoncom.CoUninitialize()
+            finally:
+                try:
+                    if com_wb:
+                        com_wb.Close(False)
+                except Exception:
+                    pass
+                try:
+                    if excel:
+                        excel.Quit()
+                except Exception:
+                    pass
+                if com_initialized:
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            self.last_error = str(e)
+            return {"ok": False, "error": str(e)}
+
 
 
 
@@ -321,7 +352,7 @@ class ExcelApp:
                 # 將 Damage Assessment 欄位設為公式
                 sheet[f'{chr(ord(col_start) + 3)}{row_num}'] = f"={fossil_cell}+{biogenic_cell}+{land_cell}"
             
-            self.status_callback("計算加總值並寫入每個表格的第一行...")
+            self._notify_status("計算加總值並寫入每個表格的第一行...")
             # 計算加總值並寫入每個表格的第一行，並做小數點後 4 位四捨五入捨去
             fossil_total = round(merged_df['fossil(kg CO2-eq)_result'].sum(), 4)
             biogenic_total = round(merged_df['biogenic(kg CO2-eq)_result'].sum(), 4)
@@ -336,7 +367,7 @@ class ExcelApp:
             sheet[f'{col_start}{first_row_idx}'] = fossil_total
             sheet[f'{chr(ord(col_start) + 1)}{first_row_idx}'] = biogenic_total
             sheet[f'{chr(ord(col_start) + 2)}{first_row_idx}'] = land_transformation_total
-        self.status_callback("寫入所有表格的加總值...")
+        self._notify_status("寫入所有表格的加總值...")
         # 在每個工作表的 AB/AC/AD 欄位中寫入所有表格的加總值
         sheet[f'AB2'] = total_fossil
         sheet[f'AC2'] = total_biogenic
@@ -633,7 +664,7 @@ class ExcelApp:
         excel = None
         try:
             self._format_cache.clear()  # 清空格式快取
-            self.status_callback("開始執行 Transform Sheet")
+            self._notify_status("開始執行 Transform Sheet")
             print("開始執行 Transform Sheet")
             self.source_file_path = self.file_path
             base_dir = os.path.dirname(os.path.abspath(__file__))   # 取得目前 script 所在的資料夾/Temp檔路徑下
@@ -641,7 +672,7 @@ class ExcelApp:
             # 用 openpyxl 讀取模板
             template_wb = openpyxl.load_workbook(target_file_path)
             print("PASS1...")
-            self.status_callback("PASS1...")
+            self._notify_status("PASS1...")
             if self.update_progress_smooth:
                 self.update_progress_smooth(0, 10, step=1, delay=0.02)  # 第1階段完成：10%
             # 建立格式定義字典，僅針對指定工作表
@@ -701,7 +732,7 @@ class ExcelApp:
                         df = df.fillna('')
                         source_data[sheet_name] = df
                         print(f"已讀取 {sheet_name} 工作表")
-                        self.status_callback(f"已讀取 {sheet_name} 工作表")
+                        self._notify_status(f"已讀取 {sheet_name} 工作表")
                     except Exception as e:
                         print(f"警告: 無法讀取 {sheet_name} 工作表: {e}")
             print("讀取來源資料完成")
@@ -753,6 +784,28 @@ class ExcelApp:
                     target_sheet_name
                 )
 
+                for pos_idx, base_pos in enumerate(base_insert_positions):
+                    print("開始處理插入點，pos_idx =", pos_idx)
+                    self._notify_status(f"開始處理插入點，pos_idx ={pos_idx}")
+                    try:
+                        if pos_idx < len(source_sheet_list):
+                            sheet_name = source_sheet_list[pos_idx]
+                            data = source_data[sheet_name]
+                            num_data_rows = data.shape[0]
+                            data_rows = [list(data.iloc[i]) for i in range(num_data_rows)]
+                            
+                            # 原本預留◎符號所在列及其後兩列，共 3 列
+                            insert_index = base_pos + 3 + offset
+
+                            # 插入來源資料，將 data_rows 這個清單「插入」到 new_sheet_rows 的指定位置
+                            new_sheet_rows[insert_index:insert_index] = data_rows   #「從第 insert_index 個元素開始，到第 insert_index 個元素結束」
+                            offset += num_data_rows
+                            print(f"在 {target_sheet_name} 的索引 {insert_index} 插入 {num_data_rows} 行來源資料")
+                        else:
+                            print(f"模板中無對應來源資料，無法插入 {sheet_name} 的資料")
+                    except Exception as e:
+                        print(f"無法處理 {sheet_name} 工作表：{e}")
+
                 default_format = [cell_info["format"] for cell_info in format_definitions[target_sheet_name][4]]
                 self._fallback_fmt = workbook.add_format({
                                         'border': 1,
@@ -793,7 +846,7 @@ class ExcelApp:
             workbook.close()
             time.sleep(0.1)
             print("靜態頁複製")
-            self.status_callback("靜態頁複製")
+            self._notify_status("靜態頁複製")
             pythoncom.CoInitialize()
             excel = win32.DispatchEx("Excel.Application")
             excel.Visible = False  # 背後跑就好
@@ -837,7 +890,7 @@ class ExcelApp:
                 # 然後再執行 RefreshAll 並存檔
                 wb_tpl.RefreshAll()
                 print("靜態頁複製完成")
-                self.status_callback("靜態頁複製完成")
+                self._notify_status("靜態頁複製完成")
                 if self.update_progress_smooth:
                     self.update_progress_smooth(95, 100, step=1, delay=0.01) # 第6階段完成：100%
                 # 存檔、關檔、退出
@@ -900,12 +953,12 @@ class ExcelApp:
             return
 
         try:
-            self.status_callback("開始執行 Transform Sheet")
+            self._notify_status("開始執行 Transform Sheet")
             new_file_path = self.transform_sheet()
             if new_file_path:  # 確認返回值有效
-                self.status_callback("Transform Sheet 完成，開始處理數據")
+                self._notify_status("Transform Sheet 完成，開始處理數據")
                 self.process_file(file_path = new_file_path)
-                self.status_callback("處理全部完成")
+                self._notify_status("處理全部完成")
             return True
         
         except Exception as e:
@@ -1045,7 +1098,7 @@ class ExcelApp:
         sheet_names = ['Raw Material', 'Manufacturing', 'Distribution', 'Usage', 'Recycling']
         transport_sheets = ['Raw Material', 'Manufacturing', 'Distribution']
 
-        self.status_callback("讀取數據處理後產生的檔案...")
+        self._notify_status("讀取數據處理後產生的檔案...")
         df = pd.read_excel(result_file, sheet_name="overview") # 讀取盤查表單'overview'所需的欄位數值​
 
         today_date = datetime.today().strftime("%Y-%m-%d_%H%M%S")
@@ -1098,7 +1151,7 @@ class ExcelApp:
 
         # === 3. 以盤查表單作為基底，繼續處理其數據與圖表，生成完整報告書 ===
         # 呼叫各個盤查表單統整計算函式，將數據與圖表插入報告中
-        self.status_callback("呼叫各個盤查表單統整計算函式，將數據與圖表生成...")
+        self._notify_status("呼叫各個盤查表單統整計算函式，將數據與圖表生成...")
         all_results = self.process_all_worksheets(result_file, sheet_names)
         self.insert_data_to_word(all_results, sheet_names)
         self.generate_bar_chart(doc, all_results, sheet_names)
@@ -1106,7 +1159,7 @@ class ExcelApp:
             self.update_progress_smooth(50, 60, step=1, delay=0.02)  # 第六階段完成：60%
         
         # Raw Material 處理與圖表生成
-        self.status_callback("Raw Material 處理與圖表生成...")
+        self._notify_status("Raw Material 處理與圖表生成...")
         resulall_data_1, Raw_data = self.process_worksheet(result_file, 'Raw Material')
         self.process_insert_raw_data(result_file)
         self.generate_insert_raw_charts(doc, Raw_data)
@@ -1123,22 +1176,22 @@ class ExcelApp:
             self.update_progress_smooth(70, 80, step=1, delay=0.02)  # 第八階段完成：80%
         
         # 前十大統整處理
-        self.status_callback("前十大統整處理與圖表生成...")
+        self._notify_status("前十大統整處理與圖表生成...")
         self.process_top10_data(sheet_names, result_file, doc)
         if self.update_progress_smooth:
             self.update_progress_smooth(80, 95, step=1, delay=0.02)  # 第十階段處理完畢前：95%
         
         # 運輸相關數據處理
-        self.status_callback("運輸相關數據處理與圖表生成...")
+        self._notify_status("運輸相關數據處理與圖表生成...")
         Air_all_data = self.process_transport_data(result_file, transport_sheets)
         self.analyze_and_chart_generate(Air_all_data, doc)
 
         # 將儲存在 self.context  的數據 & 圖表匯入
-        self.status_callback("所有數據與圖表匯入報告書...")
+        self._notify_status("所有數據與圖表匯入報告書...")
         doc.render(self.context)    
 
         # === 4. 存檔完整報告書 ===
-        self.status_callback("保存文件...")
+        self._notify_status("保存文件...")
         full_report_file = os.path.join(
             self.output_dir, f"智邦-產品碳足跡盤查總報告書_{today_date}.docx")
         doc.save(full_report_file)
