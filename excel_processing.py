@@ -44,7 +44,10 @@ class ExcelApp:
         # ──────────────────────────────────────────────────────────
 
     def _notify_status(self, message):
-        """Safely invoke the status callback if it is available."""
+        """
+        Safely invoke the status callback if it is available.
+        如果可用，則安全地呼叫狀態回呼。
+        """
         callback = self.status_callback
         if callable(callback):
             self._has_status_callback = callback is not self._no_op_status_callback
@@ -779,13 +782,11 @@ class ExcelApp:
             # 打開新檔和範本
             if not os.path.exists(target_file_path):
                 raise FileNotFoundError(f"找不到範本：{target_file_path}")
-            print("============1============") 
             wb_tpl = excel.Workbooks.Open(target_file_path,
                               CorruptLoad=1,
                               ReadOnly=True,
                               IgnoreReadOnlyRecommended=True)
             wb_new = excel.Workbooks.Open(new_file_path, CorruptLoad=1)
-            print("============2============")
             static_sheets = ['Instruction', 'overview', 'Process flow chart', 'simapro10.2.0.0']
             for sheet_name in static_sheets:
                 try:
