@@ -588,6 +588,62 @@ class ExcelApp:
             self._format_cache[key] = workbook.add_format(fmt_dict)
         return self._format_cache[key]
 
+    def _process_insert_positions(
+        self,
+        template_rows,
+        base_insert_positions,
+        source_sheet_list,
+        source_data,
+        target_sheet_name
+    ):
+        """根據插入點將來源資料插入模板列中。"""
+        new_sheet_rows = template_rows.copy()
+        offset = 0
+        status_cb = getattr(self, "status_callback", None)
+
+        for pos_idx, base_pos in enumerate(base_insert_positions):
+            start_msg = f"開始處理插入點，pos_idx ={pos_idx}"
+            print(start_msg)
+            if status_cb:
+                status_cb(start_msg)
+
+            source_sheet_name = (
+                source_sheet_list[pos_idx]
+                if pos_idx < len(source_sheet_list)
+                else None
+            )
+            source_label = source_sheet_name or f"{target_sheet_name}#{pos_idx + 1}"
+
+            try:
+                if source_sheet_name and source_sheet_name in source_data:
+                    data = source_data[source_sheet_name]
+                    num_data_rows = data.shape[0]
+                    data_rows = [list(data.iloc[i]) for i in range(num_data_rows)]
+
+                    # 原本預留◎符號所在列及其後兩列，共 3 列
+                    insert_index = base_pos + 3 + offset
+
+                    # 插入來源資料，將 data_rows 這個清單插入到 new_sheet_rows 的指定位置
+                    new_sheet_rows[insert_index:insert_index] = data_rows
+                    offset += num_data_rows
+                    print(
+                        f"在 {target_sheet_name} 的索引 {insert_index} 插入 {num_data_rows} 行來源資料"
+                    )
+                else:
+                    warn_msg = (
+                        f"模板中無對應來源資料，目標 {target_sheet_name} 插入點 {pos_idx + 1} 將略過（{source_label}）。"
+                    )
+                    print(warn_msg)
+                    if status_cb:
+                        status_cb(warn_msg)
+            except Exception as e:
+                err_msg = f"無法處理 {source_label} 工作表：{e}"
+                print(err_msg)
+                if status_cb:
+                    status_cb(err_msg)
+
+        return new_sheet_rows
+
     def transform_sheet(self):
         """
         將原始 Excel 表單轉換成盤查表單格式：
@@ -603,9 +659,12 @@ class ExcelApp:
         if not self.file_path:
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return
-        
+
         ok = False
         err_msg = None
+        wb_tpl = None
+        wb_new = None
+        excel = None
         try:
             self._format_cache.clear()  # 清空格式快取
             self._notify_status("開始執行 Transform Sheet")
@@ -718,11 +777,15 @@ class ExcelApp:
                     if any(cell is not None and '◎' in str(cell) for cell in row):
                         base_insert_positions.append(idx)
                         print(f"在 {target_sheet_name} 模板中找到插入點：第 {idx} 行")
-                
-                # 複製模板內容作為最終輸出，並利用 offset 追蹤因插入或替換而產生的行偏移
-                new_sheet_rows = template_rows.copy()
-                offset = 0
 
+                # 複製模板內容作為最終輸出，並利用 offset 追蹤因插入或替換而產生的行偏移
+                new_sheet_rows = self._process_insert_positions(
+                    template_rows,
+                    base_insert_positions,
+                    source_sheet_list,
+                    source_data,
+                    target_sheet_name
+                )
 
                 for pos_idx, base_pos in enumerate(base_insert_positions):
                     print("開始處理插入點，pos_idx =", pos_idx)
