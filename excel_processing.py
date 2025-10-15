@@ -101,8 +101,8 @@ class ExcelApp:
             sheet_A_tables = self.read_multiple_tables('Raw Material', self.file_path)      #呼叫 read_multiple_tables(sheet_name, file_path) 
             sheet_C_tables = self.read_multiple_tables('Manufacturing', self.file_path)     #讀取特定數個工作表（如 Raw Material、Manufacturing 等）
             sheet_D_tables = self.read_multiple_tables('Distribution', self.file_path)      #將每個工作表中多個獨立的資料表格區段解析為 pandas DataFrame 清單
-            sheet_E_tables = self.read_multiple_tables('Recycling', self.file_path)
-            sheet_F_tables = self.read_multiple_tables('Usage', self.file_path)
+            sheet_E_tables = self.read_multiple_tables('Usage', self.file_path)
+            sheet_F_tables = self.read_multiple_tables('Recycling', self.file_path)
             
             self.update_progress_smooth(10, 40, step=1, delay=0.05) # 階段2：讀取工作表B，處理工作表並計算數值，模擬進度從 10% 到 40%
             # 以 pandas 讀入另一張關鍵對照表（sheet_B，如 simapro10.2.0.0）
@@ -112,8 +112,8 @@ class ExcelApp:
             total_A = self.process_tables(sheet_A_tables, 'Raw Material', 'W', result_workbook, sheet_B)
             total_C = self.process_tables(sheet_C_tables, 'Manufacturing', 'W', result_workbook, sheet_B)
             total_D = self.process_tables(sheet_D_tables, 'Distribution', 'U', result_workbook, sheet_B)
-            total_E = self.process_tables(sheet_E_tables, 'Recycling', 'Q', result_workbook, sheet_B)
-            total_F = self.process_tables(sheet_F_tables, 'Usage', 'Q', result_workbook, sheet_B)
+            total_E = self.process_tables(sheet_E_tables, 'Usage', 'Q', result_workbook, sheet_B)
+            total_F = self.process_tables(sheet_F_tables, 'Recycling', 'Q', result_workbook, sheet_B)
 
 
             self.update_progress_smooth(40, 70, step=1, delay=0.02) # 階段3：更新報告模板，模擬進度從 40% 到 70%
