@@ -12,7 +12,7 @@ import threading
 import time
 import tkinter as tk
 import win32com.client as win32
-
+#
 importlib.reload(excel_processing) # 調用 excel_processing 模組
 
 class ProgressBarWindow:
