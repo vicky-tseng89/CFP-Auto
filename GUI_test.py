@@ -170,6 +170,7 @@ class GUI:
         self.company_var = tk.StringVar()
         self.start_date_var = tk.StringVar()
         self.end_date_var = tk.StringVar()
+        self.factory_site_var = tk.StringVar(value="竹南")
 
         # 初始化分頁內容
         self.create_transform_tab()
@@ -187,11 +188,23 @@ class GUI:
         ttk.Button(frame, text="瀏覽", command=self.browse_file).grid(row=0, column=2, padx=10, pady=10)
         
         # 新增三個欄位
-        ttk.Label(frame, text="產品F階機種：").grid(row=1, column=0, padx=10, pady=10)
+
+
+        ttk.Label(frame, text="盤查廠區").grid(row=1, column=0, padx=10, pady=10)
+        self.factory_site_combo = ttk.Combobox(
+            frame,
+            values=["","竹南廠", "竹北廠"],
+            textvariable=self.factory_site_var,
+            state="readonly",
+            width=20
+        )
+        self.factory_site_combo.grid(row=1, column=1, sticky='w', padx=10, pady=10)
+
+        ttk.Label(frame, text="產品F階機種：").grid(row=2, column=0, padx=10, pady=10)
         self.product_f_entry = ttk.Entry(frame, textvariable=self.company_var, width=50)
-        self.product_f_entry.grid(row=1, column=1, padx=10, pady=10)
+        self.product_f_entry.grid(row=2, column=1, padx=10, pady=10)
         
-        ttk.Label(frame, text="碳足跡蒐集起始時間 (YYYY/MM/DD)：").grid(row=2, column=0, padx=10, pady=10)
+        ttk.Label(frame, text="碳足跡蒐集起始時間 (YYYY/MM/DD)：").grid(row=3, column=0, padx=10, pady=10)
         self.start_date_entry = DateEntry(
             frame, 
             textvariable=self.start_date_var,    
@@ -200,9 +213,9 @@ class GUI:
             width=12
             )
         self.start_date_entry.delete(0, tk.END)
-        self.start_date_entry.grid(row=2, column=1, sticky='w', padx=10, pady=10)
+        self.start_date_entry.grid(row=3, column=1, sticky='w', padx=10, pady=10)
         
-        ttk.Label(frame, text="碳足跡蒐集結束時間 (YYYY/MM/DD)：").grid(row=3, column=0, padx=10, pady=10)
+        ttk.Label(frame, text="碳足跡蒐集結束時間 (YYYY/MM/DD)：").grid(row=4, column=0, padx=10, pady=10)
         self.end_date_entry = DateEntry(
             frame, 
             textvariable=self.end_date_var,    
@@ -211,7 +224,7 @@ class GUI:
             width=12
             )
         self.end_date_entry.delete(0, tk.END)
-        self.end_date_entry.grid(row=3, column=1, sticky='w', padx=10, pady=10)
+        self.end_date_entry.grid(row=4, column=1, sticky='w', padx=10, pady=10)
 
 
         # 新增重新整理功能的勾選框
@@ -219,11 +232,11 @@ class GUI:
                         text="啟用重新整理功能",
                         variable=self.enable_refresh,
                         command=self.toggle_refresh_fields
-                        ).grid(row=4, column=0, columnspan=2, padx=5, pady=5)
+                        ).grid(row=5, column=0, columnspan=2, padx=5, pady=5)
         
-        ttk.Button(frame, text="開始轉換", command=self.transform_sheet).grid(row=4, column=1, pady=10)
-        self.add_status_label(frame)
-        ttk.Button(frame, text="Excel ✕", command=lambda: os.system("taskkill /f /im excel.exe")).grid(row=4, column=2, padx=10, pady=10)
+        ttk.Button(frame, text="開始轉換", command=self.transform_sheet).grid(row=5, column=1, pady=10)
+        self.add_status_label(frame, row=6)
+        ttk.Button(frame, text="Excel ✕", command=lambda: os.system("taskkill /f /im excel.exe")).grid(row=5, column=2, padx=10, pady=10)
 
         self.toggle_refresh_fields()
 
@@ -249,11 +262,23 @@ class GUI:
         ttk.Button(frame, text="瀏覽", command=self.browse_file).grid(row=0, column=2, padx=10, pady=10)
         
         # 新增三個欄位
-        ttk.Label(frame, text="產品F階機種：").grid(row=1, column=0, padx=10, pady=10)
+
+
+        ttk.Label(frame, text="盤查廠區").grid(row=1, column=0, padx=10, pady=10)
+        self.factory_site_combo = ttk.Combobox(
+            frame,
+            values=["","竹南廠", "竹北廠"],
+            textvariable=self.factory_site_var,
+            state="readonly",
+            width=20
+        )
+        self.factory_site_combo.grid(row=1, column=1, sticky='w', padx=10, pady=10)
+
+        ttk.Label(frame, text="產品F階機種：").grid(row=2, column=0, padx=10, pady=10)
         self.product_f_entry = ttk.Entry(frame, textvariable=self.company_var, width=50)
-        self.product_f_entry.grid(row=1, column=1, padx=10, pady=10)
+        self.product_f_entry.grid(row=2, column=1, padx=10, pady=10)
         
-        ttk.Label(frame, text="碳足跡蒐集起始時間 (YYYY/MM/DD)：").grid(row=2, column=0, padx=10, pady=10)
+        ttk.Label(frame, text="碳足跡蒐集起始時間 (YYYY/MM/DD)：").grid(row=3, column=0, padx=10, pady=10)
         self.start_date_entry = DateEntry(
             frame, 
             textvariable=self.start_date_var,    
@@ -262,9 +287,9 @@ class GUI:
             width=12
             )
         self.start_date_entry.delete(0, tk.END)
-        self.start_date_entry.grid(row=2, column=1, sticky='w', padx=10, pady=10)
+        self.start_date_entry.grid(row=3, column=1, sticky='w', padx=10, pady=10)
         
-        ttk.Label(frame, text="碳足跡蒐集結束時間 (YYYY/MM/DD)：").grid(row=3, column=0, padx=10, pady=10)
+        ttk.Label(frame, text="碳足跡蒐集結束時間 (YYYY/MM/DD)：").grid(row=4, column=0, padx=10, pady=10)
         self.end_date_entry = DateEntry(
             frame, 
             textvariable=self.end_date_var,    
@@ -273,18 +298,18 @@ class GUI:
             width=12
             )
         self.end_date_entry.delete(0, tk.END)
-        self.end_date_entry.grid(row=3, column=1, sticky='w', padx=10, pady=10)
+        self.end_date_entry.grid(row=4, column=1, sticky='w', padx=10, pady=10)
 
         # 新增重新整理功能的勾選框
         ttk.Checkbutton(frame, 
                         text="啟用重新整理功能",
                         variable=self.enable_refresh,
                         command=self.toggle_refresh_fields
-                        ).grid(row=4, column=0, columnspan=2, padx=5, pady=5)
+                        ).grid(row=5, column=0, columnspan=2, padx=5, pady=5)
 
-        ttk.Button(frame, text="處理全部", command=self.process_all).grid(row=4, column=1, pady=10)
-        self.add_status_label(frame)
-        ttk.Button(frame, text="Excel ✕", command=lambda: os.system("taskkill /f /im excel.exe")).grid(row=4, column=2, padx=10, pady=10)
+        ttk.Button(frame, text="處理全部", command=self.process_all).grid(row=5, column=1, pady=10)
+        self.add_status_label(frame, row=6)
+        ttk.Button(frame, text="Excel ✕", command=lambda: os.system("taskkill /f /im excel.exe")).grid(row=5, column=2, padx=10, pady=10)
 
         self.toggle_refresh_fields()
         
@@ -302,10 +327,10 @@ class GUI:
         # 生成報告的按鈕
         ttk.Button(frame, text="生成報告書", command=self.generate_report).grid(row=2, column=0, columnspan=2, pady=10)
 
-    def add_status_label(self, frame):
-        ttk.Label(frame, text="狀態：").grid(row=5, column=0, padx=10, pady=10)
+    def add_status_label(self, frame, row=5):
+        ttk.Label(frame, text="狀態：").grid(row=row, column=0, padx=10, pady=10)
         self.status_label = ttk.Label(frame, text="等待操作", font=("Arial", 10))
-        self.status_label.grid(row=5, column=1, padx=10, pady=10)
+        self.status_label.grid(row=row, column=1, padx=10, pady=10)
     
     def toggle_refresh_fields(self):
         """根據 self.enable_refresh 是否為 True，決定欄位要不要鎖住（disabled）"""
@@ -329,6 +354,9 @@ class GUI:
             self.process_file_entry.insert(0, self.file_path)
             self.process_all_file_entry.insert(0, self.file_path)
     
+    def sync_factory_site(self):
+        self.excel.factory_site = (self.factory_site_var.get() or "").strip()
+
     def transform_sheet(self):
         if not self.file_path:
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
@@ -504,6 +532,7 @@ class GUI:
 
 
         self.excel.file_path = self.file_path
+        self.sync_factory_site()
         self.check_excel_Product()
 
         # 呼叫主要處理流程
@@ -521,6 +550,7 @@ class GUI:
         """背景執行緒：處理單一檔案"""
         self.excel.status_callback = self.progress_window.update_status
         self.excel.file_path = self.file_path
+        self.sync_factory_site()
         try:
             result = self.excel.process_file()
             if result and result.get("ok"):
@@ -561,6 +591,7 @@ class GUI:
 
         # 設定檔案路徑與檢查
         self.excel.file_path = self.file_path
+        self.sync_factory_site()
         self.check_excel_Product()
         excel = wb_tpl = wb_new = None
         process_result = None
@@ -809,7 +840,7 @@ class GUI:
             return False
 
 if __name__ == "__main__":
-    os.system("taskkill /f /im excel.exe >nul 2>&1")        #將Excel檔案清除
+    # os.system("taskkill /f /im excel.exe >nul 2>&1")        #將Excel檔案清除
     python = sys.executable #測試
     root = tk.Tk()
     app = GUI(root)

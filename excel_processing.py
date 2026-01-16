@@ -20,7 +20,11 @@ import win32com.client as win32
 import xlsxwriter
 from openpyxl.styles.colors import Color
 import traceback
-#
+
+FACTORY_OVERVIEW_INFO = {
+    "竹南": {"name": "竹南廠", "address": "苗栗縣竹南鎮公義里科義街1號1、5樓"},
+    "竹北": {"name": "竹北廠", "address": "新竹縣竹北市北興里智慧一路1號"},
+}
 
 class ExcelApp:
     def __init__(self, status_callback=None, progress_callback=None):
@@ -37,6 +41,8 @@ class ExcelApp:
         self.last_error = None
         self.error_callback = None
         self._format_cache = {}
+        self.factory_site = ""
+
         # ──────────────────────────────────────────────────────────
         # 自動在程式路徑下建立「結果」資料夾
         base_dir = self.get_base_dir()
@@ -79,7 +85,6 @@ class ExcelApp:
         self.file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
         self.file_entry.delete(0, tk.END)
         self.file_entry.insert(0, self.file_path)
-
     def process_file(self, file_path=None):
         """數據處理"""
         from win32com.client import DispatchEx
@@ -218,8 +223,6 @@ class ExcelApp:
 
 
 
-
-
     def read_multiple_tables(self, sheet_name, file_path):
         """
         讀取工作表（如 Raw Material、Manufacturing 等）
@@ -288,6 +291,23 @@ class ExcelApp:
                     f"需包含 'total'、'Ton‧Km'、'consumed amount allocated to single product (energy/product unit)' 或 'total amount'。\n"
                     f"實際欄位有: {list(sheet_data.columns)}"
                 )
+            
+            # 1) 保留原本表格內既有的 result（若有）
+            for col in [
+                'fossil(kg CO2-eq)_result',
+                'biogenic(kg CO2-eq)_result',
+                'land transformation (kg CO2-eq)_result'
+            ]:
+                if col in merged_df.columns:
+                    merged_df[col + "_manual"] = pd.to_numeric(merged_df[col], errors="coerce")
+                else:
+                    merged_df[col + "_manual"] = pd.NA
+
+            # 2) 初始化計算欄位（先用手動值當預設）
+            merged_df['fossil(kg CO2-eq)_result'] = merged_df['fossil(kg CO2-eq)_result_manual']
+            merged_df['biogenic(kg CO2-eq)_result'] = merged_df['biogenic(kg CO2-eq)_result_manual']
+            merged_df['land transformation (kg CO2-eq)_result'] = merged_df['land transformation (kg CO2-eq)_result_manual']
+
             # 判斷工作表和工作表B的單位是否一致
             for idx, row in merged_df.iterrows():
                 if pd.notna(row['Unit']) and pd.notna(row['unit']):
@@ -317,18 +337,25 @@ class ExcelApp:
                 # 檢查數值是否為數字類型，避免類似 TypeError 的錯誤
                 try:
                     quantity = float(row[quantity_column])
-                    fossil_value = float(row['fossil(kg CO2-eq)_y']) 
-                    biogenic_value = float(row['biogenic(kg CO2-eq)_y']) 
-                    land_transformation_value = float(row['land transformation (kg CO2-eq)_y']) 
-                except ValueError:
+                except (ValueError, TypeError):
                     continue
-                   
-                # 計算 'fossil(kg CO2-eq)_result'
+
+                # 係數若缺值，就不要覆蓋手動值（維持上面初始化的 manual）
+                try:
+                    fossil_value = float(row['fossil(kg CO2-eq)_y'])
+                    biogenic_value = float(row['biogenic(kg CO2-eq)_y'])
+                    land_transformation_value = float(row['land transformation (kg CO2-eq)_y'])
+                except (ValueError, TypeError):
+                    continue
+
+                # 若係數是 NaN，也不要覆蓋手動值
+                if any(pd.isna(v) for v in [fossil_value, biogenic_value, land_transformation_value]):
+                    continue
+
                 merged_df.at[idx, 'fossil(kg CO2-eq)_result'] = quantity * fossil_value * conversion_factor
-                # 計算 'biogenic(kg CO2-eq)_result'
                 merged_df.at[idx, 'biogenic(kg CO2-eq)_result'] = quantity * biogenic_value * conversion_factor
-                # 計算 'land transformation (kg CO2-eq)_result'
                 merged_df.at[idx, 'land transformation (kg CO2-eq)_result'] = quantity * land_transformation_value * conversion_factor
+
             
             # 更新原始的工作表中的相關欄位，並小數點後 10 位無條件捨去
             sheet = workbook[sheet_name]
@@ -358,9 +385,9 @@ class ExcelApp:
             
             self._notify_status("計算加總值並寫入每個表格的第一行...")
             # 計算加總值並寫入每個表格的第一行，並做小數點後 4 位四捨五入捨去
-            fossil_total = round(merged_df['fossil(kg CO2-eq)_result'].sum(), 4)
-            biogenic_total = round(merged_df['biogenic(kg CO2-eq)_result'].sum(), 4)
-            land_transformation_total = round(merged_df['land transformation (kg CO2-eq)_result'].sum(), 4)
+            fossil_total = round(merged_df['fossil(kg CO2-eq)_result'].sum(), 10)
+            biogenic_total = round(merged_df['biogenic(kg CO2-eq)_result'].sum(), 10)
+            land_transformation_total = round(merged_df['land transformation (kg CO2-eq)_result'].sum(), 10)
 
             # 計算加總值並寫入每階段的第一行
             total_fossil += fossil_total
@@ -373,11 +400,11 @@ class ExcelApp:
             sheet[f'{chr(ord(col_start) + 2)}{first_row_idx}'] = land_transformation_total
         self._notify_status("寫入所有表格的加總值...")
         # 在每個工作表的 AB/AC/AD 欄位中寫入所有表格的加總值
-        sheet[f'AB2'] = total_fossil
-        sheet[f'AC2'] = total_biogenic
-        sheet[f'AD2'] = total_land_transformation
+        sheet[f'AB2'] = round(total_fossil, 3)
+        sheet[f'AC2'] = round(total_biogenic, 3)
+        sheet[f'AD2'] = round(total_land_transformation, 3)
         # 在每個工作表的 AE 欄位中寫入 AB/AC/AD 欄位的加總值
-        sheet[f'AE2'] = total_fossil + total_biogenic + total_land_transformation
+        sheet[f'AE2'] = round(total_fossil + total_biogenic + total_land_transformation, 3)
 
         # 返回每個工作表的加總值
         return total_fossil, total_biogenic, total_land_transformation
@@ -619,7 +646,15 @@ class ExcelApp:
                 if source_sheet_name and source_sheet_name in source_data:
                     data = source_data[source_sheet_name]
                     num_data_rows = data.shape[0]
-                    data_rows = [list(data.iloc[i]) for i in range(num_data_rows)]
+                    fixed_col_count = 27  # A-AA
+                    data_rows = []
+                    for i in range(num_data_rows):
+                        row = list(data.iloc[i])
+                        if len(row) < fixed_col_count:
+                            row.extend([""] * (fixed_col_count - len(row)))
+                        elif len(row) > fixed_col_count:
+                            row = row[:fixed_col_count]
+                        data_rows.append(row)
 
                     # 原本預留◎符號所在列及其後兩列，共 3 列
                     insert_index = base_pos + 3 + offset
@@ -647,7 +682,7 @@ class ExcelApp:
 
     def transform_sheet(self):
         """
-        將原始 Excel 表單轉換成盤查表單格式：
+        將自動化Excel表單轉換成盤查表單格式：
         1. 用 openpyxl 讀取模板檔案（PLCI_table_format.xlsx），取得各工作表內容。
         2. 根據模板中◎符號所在行決定插入點：
            模板中原本預留◎符號所在行及後兩列（共3列）的區塊，
@@ -722,7 +757,8 @@ class ExcelApp:
                     'Distribution(Customer)'
                 ],
                 'Recycling': ['Recyling(Recyling)'],
-                'Usage': ['Usage']
+                'Usage': ['Usage'],
+                'overview': ['INPUT']
             }
             
             # 讀取來源資料，各工作表以 DataFrame 儲存
@@ -796,8 +832,16 @@ class ExcelApp:
                             sheet_name = source_sheet_list[pos_idx]
                             data = source_data[sheet_name]
                             num_data_rows = data.shape[0]
-                            data_rows = [list(data.iloc[i]) for i in range(num_data_rows)]
-                            
+                            fixed_col_count = 27  # A-AA
+                            data_rows = []
+                            for i in range(num_data_rows):
+                                row = list(data.iloc[i])
+                                if len(row) < fixed_col_count:
+                                    row.extend([""] * (fixed_col_count - len(row)))
+                                elif len(row) > fixed_col_count:
+                                    row = row[:fixed_col_count]
+                                data_rows.append(row)
+
                             # 原本預留◎符號所在列及其後兩列，共 3 列
                             insert_index = base_pos + 3 + offset
 
@@ -879,6 +923,17 @@ class ExcelApp:
                 # 在 H2 設定你要的公式，例如：合計 AB2 到 AE2
                 overview.Range("H2").Formula = "='Raw Material'!AE2+Manufacturing!AE2+Distribution!AE2+Recycling!AE2+Usage!AE2"
                 overview.Range("V2").Formula = "=Usage!$K$5"
+                input_sheet = wb_new.Sheets("INPUT")
+                overview.Range("C17").Value = input_sheet.Range("B1").Value #產品F階段名稱
+                overview.Range("C18").Value = input_sheet.Range("B2").Value #盤查起始時間
+                overview.Range("G18").Value = input_sheet.Range("B3").Value #盤查結束時間
+                
+                factory_site = self.factory_site.strip() if isinstance(self.factory_site, str) else ""
+                factory_info = FACTORY_OVERVIEW_INFO.get(factory_site)
+                if factory_info:
+                    overview.Range("C3").Value = factory_info["name"]
+                    overview.Range("C4").Value = factory_info["address"]
+                # *新增*填入產品資訊(公司廠址名稱、盤查地址、機種、型號、時間區間、照片)
                 # 如果要寫入本地語系公式，可改用 FormulaLocal
                 # overview.Range("H2").FormulaLocal = "=SUM(AB2:AE2)"
                 print("已在 overview 工作表寫入公式")
@@ -1720,13 +1775,13 @@ class ExcelApp:
         # 2. 用 Manu_data 插入 Word (表格標籤)
 
         Manu_sum = Manu_data['Damage Assessment'].sum()
-        self.context['Manufacturing_total'] = round(Manu_sum, 4)
+        self.context['Manufacturing_total'] = round(Manu_sum, 3)
 
         for idx, row in Manu_data.head(10).reset_index(drop=True).iterrows():
             i = idx + 1  # 1-based index
             self.context[f'Manufacturing_Name_{i}']              = row['Name']
             self.context[f'Manufacturing_name_of_database_{i}']  = row['name of database']
-            self.context[f'Manufacturing_Damage_Assessment_{i}'] = round(row['Damage Assessment'], 4)
+            self.context[f'Manufacturing_Damage_Assessment_{i}'] = round(row['Damage Assessment'], 3)
             # 百分比
             pct = row['Damage Assessment'] / Manu_sum * 100
             self.context[f'Manufacturing_percentage_{i}']        = f"{round(pct, 2)}%"
@@ -1739,7 +1794,7 @@ class ExcelApp:
             self.context[f'Manufacturing_percentage_{i}']        = ""
 
 
-        remaining_val = round(Manu_data['Damage Assessment'][10:].sum(), 4)
+        remaining_val = round(Manu_data['Damage Assessment'][10:].sum(), 3)
         self.context['Remaining_processes_2'] = remaining_val
         total_dmg = Manu_data['Damage Assessment'].sum()
         if total_dmg > 0:
