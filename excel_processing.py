@@ -90,9 +90,12 @@ class ExcelApp:
         from win32com.client import DispatchEx
         if file_path is not None:
             self.file_path = file_path
+        self.last_error = None
         if not self.file_path:
+            err_msg = "請選擇 Excel 文件"
+            self.last_error = err_msg
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
-            return
+            return {"ok": False, "error": err_msg}
 
         excel = None
         com_wb = None
@@ -190,14 +193,11 @@ class ExcelApp:
                 excel.CalculateUntilAsyncQueriesDone()
                 com_wb.Save()
 
-                if self.update_progress_smooth: # 更新進度至 100%
-                    self.update_progress_smooth(95, 100, step=1, delay=0.05)
-                return {"ok": True, "result_file": self.result_file, "report_file": self.report_file}
-
             except Exception as e:
                 print(f"處理文件時出錯：{e}")
-                self.last_error = str(e)
-                return {"ok": False, "error": str(e)}  # 告知呼叫方：失敗
+                err_msg = f"{e}\n{traceback.format_exc()}"
+                self.last_error = err_msg
+                return {"ok": False, "error": err_msg}  # 告知呼叫方：失敗
 
             finally:
                 try:
@@ -216,9 +216,16 @@ class ExcelApp:
                     except Exception:
                         pass
 
+            return {
+                "ok": True,
+                "result_file": self.result_file,
+                "report_file": self.report_file,
+            }
+
         except Exception as e:
-            self.last_error = str(e)
-            return {"ok": False, "error": str(e)}
+            err_msg = f"{e}\n{traceback.format_exc()}"
+            self.last_error = err_msg
+            return {"ok": False, "error": err_msg}
 
 
 
@@ -706,6 +713,20 @@ class ExcelApp:
             self._notify_status("開始執行 Transform Sheet")
             print("開始執行 Transform Sheet")
             self.source_file_path = self.file_path
+            input_values = {"product_name": "", "start_date": "", "end_date": ""}
+            try:
+                wb_input = openpyxl.load_workbook(self.source_file_path, read_only=True, data_only=True)
+                if "INPUT" in wb_input.sheetnames:
+                    ws_input = wb_input["INPUT"]
+                    input_values["product_name"] = ws_input["B1"].value or ""
+                    input_values["start_date"] = ws_input["B2"].value or ""
+                    input_values["end_date"] = ws_input["B3"].value or ""
+            finally:
+                try:
+                    wb_input.close()
+                except Exception:
+                    pass
+
             base_dir = os.path.dirname(os.path.abspath(__file__))   # 取得目前 script 所在的資料夾/Temp檔路徑下
             target_file_path = os.path.join(base_dir, "PLCI_table_format.xlsx")
             # 用 openpyxl 讀取模板
@@ -716,7 +737,7 @@ class ExcelApp:
                 self.update_progress_smooth(0, 10, step=1, delay=0.02)  # 第1階段完成：10%
             # 建立格式定義字典，僅針對指定工作表
             format_definitions = {}
-            for sheet_name in ['Raw Material', 'Manufacturing', 'Distribution', 'Recycling', 'Usage']:
+            for sheet_name in ['Raw Material', 'Manufacturing', 'Distribution', 'Recycling', 'Usage', 'overview']:
                 if sheet_name in template_wb.sheetnames:
                     sheet = template_wb[sheet_name]
                     fd = [] # 空的串列
@@ -757,8 +778,7 @@ class ExcelApp:
                     'Distribution(Customer)'
                 ],
                 'Recycling': ['Recyling(Recyling)'],
-                'Usage': ['Usage'],
-                'overview': ['INPUT']
+                'Usage': ['Usage']
             }
             
             # 讀取來源資料，各工作表以 DataFrame 儲存
@@ -783,7 +803,8 @@ class ExcelApp:
             current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
             new_file_name = f'merged_result_{current_datetime}.xlsx'
             new_file_path = os.path.join(self.output_dir, new_file_name)
-            workbook = xlsxwriter.Workbook(new_file_path, {'nan_inf_to_errors': True})    
+            workbook = xlsxwriter.Workbook(new_file_path, {'nan_inf_to_errors': True})
+            formula_entries = {}    
 
             if self.update_progress_smooth:
                 self.update_progress_smooth(30, 80, step=1, delay=0.05) # 第4階段完成：80%
@@ -803,7 +824,8 @@ class ExcelApp:
                     for cell in row:
                         cell_info = {
                             "value": cell.value,
-                            "format": self.get_format_dict(cell)  # 函式取得格式設定
+                            "format": self.get_format_dict(cell),  # 函式取得格式設定
+                            "is_formula": cell.data_type == "f"
                         }
                         current_row.append(cell_info)
                     template_rows.append(current_row)
@@ -824,36 +846,6 @@ class ExcelApp:
                     target_sheet_name
                 )
 
-                for pos_idx, base_pos in enumerate(base_insert_positions):
-                    print("開始處理插入點，pos_idx =", pos_idx)
-                    self._notify_status(f"開始處理插入點，pos_idx ={pos_idx}")
-                    try:
-                        if pos_idx < len(source_sheet_list):
-                            sheet_name = source_sheet_list[pos_idx]
-                            data = source_data[sheet_name]
-                            num_data_rows = data.shape[0]
-                            fixed_col_count = 27  # A-AA
-                            data_rows = []
-                            for i in range(num_data_rows):
-                                row = list(data.iloc[i])
-                                if len(row) < fixed_col_count:
-                                    row.extend([""] * (fixed_col_count - len(row)))
-                                elif len(row) > fixed_col_count:
-                                    row = row[:fixed_col_count]
-                                data_rows.append(row)
-
-                            # 原本預留◎符號所在列及其後兩列，共 3 列
-                            insert_index = base_pos + 3 + offset
-
-                            # 插入來源資料，將 data_rows 這個清單「插入」到 new_sheet_rows 的指定位置
-                            new_sheet_rows[insert_index:insert_index] = data_rows   #「從第 insert_index 個元素開始，到第 insert_index 個元素結束」
-                            offset += num_data_rows
-                            print(f"在 {target_sheet_name} 的索引 {insert_index} 插入 {num_data_rows} 行來源資料")
-                        else:
-                            print(f"模板中無對應來源資料，無法插入 {sheet_name} 的資料")
-                    except Exception as e:
-                        print(f"無法處理 {sheet_name} 工作表：{e}")
-
                 default_format = [cell_info["format"] for cell_info in format_definitions[target_sheet_name][4]]
                 self._fallback_fmt = workbook.add_format({
                                         'border': 1,
@@ -862,32 +854,44 @@ class ExcelApp:
                                     })
 
                 # 將最終結果寫入 xlsxwriter 工作表
+                def _write_cell(ws, row_idx, col_idx, value, fmt):
+                    if isinstance(value, str) and value.startswith("="):
+                        ws.write_string(row_idx, col_idx, value, fmt)
+                    else:
+                        ws.write(row_idx, col_idx, value, fmt)
+
                 for r, row in enumerate(new_sheet_rows):
                     for c, cell in enumerate(row):
                         # 先取出值與格式 dict
                         if isinstance(cell, dict):
                             val = cell.get("value", "")
                             fmt_dict = cell.get("format") or {}
+                            is_formula = cell.get("is_formula", False)
                         else:
                             val = cell
                             fmt_dict = {}
+                            is_formula = False
+
+                        if is_formula and isinstance(val, str):
+                            formula = val if val.startswith("=") else f"={val}"
+                            formula_entries.setdefault(target_sheet_name, []).append((r, c, formula))
 
                         if fmt_dict:
                             # 只有當 fmt_dict 裡真的有設定才建 format
                             # cell_fmt = workbook.add_format(fmt_dict, workbook)
                             cell_fmt = self._get_format(fmt_dict, workbook)
-                            worksheet.write(r, c, val, cell_fmt)
+                            _write_cell(worksheet, r, c, val, cell_fmt)
                         else:
                             # 沒有自訂格式，就用 default_format
                             if isinstance(default_format, list) and c < len(default_format):
                                 dfmt = default_format[c]  # 取出 column 對應的格式 dict
                                 # cell_fmt = workbook.add_format(dfmt, workbook)
                                 cell_fmt = self._get_format(dfmt, workbook)
-                                worksheet.write(r, c, val, cell_fmt)
+                                _write_cell(worksheet, r, c, val, cell_fmt)
                             else:
                                 # fallback 样式
                                 cell_fmt = self._fallback_fmt
-                            worksheet.write(r, c, val if val is not None else "", cell_fmt)
+                            _write_cell(worksheet, r, c, val if val is not None else "", cell_fmt)
 
             if self.update_progress_smooth:
                 self.update_progress_smooth(80, 95, step=1, delay=0.02) # 第5階段完成：95%
@@ -907,6 +911,12 @@ class ExcelApp:
                               CorruptLoad=1,
                               ReadOnly=True,
                               IgnoreReadOnlyRecommended=True)
+            #(測試)確認新檔案存在
+            print(new_file_path)
+            print("exists:", os.path.exists(new_file_path))
+            if os.path.exists(new_file_path):
+                print("size:", os.path.getsize(new_file_path))
+
             wb_new = excel.Workbooks.Open(new_file_path, CorruptLoad=1)
             static_sheets = ['Instruction', 'overview', 'Process flow chart', 'simapro10.2.0.0']
             for sheet_name in static_sheets:
@@ -917,16 +927,28 @@ class ExcelApp:
                     print(f"複製「{sheet_name}」失敗：{e}")
 
             # 複製完所有靜態頁後，加入以下程式碼
+            # Write back formulas after static sheet copy
+            for sheet_name, formula_list in formula_entries.items():
+                try:
+                    ws_target = wb_new.Sheets(sheet_name)
+                except Exception as e:
+                    print(f"Formula writeback skipped: missing sheet {sheet_name}: {e}")
+                    continue
+                for row_idx, col_idx, formula in formula_list:
+                    try:
+                        ws_target.Cells(row_idx + 1, col_idx + 1).Formula = formula
+                    except Exception as e:
+                        print(f"Formula writeback failed: {sheet_name} {row_idx + 1},{col_idx + 1} {formula}: {e}")
+
             try:
                 # 取得 wb_new 的 overview 工作表
                 overview = wb_new.Sheets("overview")
                 # 在 H2 設定你要的公式，例如：合計 AB2 到 AE2
                 overview.Range("H2").Formula = "='Raw Material'!AE2+Manufacturing!AE2+Distribution!AE2+Recycling!AE2+Usage!AE2"
                 overview.Range("V2").Formula = "=Usage!$K$5"
-                input_sheet = wb_new.Sheets("INPUT")
-                overview.Range("C17").Value = input_sheet.Range("B1").Value #產品F階段名稱
-                overview.Range("C18").Value = input_sheet.Range("B2").Value #盤查起始時間
-                overview.Range("G18").Value = input_sheet.Range("B3").Value #盤查結束時間
+                overview.Range("C17").Value = input_values["product_name"] #產品F階段名稱
+                overview.Range("C18").Value = input_values["start_date"] #盤查起始時間
+                overview.Range("G18").Value = input_values["end_date"] #盤查結束時間
                 
                 factory_site = self.factory_site.strip() if isinstance(self.factory_site, str) else ""
                 factory_info = FACTORY_OVERVIEW_INFO.get(factory_site)
@@ -948,12 +970,13 @@ class ExcelApp:
                 wb_tpl.RefreshAll()
                 print("靜態頁複製完成")
                 self._notify_status("靜態頁複製完成")
-                if self.update_progress_smooth:
-                    self.update_progress_smooth(95, 100, step=1, delay=0.01) # 第6階段完成：100%
+
                 # 存檔、關檔、退出
                 wb_new.Save()
                 wb_tpl.Close(False)
                 wb_new.Close(False)
+                if self.update_progress_smooth:
+                    self.update_progress_smooth(95, 100, step=1, delay=0.01) # 第6階段完成：100%
                 # pythoncom.CoUninitialize()    
                 ok = True
             except Exception as e:
@@ -965,7 +988,10 @@ class ExcelApp:
         except Exception as e:
             # 捕捉其他未預期錯誤
             tb = traceback.format_exc()
-            err_msg = f"處理 Transform Sheet 時出錯：{e}\n{tb}"
+            if isinstance(e, PermissionError) or getattr(e, "errno", None) == 13:
+                err_msg = "檔案開啟中無法讀取"
+            else:
+                err_msg = f"處理 Transform Sheet 時出錯：{e}\n{tb}"
             print(f"處理 Transform Sheet 時出錯：{e}\n{tb}")
             return False
         finally:
