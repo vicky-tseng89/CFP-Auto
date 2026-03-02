@@ -148,16 +148,31 @@ class ExcelApp:
             self.update_progress_smooth(70, 95, step=1, delay=0.05) # 階段4：儲存結果，模擬進度從 70% 到 99%
             # 獲取當前的日期和時間，用於生成檔案名稱
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            product_name_suffix = ""
+            if "overview" in result_workbook.sheetnames:
+                product_name_suffix = str(result_workbook["overview"]["C17"].value or "").strip()
+            elif "INPUT" in result_workbook.sheetnames:
+                product_name_suffix = str(result_workbook["INPUT"]["B1"].value or "").strip()
+            if product_name_suffix:
+                product_name_suffix = re.sub(r'[\\/:*?"<>|]+', '_', product_name_suffix)
+                product_name_suffix = re.sub(r'\s+', '_', product_name_suffix).strip("._")
+                product_name_suffix = product_name_suffix[:80]
             self._notify_status("保存更新後的報告，附上日期和時間...")
             print("保存更新後的報告，附上日期和時間...")
             # 保存更新後的報告，附上日期和時間
-            self.report_file = f'report_{current_time}.xlsx'
+            if product_name_suffix:
+                self.report_file = f'report_{product_name_suffix}_{current_time}.xlsx'
+            else:
+                self.report_file = f'report_{current_time}.xlsx'
             self.report_file = os.path.join(self.output_dir, self.report_file)
             print("路徑位置：",self.output_dir)
             report_workbook.save(self.report_file)
             
             # 另存為新文件，保留原有的表格樣式，附上日期和時間
-            self.result_file = f'result_{current_time}.xlsx'
+            if product_name_suffix:
+                self.result_file = f'result_{product_name_suffix}_{current_time}.xlsx'
+            else:
+                self.result_file = f'result_{current_time}.xlsx'
             self.result_file = os.path.join(self.output_dir, self.result_file)
             result_workbook.save(self.result_file)
 
@@ -716,9 +731,13 @@ class ExcelApp:
             input_values = {"product_name": "", "start_date": "", "end_date": ""}
             try:
                 wb_input = openpyxl.load_workbook(self.source_file_path, read_only=True, data_only=True)
+                if "overview" in wb_input.sheetnames:
+                    ws_overview = wb_input["overview"]
+                    input_values["product_name"] = ws_overview["C17"].value or ""
                 if "INPUT" in wb_input.sheetnames:
                     ws_input = wb_input["INPUT"]
-                    input_values["product_name"] = ws_input["B1"].value or ""
+                    if not input_values["product_name"]:
+                        input_values["product_name"] = ws_input["B1"].value or ""
                     input_values["start_date"] = ws_input["B2"].value or ""
                     input_values["end_date"] = ws_input["B3"].value or ""
             finally:
@@ -801,7 +820,16 @@ class ExcelApp:
 
             # 建立新的 xlsxwriter 工作簿
             current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
-            new_file_name = f'merged_result_{current_datetime}.xlsx'
+            product_name_suffix = str(input_values.get("product_name", "")).strip()
+            if product_name_suffix:
+                product_name_suffix = re.sub(r'[\\/:*?"<>|]+', '_', product_name_suffix)
+                product_name_suffix = re.sub(r'\s+', '_', product_name_suffix).strip("._")
+                product_name_suffix = product_name_suffix[:80]
+
+            if product_name_suffix:
+                new_file_name = f'merged_result_{product_name_suffix}_{current_datetime}.xlsx'
+            else:
+                new_file_name = f'merged_result_{current_datetime}.xlsx'
             new_file_path = os.path.join(self.output_dir, new_file_name)
             workbook = xlsxwriter.Workbook(new_file_path, {'nan_inf_to_errors': True})
             formula_entries = {}    
