@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from docx import Document
 from docx.shared import Inches
 from docxtpl import DocxTemplate, InlineImage
@@ -26,6 +26,10 @@ FACTORY_OVERVIEW_INFO = {
     "竹北": {"name": "竹北廠", "address": "新竹縣竹北市北興里智慧一路1號"},
 }
 
+class UserCancelledError(Exception):
+    pass
+
+
 class ExcelApp:
     def __init__(self, status_callback=None, progress_callback=None):
         self._no_op_status_callback = lambda *_, **__: None
@@ -42,6 +46,8 @@ class ExcelApp:
         self.error_callback = None
         self._format_cache = {}
         self.factory_site = ""
+        self.cancel_event = None
+        self.was_cancelled = False
 
         # ──────────────────────────────────────────────────────────
         # 自動在程式路徑下建立「結果」資料夾
@@ -62,6 +68,23 @@ class ExcelApp:
             callback = self._no_op_status_callback
             self._has_status_callback = False
         callback(message)
+
+    def set_cancel_event(self, cancel_event):
+        self.cancel_event = cancel_event
+
+    def clear_cancel(self):
+        self.was_cancelled = False
+        if self.cancel_event is not None:
+            self.cancel_event.clear()
+
+    def request_cancel(self):
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+
+    def _check_cancel(self):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            self.was_cancelled = True
+            raise UserCancelledError("Operation cancelled by user.\n已取消作業，未寫入任何檔案。")
 
     def get_base_dir(self):
         """
@@ -91,6 +114,8 @@ class ExcelApp:
         if file_path is not None:
             self.file_path = file_path
         self.last_error = None
+        self.was_cancelled = False
+        self._check_cancel()
         if not self.file_path:
             err_msg = "請選擇 Excel 文件"
             self.last_error = err_msg
@@ -102,10 +127,12 @@ class ExcelApp:
         com_initialized = False
 
         try:
+            self._check_cancel()
             self.update_progress_smooth(0, 10, step=1, delay=0.5) # 階段1：讀取 Excel 檔案與資料準備，模擬從 0% 到 10%
             # 使用 openpyxl 讀取原始的 Excel 文件，保留原始格式和樣式
             self._notify_status("讀取 Excel 文件...")
             print("讀取 Excel 文件...")
+            self._check_cancel()
             result_workbook = openpyxl.load_workbook(self.file_path, keep_vba=False, keep_links=False)
             sheet_A_tables = self.read_multiple_tables('Raw Material', self.file_path)      #呼叫 read_multiple_tables(sheet_name, file_path) 
             sheet_C_tables = self.read_multiple_tables('Manufacturing', self.file_path)     #讀取特定數個工作表（如 Raw Material、Manufacturing 等）
@@ -115,6 +142,7 @@ class ExcelApp:
             
             self.update_progress_smooth(10, 40, step=1, delay=0.05) # 階段2：讀取工作表B，處理工作表並計算數值，模擬進度從 10% 到 40%
             # 以 pandas 讀入另一張關鍵對照表（sheet_B，如 simapro10.2.0.0）
+            self._check_cancel()
             sheet_B = pd.read_excel(self.file_path, sheet_name='simapro10.2.0.0', usecols=['單位對照', 'fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)', 'unit']).dropna(subset=['單位對照'])
             self._notify_status("處理工作表並獲取總值...")
             print("處理工作表並獲取總值...")
@@ -130,6 +158,7 @@ class ExcelApp:
             print("讀取報告模板並寫入計算的數值...")
             base_dir = os.path.dirname(os.path.abspath(__file__))       # Temp檔路徑下
             report_path = os.path.join(base_dir, 'report_temp.xlsx')    # 將結果寫入報告範本 Excel (report_temp.xlsx) 中預定的儲存格
+            self._check_cancel()
             report_workbook = openpyxl.load_workbook(report_path)
             # 確保選擇報告中的 'general' 工作表
             if 'general' in report_workbook.sheetnames:
@@ -174,9 +203,11 @@ class ExcelApp:
             else:
                 self.result_file = f'result_{current_time}.xlsx'
             self.result_file = os.path.join(self.output_dir, self.result_file)
+            self._check_cancel()
             result_workbook.save(self.result_file)
 
         #    3. 用 Excel COM 自動修復並輸出最終結果
+            self._check_cancel()
             pythoncom.CoInitialize()
             com_initialized = True
             try:
@@ -189,6 +220,7 @@ class ExcelApp:
                 # CorruptLoad=1: 自動嘗試修復任何架構問題；UpdateLinks=0: 不更新外部連結
                 # 小延遲 + 確認檔案存在
                 for _ in range(5):
+                    self._check_cancel()
                     if os.path.exists(path):
                         try:
                             com_wb = excel.Workbooks.Open(
@@ -205,9 +237,12 @@ class ExcelApp:
 
                 if com_wb is None:
                     raise RuntimeError(f"Excel 無法開啟結果檔：{path}")
+                self._check_cancel()
                 excel.CalculateUntilAsyncQueriesDone()
                 com_wb.Save()
 
+            except UserCancelledError:
+                raise
             except Exception as e:
                 print(f"處理文件時出錯：{e}")
                 err_msg = f"{e}\n{traceback.format_exc()}"
@@ -236,6 +271,10 @@ class ExcelApp:
                 "result_file": self.result_file,
                 "report_file": self.report_file,
             }
+        except UserCancelledError as e:
+            self.was_cancelled = True
+            self.last_error = str(e)
+            return {"ok": False, "cancelled": True, "error": str(e)}
 
         except Exception as e:
             err_msg = f"{e}\n{traceback.format_exc()}"
@@ -288,6 +327,7 @@ class ExcelApp:
         total_biogenic = 0
         total_land_transformation = 0
         for i, (start_idx, sheet_data) in enumerate(sheet_tables):
+            self._check_cancel()
             required_cols = ['name of database']
             missing = [c for c in required_cols if c not in sheet_data.columns]
             if missing:
@@ -332,6 +372,7 @@ class ExcelApp:
 
             # 判斷工作表和工作表B的單位是否一致
             for idx, row in merged_df.iterrows():
+                self._check_cancel()
                 if pd.notna(row['Unit']) and pd.notna(row['unit']):
                     if row['Unit'] != row['unit']:
                         if row['Unit'] in ['g', 'kg', 'ton'] and row['unit'] in ['g', 'kg', 'ton']:
@@ -397,6 +438,7 @@ class ExcelApp:
             # 假設 damage 欄位放在 fossil 欄位之後的下一欄
             num_rows = len(merged_df)
             for i in range(num_rows):
+                self._check_cancel()
                 # Excel 的列號從 1 開始，所以 row_num 需要調整
                 row_num = start_idx + 3 + i + 1  
                 fossil_cell = f"{col_start}{row_num}"
@@ -652,6 +694,7 @@ class ExcelApp:
         status_cb = getattr(self, "status_callback", None)
 
         for pos_idx, base_pos in enumerate(base_insert_positions):
+            self._check_cancel()
             start_msg = f"開始處理插入點，pos_idx ={pos_idx}"
             print(start_msg)
             if status_cb:
@@ -671,6 +714,7 @@ class ExcelApp:
                     fixed_col_count = 27  # A-AA
                     data_rows = []
                     for i in range(num_data_rows):
+                        self._check_cancel()
                         row = list(data.iloc[i])
                         if len(row) < fixed_col_count:
                             row.extend([""] * (fixed_col_count - len(row)))
@@ -718,18 +762,23 @@ class ExcelApp:
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return
 
+        self.was_cancelled = False
+        self._check_cancel()
+
         ok = False
         err_msg = None
         wb_tpl = None
         wb_new = None
         excel = None
         try:
+            self._check_cancel()
             self._format_cache.clear()  # 清空格式快取
             self._notify_status("開始執行 Transform Sheet")
             print("開始執行 Transform Sheet")
             self.source_file_path = self.file_path
             input_values = {"product_name": "", "start_date": "", "end_date": ""}
             try:
+                self._check_cancel()
                 wb_input = openpyxl.load_workbook(self.source_file_path, read_only=True, data_only=True)
                 if "overview" in wb_input.sheetnames:
                     ws_overview = wb_input["overview"]
@@ -749,6 +798,7 @@ class ExcelApp:
             base_dir = os.path.dirname(os.path.abspath(__file__))   # 取得目前 script 所在的資料夾/Temp檔路徑下
             target_file_path = os.path.join(base_dir, "PLCI_table_format.xlsx")
             # 用 openpyxl 讀取模板
+            self._check_cancel()
             template_wb = openpyxl.load_workbook(target_file_path)
             print("PASS1...")
             self._notify_status("PASS1...")
@@ -803,7 +853,9 @@ class ExcelApp:
             # 讀取來源資料，各工作表以 DataFrame 儲存
             source_data = {}
             for target_sheet_name, source_sheet_list in self.source_sheets.items():
+                self._check_cancel()
                 for sheet_name in source_sheet_list:
+                    self._check_cancel()
                     try:
                         df = pd.read_excel(self.source_file_path, sheet_name=sheet_name)
                         # 將無限大值替換並填充空值，讓 xlsxwriter 能正確處理
@@ -838,6 +890,7 @@ class ExcelApp:
                 self.update_progress_smooth(30, 80, step=1, delay=0.05) # 第4階段完成：80%
             # 處理每個目標工作表
             for target_sheet_name, source_sheet_list in self.source_sheets.items():
+                self._check_cancel()
                 print(f"處理目標工作表：{target_sheet_name}")
                 worksheet = workbook.add_worksheet(target_sheet_name)
                 if target_sheet_name in template_wb.sheetnames:
@@ -889,6 +942,7 @@ class ExcelApp:
                         ws.write(row_idx, col_idx, value, fmt)
 
                 for r, row in enumerate(new_sheet_rows):
+                    self._check_cancel()
                     for c, cell in enumerate(row):
                         # 先取出值與格式 dict
                         if isinstance(cell, dict):
@@ -923,10 +977,12 @@ class ExcelApp:
 
             if self.update_progress_smooth:
                 self.update_progress_smooth(80, 95, step=1, delay=0.02) # 第5階段完成：95%
+            self._check_cancel()
             workbook.close()
             time.sleep(0.1)
             print("靜態頁複製")
             self._notify_status("靜態頁複製")
+            self._check_cancel()
             pythoncom.CoInitialize()
             excel = win32.DispatchEx("Excel.Application")
             excel.Visible = False  # 背後跑就好
@@ -945,9 +1001,11 @@ class ExcelApp:
             if os.path.exists(new_file_path):
                 print("size:", os.path.getsize(new_file_path))
 
+            self._check_cancel()
             wb_new = excel.Workbooks.Open(new_file_path, CorruptLoad=1)
             static_sheets = ['Instruction', 'overview', 'Process flow chart', 'simapro10.2.0.0']
             for sheet_name in static_sheets:
+                self._check_cancel()
                 try:
                     # 把範本的這張 Copy 到新檔，放在第一張動態頁前面
                     wb_tpl.Sheets(sheet_name).Copy(Before=wb_new.Sheets(1))
@@ -957,12 +1015,14 @@ class ExcelApp:
             # 複製完所有靜態頁後，加入以下程式碼
             # Write back formulas after static sheet copy
             for sheet_name, formula_list in formula_entries.items():
+                self._check_cancel()
                 try:
                     ws_target = wb_new.Sheets(sheet_name)
                 except Exception as e:
                     print(f"Formula writeback skipped: missing sheet {sheet_name}: {e}")
                     continue
                 for row_idx, col_idx, formula in formula_list:
+                    self._check_cancel()
                     try:
                         ws_target.Cells(row_idx + 1, col_idx + 1).Formula = formula
                     except Exception as e:
@@ -995,6 +1055,7 @@ class ExcelApp:
             
             try:
                 # 然後再執行 RefreshAll 並存檔
+                self._check_cancel()
                 wb_tpl.RefreshAll()
                 print("靜態頁複製完成")
                 self._notify_status("靜態頁複製完成")
@@ -1013,6 +1074,11 @@ class ExcelApp:
                 return False
             # 成功的回傳值
             return new_file_path
+        except UserCancelledError as e:
+            self.was_cancelled = True
+            err_msg = str(e)
+            self.last_error = err_msg
+            return False
         except Exception as e:
             # 捕捉其他未預期錯誤
             tb = traceback.format_exc()
@@ -1090,6 +1156,7 @@ class ExcelApp:
         err_msg = None  
 
         try:
+            self._check_cancel()
             pythoncom.CoInitialize()
             # 建立 Excel 應用程式實例（不顯示）
             excel = win32.DispatchEx("Excel.Application")
@@ -1101,6 +1168,7 @@ class ExcelApp:
                 ReadOnly=False
             )           
             # 強制計算所有公式
+            self._check_cancel()
             excel.CalculateUntilAsyncQueriesDone()
             # 儲存並關閉工作簿
             wb.Save() 
@@ -1108,7 +1176,10 @@ class ExcelApp:
             pythoncom.CoUninitialize()
             ok = True
             return True
-        
+        except UserCancelledError as e:
+            self.was_cancelled = True
+            self.last_error = str(e)
+            raise
         except Exception as e:
             err_msg = f"更新 Excel 快取值時發生錯誤：{e}"
             print(f"更新 Excel 快取值時發生錯誤：{e}")
@@ -1154,6 +1225,8 @@ class ExcelApp:
         3. 最後將完整報告書存檔，檔名格式為 "智邦-產品碳足跡盤查總報告書_{today_date}.docx"
         
         """
+        self.was_cancelled = False
+        self._check_cancel()
         # 檢查是否已有數據處理過的檔案，才能進行
         if not hasattr(self, 'result_file') or not hasattr(self, 'report_file'):
             messagebox.showerror("錯誤", "請先處理檔案，再產生報告。")
@@ -1168,14 +1241,18 @@ class ExcelApp:
         # template_file= r'D:\OneDrive - Accton Technology Corporation\Python\code\Excel_Vlookup_Python\智邦-產品碳足跡盤查總報告書_竹南_temp.docx'
 
         if result_file:
+            self._check_cancel()
             try:
                 # 在讀取前先更新公式快取值，確保公式計算後的值有被存入檔案中
-                self.update_excel_cache(result_file)
+                cache_ok = self.update_excel_cache(result_file)
+                if cache_ok is False:
+                    return False
             except Exception as e:
                 messagebox.showerror("錯誤", f"{e}")
                 return  False
 
         base_dir = os.path.dirname(os.path.abspath(__file__))   # 取得目前 script 所在的資料夾
+        self._check_cancel()
         # 依據 template_choice 選擇不同模板
         if template_choice == "竹南":
             template_file = os.path.join(base_dir, "智邦-產品碳足跡盤查總報告書_竹南_temp.docx")
@@ -1197,6 +1274,7 @@ class ExcelApp:
             )
             return  False
         try:
+            self._check_cancel()
             doc = Document(template_file)
         except Exception as e:
             print("錯誤", f"開啟 Word template 失敗：{e}")
@@ -1210,6 +1288,7 @@ class ExcelApp:
         transport_sheets = ['Raw Material', 'Manufacturing', 'Distribution']
 
         self._notify_status("讀取數據處理後產生的檔案...")
+        self._check_cancel()
         df = pd.read_excel(result_file, sheet_name="overview") # 讀取盤查表單'overview'所需的欄位數值​
 
         today_date = datetime.today().strftime("%Y-%m-%d_%H%M%S")
@@ -1221,6 +1300,7 @@ class ExcelApp:
         # 建立存放各筆資料的 context 清單
         all_contexts = []
         for _, row in df.iterrows():
+            self._check_cancel()
             if pd.isna(row['start_date']) or pd.isna(row['end_date']):
                 continue
 
@@ -1244,6 +1324,7 @@ class ExcelApp:
 
         if all_contexts:
             try:
+                self._check_cancel()
                 # 建立 DocxTemplate 物件
                 doc = DocxTemplate(template_file)
                 # 模板中可使用 {% for item in all_contexts %} ... {% endfor %} 來逐筆列印資料
@@ -1263,46 +1344,61 @@ class ExcelApp:
         # === 3. 以盤查表單作為基底，繼續處理其數據與圖表，生成完整報告書 ===
         # 呼叫各個盤查表單統整計算函式，將數據與圖表插入報告中
         self._notify_status("呼叫各個盤查表單統整計算函式，將數據與圖表生成...")
+        self._check_cancel()
         all_results = self.process_all_worksheets(result_file, sheet_names)
+        self._check_cancel()
         self.insert_data_to_word(all_results, sheet_names)
+        self._check_cancel()
         self.generate_bar_chart(doc, all_results, sheet_names)
         if self.update_progress_smooth:
             self.update_progress_smooth(50, 60, step=1, delay=0.02)  # 第六階段完成：60%
         
         # Raw Material 處理與圖表生成
         self._notify_status("Raw Material 處理與圖表生成...")
+        self._check_cancel()
         resulall_data_1, Raw_data = self.process_worksheet(result_file, 'Raw Material')
+        self._check_cancel()
         self.process_insert_raw_data(result_file)
+        self._check_cancel()
         self.generate_insert_raw_charts(doc, Raw_data)
         if self.update_progress_smooth:
             self.update_progress_smooth(60, 70, step=1, delay=0.02)  # 第七階段完成：70%
         
         # Manufacturing 處理與圖表生成
         print("Manufacturing 處理與圖表生成...")
+        self._check_cancel()
         resulall_data_2, Manu_data = self.process_worksheet(result_file, 'Manufacturing')
+        self._check_cancel()
         self.process_insert_manufacturing_data(result_file)
+        self._check_cancel()
         self.generate_insert_manufacturing_charts(doc, Manu_data)
+        self._check_cancel()
         self.generate_and_insert_electric_chart(doc, resulall_data_2)
         if self.update_progress_smooth:
             self.update_progress_smooth(70, 80, step=1, delay=0.02)  # 第八階段完成：80%
         
         # 前十大統整處理
         self._notify_status("前十大統整處理與圖表生成...")
+        self._check_cancel()
         self.process_top10_data(sheet_names, result_file, doc)
         if self.update_progress_smooth:
             self.update_progress_smooth(80, 95, step=1, delay=0.02)  # 第十階段處理完畢前：95%
         
         # 運輸相關數據處理
         self._notify_status("運輸相關數據處理與圖表生成...")
+        self._check_cancel()
         Air_all_data = self.process_transport_data(result_file, transport_sheets)
+        self._check_cancel()
         self.analyze_and_chart_generate(Air_all_data, doc)
 
         # 將儲存在 self.context  的數據 & 圖表匯入
         self._notify_status("所有數據與圖表匯入報告書...")
+        self._check_cancel()
         doc.render(self.context)    
 
         # === 4. 存檔完整報告書 ===
         self._notify_status("保存文件...")
+        self._check_cancel()
         full_report_file = os.path.join(
             self.output_dir, f"智邦-產品碳足跡盤查總報告書_{today_date}.docx")
         doc.save(full_report_file)
@@ -1314,6 +1410,7 @@ class ExcelApp:
 
     def process_worksheet(self, file_name, sheet_name):
         """處理單個表單的數據，返回結果字典和整合數據框。"""
+        self._check_cancel()
         df = pd.read_excel(file_name, sheet_name=sheet_name)  
         group_starts = df.index[df.iloc[:, 1].str.contains('^◎', na=False)].tolist()
         # 初始化一个空的字典，用于存储每个数据组的结果
@@ -1321,6 +1418,7 @@ class ExcelApp:
         all_data = pd.DataFrame()    
         # 循环处理每个数据群组
         for j in range(len(group_starts)):
+            self._check_cancel()
             start_idx = group_starts[j]
             end_idx = group_starts[j + 1] if j < len(group_starts) - 1 else df.shape[0]
 
@@ -1340,6 +1438,7 @@ class ExcelApp:
             ]
             # 1) 型別轉換與空值補 0
             for c in num_cols:
+                self._check_cancel()
                 group_data[c] = group_data[c].astype(float).fillna(0)
             # 2) 過濾：只保留「至少一個數值欄位非 0」的列
             mask = group_data[num_cols].sum(axis=1) != 0
@@ -1376,8 +1475,10 @@ class ExcelApp:
 
     def process_all_worksheets(self, file_name, sheet_names):
         """處理多個表單的數據，返回所有結果。"""
+        self._check_cancel()
         all_results = {}
         for sheet in sheet_names:
+            self._check_cancel()
             resulall_data, all_data = self.process_worksheet(file_name, sheet)
             all_results[sheet] = {'resulall_data': resulall_data, 'all_data': all_data}
             # print(all_results)
@@ -1391,6 +1492,7 @@ class ExcelApp:
         - doc: Document，Word 文件對象。
         - data_mapping: dict，標籤與數據的對應字典，例如 {'[TAG_1]': 'value1', '[TAG_2]': 'value2'}。
         """
+        self._check_cancel()
         print("【Process_2】開始將數據匯入 Word 文件")
         # 遍歷文檔中的所有段落，尋找標籤
         total_damage_assessment = 0
@@ -1398,6 +1500,7 @@ class ExcelApp:
         sum_biogenic = 0
         sum_land = 0
         for sheet in all_results.keys():
+            self._check_cancel()
             total_damage_assessment += all_results[sheet]['all_data']['Damage Assessment'].sum()
             sum_fossil += all_results[sheet]['all_data']['fossil(kg CO2-eq)'].sum()
             sum_biogenic += all_results[sheet]['all_data']['biogenic(kg CO2-eq)'].sum()
@@ -1405,6 +1508,7 @@ class ExcelApp:
          # 將碳排五階段統整的數值儲存至self.context
         sum_list = [] 
         for sheet in sheet_names:
+            self._check_cancel()
             sheet_key = re.sub(r'\W+', '_', sheet).strip('_')
             df = all_results[sheet]['all_data']
             fossil      = df['fossil(kg CO2-eq)'].sum()
@@ -1430,6 +1534,7 @@ class ExcelApp:
         sorted_sums = sorted(sum_list, key=lambda x: x[1], reverse=True)[:5]
 
         for idx, (sheet_key, val, names) in enumerate(sorted_sums, start=1):
+            self._check_cancel()
             pct = val / total_damage_assessment * 100
             # 存到 self.context
             self.context[f'Carbon_percentage_{idx}'] = f"{pct:.2f}%"
@@ -1446,6 +1551,7 @@ class ExcelApp:
         total_percentage_df = pd.DataFrame(columns=['Sheet', 'Total_Percentage'])
         # 假設 all_results 已經被填充了數據
         for sheet in sheet_names:
+            self._check_cancel()
             # 假設你已經有了每個工作表的 total_damage_assessment 值
             total_percentage = all_results[sheet]['all_data']['Damage Assessment'].sum() / total_damage_assessment * 100
             # 將數據添加到DataFrame中
@@ -1455,6 +1561,7 @@ class ExcelApp:
         print("total_percentage_df:", total_percentage_df)
 
         for j, row in total_percentage_df.iterrows():
+            self._check_cancel()
             self.context[f'Sheet_name_{j+1}']       = row['Sheet']
             self.context[f'Total_percentage_{j+1}'] = f"{round(row['Total_Percentage'],2)}%"
 
@@ -1478,6 +1585,7 @@ class ExcelApp:
         - sheet_names: list
             記錄各個工作表名稱的清單，如 ['Raw Material', 'Manufacturing', 'Distribution', ...]
         """
+        self._check_cancel()
         print("【Process_3】開始生成長條圖")
         # ------------------- 1. 計算各 Sheet 的 Damage Assessment 百分比長條圖 (bar_chart_1) -------------------
         # 先計算 total_damage_assessment
@@ -1491,6 +1599,7 @@ class ExcelApp:
         percentages = []
         sheet_labels = []
         for sheet in all_results:
+            self._check_cancel()
             sheet_sum = all_results[sheet]['all_data']['Damage Assessment'].sum()
             percentage = (sheet_sum / total_damage_assessment) * 100
             percentages.append(percentage)
@@ -1504,6 +1613,7 @@ class ExcelApp:
         plt.title('Percentage of Damage Assessment by Sheet')
         # 在每個 bar 上方添加數值標籤
         for i, bar in enumerate(bars):
+            self._check_cancel()
             bar.set_label(sheet_names[i])  # 如果您想在 legend 中顯示 sheet_names[i]
             yval = bar.get_height()
             plt.text(
@@ -1526,7 +1636,9 @@ class ExcelApp:
 
         # 計算 percentage
         for category in categories:
+            self._check_cancel()
             for sheet in sheet_labels:
+                self._check_cancel()
                 category_value = all_results[sheet]['all_data'][category].sum()
                 percentage = (category_value / total_damage_assessment) * 100 if total_damage_assessment > 0 else 0
                 category_data[category].append(percentage)
@@ -1539,6 +1651,7 @@ class ExcelApp:
         bars_all = []  # 用於存放所有條形的物件引用
 
         for i, sheet in enumerate(sheet_labels):
+            self._check_cancel()
             bar_positions = index + i * bar_width
             bar = plt.bar(
                 bar_positions,
@@ -1551,7 +1664,9 @@ class ExcelApp:
 
         # 為每個 bar 添加數值標籤
         for bar_group in bars_all:
+            self._check_cancel()
             for bar in bar_group:
+                self._check_cancel()
                 height = bar.get_height()
                 plt.text(
                     bar.get_x() + bar.get_width() / 2,
@@ -1600,6 +1715,7 @@ class ExcelApp:
         Raw_data : pandas.DataFrame
             統整後的 Raw Material 資料表。(即 all_data)
         """
+        self._check_cancel()
         print("【Process_4】開始處理原材料數據")
         # (A) 改用通用的 process_worksheet
         # resulall_data_1 可以保留在需要的話使用，但主要我們只需要 all_data
@@ -1610,6 +1726,7 @@ class ExcelApp:
         self.context['Raw_total'] = round(raw_sum, 4)
 
         for idx, row in Raw_data.head(10).reset_index(drop=True).iterrows():
+            self._check_cancel()
             i = idx + 1  # 1-based index
             self.context[f'Raw_Name_{i}']              = row['Name']
             self.context[f'Raw_name_of_database_{i}']  = row['name of database']
@@ -1620,6 +1737,7 @@ class ExcelApp:
 
         # （如果少於十筆，也可選擇把沒有資料的 key 先設成空字串）
         for i in range(len(Raw_data)+1, 11):
+            self._check_cancel()
             self.context[f'Raw_Name_{i}']              = ""
             self.context[f'Raw_name_of_database_{i}']  = ""
             self.context[f'Raw_Damage_Assessment_{i}'] = ""
@@ -1655,6 +1773,7 @@ class ExcelApp:
         None
             直接在函式內完成繪圖、儲存圖片與插入 Word 不返回任何值。
         """
+        self._check_cancel()
         print("【Process_5】開始生成並插入原材料圖表")
         # ------------------ 1. 準備繪圖資料 ------------------
         name_values = Raw_data['Name'].head(10).fillna(0)
@@ -1683,6 +1802,7 @@ class ExcelApp:
 
         # 在每個 bar 上方顯示對應數值
         for i, bar in enumerate(bars):
+            self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), 
@@ -1755,6 +1875,7 @@ class ExcelApp:
         # 在每個 wedge 上加百分比標籤（帶箭頭）
         if not only_no_data:
             for i, wedge in enumerate(wedges):
+                self._check_cancel()
                 ang = (wedge.theta2 - wedge.theta1) / 2 + wedge.theta1
                 x = wedge.r * 0.85 * np.cos(np.deg2rad(ang))
                 y = wedge.r * 0.85 * np.sin(np.deg2rad(ang))
@@ -1822,6 +1943,7 @@ class ExcelApp:
         Manu_data : pandas.DataFrame
             綜合所有群組的彙整資料 (Damage Assessment 降冪排序)。
         """
+        self._check_cancel()
         print("【Process_6】開始處理製造數據")
         # 1. 呼叫通用函式 process_worksheet
         resulall_data_2, Manu_data = self.process_worksheet(file_name, 'Manufacturing')
@@ -1832,6 +1954,7 @@ class ExcelApp:
         self.context['Manufacturing_total'] = round(Manu_sum, 3)
 
         for idx, row in Manu_data.head(10).reset_index(drop=True).iterrows():
+            self._check_cancel()
             i = idx + 1  # 1-based index
             self.context[f'Manufacturing_Name_{i}']              = row['Name']
             self.context[f'Manufacturing_name_of_database_{i}']  = row['name of database']
@@ -1842,6 +1965,7 @@ class ExcelApp:
 
         # （如果少於十筆，也可選擇把沒有資料的 key 先設成空字串）
         for i in range(len(Manu_data)+1, 11):
+            self._check_cancel()
             self.context[f'Manufacturing_Name_{i}']              = ""
             self.context[f'Manufacturing_name_of_database_{i}']  = ""
             self.context[f'Manufacturing_Damage_Assessment_{i}'] = ""
@@ -1865,6 +1989,7 @@ class ExcelApp:
 
     def generate_insert_manufacturing_charts(self, doc, Manu_data):
         """將Manufacturing的Manu_data數據繪製長條圖並匯入至Word"""
+        self._check_cancel()
         print("【Process_7】開始生成並插入製造圖表")
         # 取得要繪製的資料，若缺值就以預設值替代
         name_values = Manu_data['Name'].head(10).fillna(0)
@@ -1888,6 +2013,7 @@ class ExcelApp:
         plt.ylabel('Damage Assessment')  # y轴标签
         plt.title('Damage Assessment by Name')  # 图表标题
         for i, bar in enumerate(bars):
+            self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2, yval, round(yval, 4), ha='center', va='bottom')
@@ -1961,6 +2087,7 @@ class ExcelApp:
         if not only_no_data:
         # 為每個區塊添加注釋（包裝在 try/except 中以防個別失敗）
             for i, wedge in enumerate(wedges):
+                self._check_cancel()
                 ang = (wedge.theta2 - wedge.theta1) / 2 + wedge.theta1
                 x = wedge.r * 0.85 * np.cos(np.deg2rad(ang))
                 y = wedge.r * 0.85 * np.sin(np.deg2rad(ang))
@@ -2027,6 +2154,7 @@ class ExcelApp:
         None
             直接在函式內完成繪圖並插入圖片，不回傳任何值。
         """
+        self._check_cancel()
         print("【Process_8】開始生成並插入電力圖表")
         # 1. 取得電力資料 (G3 群組)
         if 'G3' not in resulall_data_2:
@@ -2058,6 +2186,7 @@ class ExcelApp:
 
         # 在每個長條顯示數值
         for i, bar in enumerate(bars):
+            self._check_cancel()
             val = bar.get_width()  # bar.get_width() 對應 x 軸長度(因為是 barh)
             plt.text(val, bar.get_y() + bar.get_height() / 2,
                     f"{val:.2f}",
@@ -2092,17 +2221,20 @@ class ExcelApp:
         Returns:
         - combined_all_data: DataFrame, 統整的前十大數值數據。
         """
+        self._check_cancel()
         print("【Process_9】開始生成前十大數據長條圖")
         combined_all_data = pd.DataFrame()
         all_results = {}
 
         # 處理每個工作表數據
         for sheet in sheet_names:
+            self._check_cancel()
             resulall_data, all_data = self.process_worksheet(input_file, sheet)
             all_results[sheet] = {'resulall_data': resulall_data, 'all_data': all_data}
 
         # 合併所有工作表的數據
         for sheet, data in all_results.items():
+            self._check_cancel()
             combined_all_data = pd.concat([combined_all_data, data['all_data']], axis=0)
 
         # 按照 'Damage Assessment' 列進行排序
@@ -2126,10 +2258,12 @@ class ExcelApp:
         - combined_all_data: DataFrame, 統整的前十大數據。
         - all_results: dict, 全階段的處理數據。
         """
+        self._check_cancel()
         print("【Process_10】開始將前十大數據匯入 Word 文件")
         
         # 1. 前十大 Name, name_of_database, Damage_Assessment 與 percentage
         for j in range(1, 11):
+            self._check_cancel()
             idx = j - 1
             row = combined_all_data.iloc[idx]
             # 名稱
@@ -2159,6 +2293,7 @@ class ExcelApp:
         - combined_all_data: DataFrame, 統整的前十大數據。
         - doc: Document, Word 文件對象。
         """
+        self._check_cancel()
         print("【Process_11】開始生成前十大數據長條圖")
         name_values = combined_all_data['Name'].head(10)
         damage_values = combined_all_data['Damage Assessment'].head(10)
@@ -2176,6 +2311,7 @@ class ExcelApp:
         plt.ylabel('Damage Assessment')
         plt.title('Damage Assessment by Name')
         for i, bar in enumerate(bars):
+            self._check_cancel()
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), ha='center', va='bottom')
 
@@ -2209,16 +2345,19 @@ class ExcelApp:
             dict: 每個工作表的分組結果。
             DataFrame: 合併後的所有數據。
         """
+        self._check_cancel()
         print("【Process_12】開始處理運輸數據")
         # transport_all_results = {}
         Air_all_data = pd.DataFrame()
 
         for sheet_name in transport_sheets:
+            self._check_cancel()
             sheet_df = pd.read_excel(file_name, sheet_name=sheet_name)
             group_starts = sheet_df.index[sheet_df.iloc[:, 1].str.contains('^◎', na=False)].tolist()
             # resulall_data_3 = {}
 
             for j in range(len(group_starts)):
+                self._check_cancel()
                 start_idx = group_starts[j]
                 end_idx = group_starts[j + 1] if j < len(group_starts) - 1 else sheet_df.shape[0]
                 sub_df = sheet_df.iloc[start_idx:end_idx, :]
@@ -2252,11 +2391,13 @@ class ExcelApp:
 
         # ---- 新增：清空以前的 Air_* keys（若有的話） ----
         for k in list(self.context):
+            self._check_cancel()
             if k.startswith('Air_'):
                 del self.context[k]
         # ---- 新增：把 merged 的每一列放到 self.context  ----
         total = Air_all_data['Damage Assessment'].sum()
         for idx, row in enumerate(Air_all_data.itertuples(index=False), start=1):
+            self._check_cancel()
             # row.Name, row._3 (對應 name of database), row._2（Damage Assessment）依實際欄位順序與屬性名稱調整
             self.context[f'Air_Name_{idx}']              = row.Name
             self.context[f'Air_name_of_database_{idx}']  = row._3
@@ -2293,6 +2434,7 @@ class ExcelApp:
         Returns:
             None
         """
+        self._check_cancel()
         print("【Process_13】開始生成運輸相關圖表並插入 Word 文件")
         # 分析運輸數據
         name_values = Air_all_data['Name'].head(10)
@@ -2333,6 +2475,7 @@ class ExcelApp:
         plt.title('運輸碳排')  # 图表标题
 
         for i, bar in enumerate(bars):
+            self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), ha='center', va='bottom')
@@ -2361,9 +2504,26 @@ class ExcelApp:
         從 start 到 end 平滑更新進度，
         每次增加 step，延遲 delay 秒（單位秒）。
         """
+        self._check_cancel()
         if self.progress_callback:
             # 確保整數更新
             for value in range(start, end + 1, step):
+                self._check_cancel()
                 self.progress_callback(value)
                 time.sleep(delay)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

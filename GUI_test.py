@@ -16,12 +16,13 @@ import win32com.client as win32
 importlib.reload(excel_processing) # 調用 excel_processing 模組
 
 class ProgressBarWindow:
-    def __init__(self, master, maximum=100):
+    def __init__(self, master, maximum=100, on_user_close=None):
         self.excel = ExcelApp()
         self.top = tk.Toplevel(master)
         self._after_jobs = set()
         self._closed = False
-        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        self._on_user_close = on_user_close
+        self.top.protocol("WM_DELETE_WINDOW", lambda: self.close(request_cancel=True))
 
         self.top.title("處理進度")
 
@@ -87,10 +88,15 @@ class ProgressBarWindow:
                 pass
         self._after_jobs.clear()
 
-    def close(self):
+    def close(self, request_cancel=False):
         if self._closed:
             return
         self._closed = True
+        if request_cancel and callable(self._on_user_close):
+            try:
+                self._on_user_close()
+            except Exception:
+                pass
         try:
             self.cancel_afters()
         finally:
@@ -100,16 +106,6 @@ class ProgressBarWindow:
             except Exception:
                 pass
 
-    def open_transform_progress(self):
-        # 建立用於 transform_sheet 的進度條視窗
-        self.transform_progress_window = ProgressBarWindow(self.root, maximum=100)
-        self.root.update_idletasks()
-
-    def open_process_progress(self):
-        # 建立用於 process_file 的進度條視窗
-        self.process_progress_window = ProgressBarWindow(self.root, maximum=100)
-        self.root.update_idletasks()
-        
     def update_status(self, status):
         # 利用 after() 確保在主線程更新視窗標題
         try:
@@ -146,10 +142,15 @@ class GUI:
         self.file_path = None
         self.excel = ExcelApp(status_callback = self.update_status, progress_callback = self.update_progress)
         self.excel.progress_callback = None
+        self.cancel_event = threading.Event()
+        self.excel.set_cancel_event(self.cancel_event)
+        self._cancel_dialog_shown = False
         self.progress_window = None # 進度條視窗屬性
         self.transform_progress_window = None
         self.process_progress_window = None
         self.enable_refresh = tk.BooleanVar(value=False)  # 新增變數控制是否執行重新整理
+        self.is_running = False
+        self.run_buttons = []
 
         # 創建 Notebook（分頁）
         self.notebook = ttk.Notebook(root)
@@ -234,7 +235,9 @@ class GUI:
                         command=self.toggle_refresh_fields
                         ).grid(row=5, column=0, columnspan=2, padx=5, pady=5)
         
-        ttk.Button(frame, text="開始轉換", command=self.transform_sheet).grid(row=5, column=1, pady=10)
+        self.transform_button = ttk.Button(frame, text="開始轉換", command=self.transform_sheet)
+        self.transform_button.grid(row=5, column=1, pady=10)
+        self.run_buttons.append(self.transform_button)
         self.add_status_label(frame, row=6)
         ttk.Button(frame, text="Excel ✕", command=lambda: os.system("taskkill /f /im excel.exe")).grid(row=5, column=2, padx=10, pady=10)
 
@@ -249,7 +252,9 @@ class GUI:
         
         ttk.Button(frame, text="瀏覽", command=self.browse_file).grid(row=0, column=2, padx=10, pady=10)
         
-        ttk.Button(frame, text="開始處理", command=self.process_file).grid(row=1, column=1, pady=10)
+        self.process_button = ttk.Button(frame, text="開始處理", command=self.process_file)
+        self.process_button.grid(row=1, column=1, pady=10)
+        self.run_buttons.append(self.process_button)
         self.add_status_label(frame)
 
     def create_all_tab(self):
@@ -307,7 +312,9 @@ class GUI:
                         command=self.toggle_refresh_fields
                         ).grid(row=5, column=0, columnspan=2, padx=5, pady=5)
 
-        ttk.Button(frame, text="處理全部", command=self.process_all).grid(row=5, column=1, pady=10)
+        self.process_all_button = ttk.Button(frame, text="處理全部", command=self.process_all)
+        self.process_all_button.grid(row=5, column=1, pady=10)
+        self.run_buttons.append(self.process_all_button)
         self.add_status_label(frame, row=6)
         ttk.Button(frame, text="Excel ✕", command=lambda: os.system("taskkill /f /im excel.exe")).grid(row=5, column=2, padx=10, pady=10)
 
@@ -325,7 +332,9 @@ class GUI:
         self.report_area.grid(row=1, column=1, padx=10, pady=10, sticky="w")
         self.report_area.current(0)  # 預設選擇第一個選項
         # 生成報告的按鈕
-        ttk.Button(frame, text="生成報告書", command=self.generate_report).grid(row=2, column=0, columnspan=2, pady=10)
+        self.report_button = ttk.Button(frame, text="生成報告書", command=self.generate_report)
+        self.report_button.grid(row=2, column=0, columnspan=2, pady=10)
+        self.run_buttons.append(self.report_button)
 
     def add_status_label(self, frame, row=5):
         ttk.Label(frame, text="狀態：").grid(row=row, column=0, padx=10, pady=10)
@@ -361,19 +370,25 @@ class GUI:
         if not self.file_path:
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return
+        if not self.begin_task():
+            return
+        self.reset_cancel_state()
         data = [
                 self.product_f_entry.get(),
                 self.start_date_entry.get(),
                 self.end_date_entry.get()
             ]
-        
-        self.open_progress_window()
-        # self.root.update()
-        # 將進度更新 callback 傳入主要資料處理程式
-        self.excel.progress_callback = self.update_progress
-        # 使用執行緒來執行長時間運算，避免 GUI 畫面凍結
-        t = threading.Thread(target=self.run_transform, args=(data,), daemon=True)
-        t.start()
+        try:
+            self.open_progress_window()
+            # self.root.update()
+            # 將進度更新 callback 傳入主要資料處理程式
+            self.excel.progress_callback = self.update_progress
+            # 使用執行緒來執行長時間運算，避免 GUI 畫面凍結
+            t = threading.Thread(target=self.run_transform, args=(data,), daemon=True)
+            t.start()
+        except Exception as e:
+            self.finish_task()
+            self.show_error("錯誤", f"啟動轉換流程失敗：{e}")
 
     def process_file(self, file_path=None):
         if file_path is not None:
@@ -381,54 +396,116 @@ class GUI:
         if not self.file_path:
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return
-        
-        self.open_progress_window()
-        self.root.update()
-        # 將進度更新 callback 傳入主要資料處理程式
-        self.excel.progress_callback = self.update_progress
-        # 使用執行緒來執行長時間運算，避免 GUI 畫面凍結
-        t = threading.Thread(target=self.run_process, daemon=True)
-        t.start()
+        if not self.begin_task():
+            return
+        self.reset_cancel_state()
+        try:
+            self.open_progress_window()
+            self.root.update()
+            # 將進度更新 callback 傳入主要資料處理程式
+            self.excel.progress_callback = self.update_progress
+            # 使用執行緒來執行長時間運算，避免 GUI 畫面凍結
+            t = threading.Thread(target=self.run_process, daemon=True)
+            t.start()
+        except Exception as e:
+            self.finish_task()
+            self.show_error("錯誤", f"啟動處理流程失敗：{e}")
 
     def process_all(self):
         if not self.file_path:
             messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return
+        if not self.begin_task():
+            return
+        self.reset_cancel_state()
         data = [
             self.product_f_entry.get(),
             self.start_date_entry.get(),
             self.end_date_entry.get()
         ]
-        self.open_progress_window()
-        self.root.update()
-        # 將進度更新 callback 傳入主要資料處理程式
-        self.excel.progress_callback = self.update_progress
-        # 使用執行緒來執行長時間運算，避免 GUI 畫面凍結
-        t = threading.Thread(target=self.run_process_all, args=(data,), daemon=True)
-        t.start()
+        try:
+            self.open_progress_window()
+            self.root.update()
+            # 將進度更新 callback 傳入主要資料處理程式
+            self.excel.progress_callback = self.update_progress
+            # 使用執行緒來執行長時間運算，避免 GUI 畫面凍結
+            t = threading.Thread(target=self.run_process_all, args=(data,), daemon=True)
+            t.start()
+        except Exception as e:
+            self.finish_task()
+            self.show_error("錯誤", f"啟動完整流程失敗：{e}")
 
     def generate_report(self):
-        # 開始完整處理前先開啟進度條視窗
-        self.open_progress_window()
-        self.root.update()  #更新「主執行緒」上的 UI 事件
+        if not self.begin_task():
+            return
+        self.reset_cancel_state()
+        try:
+            # 開始完整處理前先開啟進度條視窗
+            self.open_progress_window()
+            self.root.update()  #更新「主執行緒」上的 UI 事件
 
-        # 從下拉選單取得使用者選擇的區域（例如 "竹南"、"竹北"、"越南"）
-        selected_area = self.report_area.get()
+            # 從下拉選單取得使用者選擇的區域（例如 "竹南"、"竹北"、"越南"）
+            selected_area = self.report_area.get()
 
-        # 將進度更新 callback 傳入主要資料處理程式
-        self.excel.progress_callback = self.update_progress
-        # 使用執行緒來執行長時間運算，避免 GUI 畫面凍結
-        t = threading.Thread(target=self.run_report, args=(selected_area,), daemon=True)
-        t.start()
+            # 將進度更新 callback 傳入主要資料處理程式
+            self.excel.progress_callback = self.update_progress
+            # 使用執行緒來執行長時間運算，避免 GUI 畫面凍結
+            t = threading.Thread(target=self.run_report, args=(selected_area,), daemon=True)
+            t.start()
+        except Exception as e:
+            self.finish_task()
+            self.show_error("錯誤", f"啟動報告流程失敗：{e}")
 
     def update_status(self, message):
-        self.status_label.config(text=message)
-        self.root.update_idletasks()  # 立即更新顯示
+        def _update():
+            self.status_label.config(text=message)
+            self.root.update_idletasks()  # 立即更新顯示
+        if threading.current_thread() is threading.main_thread():
+            _update()
+        else:
+            self.run_on_main(_update, wait=False)
         
     def update_progress(self, value):
         if self.progress_window:
             self.progress_window.update_progress(value)
-    
+
+    def reset_cancel_state(self):
+        self.cancel_event.clear()
+        self.excel.clear_cancel()
+        self._cancel_dialog_shown = False
+
+    @staticmethod
+    def _cancel_message():
+        return "Operation cancelled by user.\n已取消作業，未寫入任何檔案。"
+
+    def request_cancel(self):
+        if self.cancel_event.is_set():
+            return
+        self.cancel_event.set()
+        self.excel.request_cancel()
+        self.update_status("取消中...")
+
+    def _raise_if_cancelled(self):
+        if self.cancel_event.is_set():
+            self.excel.request_cancel()
+            self.excel.was_cancelled = True
+            raise excel_processing.UserCancelledError(self._cancel_message())
+
+    def _handle_user_cancelled(self, exc=None):
+        self.excel.request_cancel()
+        self.excel.was_cancelled = True
+        self.update_status("作業已取消")
+        if self._cancel_dialog_shown:
+            return
+        self._cancel_dialog_shown = True
+        message = str(exc) if exc else self._cancel_message()
+        self.show_error("UserCancelledError", message)
+
+    def _make_threadsafe_status_callback(self):
+        def _status(status):
+            self.root.after(0, lambda: self.progress_window.update_status(status) if self.progress_window else None)
+        return _status
+
     def run_on_main(self, func, wait=True):
         if threading.current_thread() is threading.main_thread():
             func()
@@ -477,12 +554,31 @@ class GUI:
         self.run_on_main(ask, wait=True)
         return response["value"]
 
-    def close_progress_window(self, wait=True):
+    def _set_run_buttons_state(self, state):
+        for button in self.run_buttons:
+            try:
+                button.config(state=state)
+            except Exception:
+                pass
+
+    def begin_task(self):
+        if self.is_running:
+            self.show_warning("提醒", "目前已有作業執行中，請等待目前作業完成。", wait=False)
+            return False
+        self.is_running = True
+        self._set_run_buttons_state("disabled")
+        return True
+
+    def finish_task(self):
+        self.is_running = False
+        self._set_run_buttons_state("normal")
+
+    def close_progress_window(self, wait=True, request_cancel=False):
         def _close():
             if self.progress_window:
                 window = self.progress_window
                 try:
-                    window.close()
+                    window.close(request_cancel=request_cancel)
                 finally:
                     if window is getattr(self, "transform_progress_window", None):
                         self.transform_progress_window = None
@@ -491,12 +587,16 @@ class GUI:
                     self.progress_window = None
         self.run_on_main(_close, wait=wait)
 
+    def _on_progress_window_user_close(self):
+        self.request_cancel()
+        self.close_progress_window(wait=False)
+
     def open_progress_window(self):
-        self.progress_window = ProgressBarWindow(self.root, maximum=100)
+        self.progress_window = ProgressBarWindow(self.root, maximum=100, on_user_close=self._on_progress_window_user_close)
 
     def open_transform_progress(self):
         # 建立用於 Transform 進度的視窗
-        self.transform_progress_window = ProgressBarWindow(self.root, maximum=100)
+        self.transform_progress_window = ProgressBarWindow(self.root, maximum=100, on_user_close=self._on_progress_window_user_close)
         self.progress_window = self.transform_progress_window  # 若你只使用一個進度條，也可以這樣設定
         self.root.update_idletasks()
 
@@ -507,7 +607,7 @@ class GUI:
 
     def open_process_progress(self):
         # 建立用於 Transform 進度的視窗
-        self.process_progress_window = ProgressBarWindow(self.root, maximum=100)
+        self.process_progress_window = ProgressBarWindow(self.root, maximum=100, on_user_close=self._on_progress_window_user_close)
         self.progress_window = self.process_progress_window  # 若你只使用一個進度條，也可以這樣設定
         self.root.update_idletasks()
 
@@ -515,126 +615,155 @@ class GUI:
         # 呼叫進度條視窗的更新函式
         if self.process_progress_window:
             self.process_progress_window.update_progress(value)
-            self.top.after(0, lambda: self.progress_label.config(text=f"{value}%"))
+            self.process_progress_window.top.after(0, lambda: self.process_progress_window.progress_label.config(text=f"{value}%"))
     
     def run_transform(self, data):
         """新的執行緒，作為背景線程運行"""
-        self.excel.status_callback = self.progress_window.update_status
-        self.excel.error_callback = lambda msg: self.root.after(
-            0, lambda: messagebox.showerror("錯誤", msg)
-        )
-        # 將 error_callback 指向一個「執行緒安全」的顯示器（可選，但很實用）
+        def threadsafe_status_show(status):
+            self.root.after(0, lambda: self.progress_window.update_status(status) if self.progress_window else None)
+
+        self.excel.status_callback = threadsafe_status_show
+
         def threadsafe_error_show(msg):
             self.root.after(0, lambda: messagebox.showerror("錯誤", msg))
+
         self.excel.error_callback = threadsafe_error_show
 
-        if self.enable_refresh.get(): # 如果啟用了重新整理功能
-            confirm = True
-            if any(val == "" for val in data):
-                confirm = self.ask_yes_no("提醒",
-                                         "部分欄位為空白，請確認是否完整填寫？\n若繼續執行將以空值進行。是否繼續？")
-            prod_f_val = self.company_var.get()
-            if ' ' in prod_f_val:
-                cleaned = prod_f_val.replace(' ', '')
-                self.company_var.set(cleaned)
-                prod_f_val = cleaned
-            if prod_f_val and len(self.company_var.get()) > 13:
-                self.show_error("輸入錯誤", "產品F種類欄位最多 13 碼")
-                self.close_progress_window()
-                return
-            if not confirm:
-                self.close_progress_window()
-                return
+        try:
+            if self.enable_refresh.get():
+                confirm = True
+                if any(val == "" for val in data):
+                    confirm = self.ask_yes_no("提醒",
+                                             "部分欄位為空白，請確認是否完整填寫？\n若繼續執行將以空值進行。是否繼續？")
+                prod_f_val = self.company_var.get()
+                if " " in prod_f_val:
+                    cleaned = prod_f_val.replace(" ", "")
+                    self.company_var.set(cleaned)
+                    prod_f_val = cleaned
+                if prod_f_val and len(self.company_var.get()) > 13:
+                    self.show_error("輸入錯誤", "產品F種類欄位最多 13 碼")
+                    return
+                if not confirm:
+                    return
 
+            self._raise_if_cancelled()
 
-        self.excel.file_path = self.file_path
-        self.sync_factory_site()
-        self.check_excel_Product()
+            self.excel.file_path = self.file_path
+            self.sync_factory_site()
+            self.check_excel_Product()
 
-        # 呼叫主要處理流程
-        result = self.excel.transform_sheet()
+            result = self.excel.transform_sheet()
 
-        if result:      # 成功：顯示完成並關視窗（都丟回主執行緒）
-            self.show_info("完成", f"轉換完成：{result}", wait=False, close_progress=True)
-        else:           # 失敗：讀錯誤訊息並顯示，再關視窗
-            msg = getattr(self.excel, "last_error", "處理失敗（未提供詳細訊息）")
-            self.root.after(0, lambda: messagebox.showerror("錯誤", msg))
+            if result:
+                self.show_info("完成", f"轉換完成：{result}", wait=False, close_progress=True)
+            elif self.excel.was_cancelled:
+                self._handle_user_cancelled()
+            else:
+                msg = getattr(self.excel, "last_error", "處理失敗（未提供詳細訊息）")
+                self.show_error("錯誤", msg)
+        except excel_processing.UserCancelledError as e:
+            self._handle_user_cancelled(e)
+        except Exception as e:
+            self.show_error("錯誤", f"轉換格式時發生錯誤：{e}")
+        finally:
             self.close_progress_window(wait=False)
-    
+            self.run_on_main(self.finish_task, wait=False)
+
     def run_process(self):
         """背景執行緒：處理單一檔案"""
-        self.excel.status_callback = self.progress_window.update_status
+        self.excel.status_callback = self._make_threadsafe_status_callback()
         self.excel.file_path = self.file_path
         self.sync_factory_site()
         try:
+            self._raise_if_cancelled()
             result = self.excel.process_file()
             if result and result.get("ok"):
                 paths = f"{result['result_file']}，{result['report_file']}"
                 self.show_info("完成", f"處理完成，已輸出檔案：{paths}", close_progress=True)
+            elif (result and result.get("cancelled")) or self.excel.was_cancelled:
+                self._handle_user_cancelled()
             else:
                 err = self._extract_process_error(result)
                 self.show_error("錯誤", f"處理檔案時出現錯誤：{err}")
+        except excel_processing.UserCancelledError as e:
+            self._handle_user_cancelled(e)
+        except Exception as e:
+            self.show_error("錯誤", f"處理檔案時發生錯誤：{e}")
         finally:
-            self.close_progress_window()
-            pythoncom.CoUninitialize()
+            self.close_progress_window(wait=False)
+            self.run_on_main(self.finish_task, wait=False)
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
 
     def run_process_all(self, data):
         """背景執行緒：一次完成轉檔與處理流程"""
-        self.excel.status_callback = self.progress_window.update_status  # 確保進度視窗存在，並設定狀態回呼
-
-        if self.enable_refresh.get():  # 如啟用完整刷新
-            confirm = True
-            if any(val == "" for val in data):
-                confirm = self.ask_yes_no("提醒",
-                                     "部分欄位為空白，請確認是否完整填寫？\n若繼續執行將以空值進行。是否繼續？")
-            prod_f_val = self.company_var.get()
-            if ' ' in prod_f_val:
-                cleaned = prod_f_val.replace(' ', '')
-                self.company_var.set(cleaned)
-                prod_f_val = cleaned
-            if prod_f_val and len(self.company_var.get()) > 13:
-                self.show_error("輸入錯誤", "產品F種類欄位最多 13 碼")
-                self.close_progress_window()
-                return
-            if not confirm:
-                self.close_progress_window()
-                return
-            if not self.update_input_sheet(self.file_path):
-                self.close_progress_window()
-                return
-
-        # 設定檔案路徑與檢查
-        self.excel.file_path = self.file_path
-        self.sync_factory_site()
-        self.check_excel_Product()
+        self.excel.status_callback = self._make_threadsafe_status_callback()  # 確保進度視窗存在，並設定狀態回呼
         excel = wb_tpl = wb_new = None
         process_result = None
         try:
+            self._raise_if_cancelled()
+            if self.enable_refresh.get():  # 如啟用完整刷新
+                confirm = True
+                if any(val == "" for val in data):
+                    confirm = self.ask_yes_no("提醒",
+                                         "部分欄位為空白，請確認是否完整填寫？\n若繼續執行將以空值進行。是否繼續？")
+                prod_f_val = self.company_var.get()
+                if ' ' in prod_f_val:
+                    cleaned = prod_f_val.replace(' ', '')
+                    self.company_var.set(cleaned)
+                    prod_f_val = cleaned
+                if prod_f_val and len(self.company_var.get()) > 13:
+                    self.show_error("輸入錯誤", "產品F種類欄位最多 13 碼")
+                    return
+                if not confirm:
+                    return
+                self._raise_if_cancelled()
+                if not self.update_input_sheet(self.file_path):
+                    if self.excel.was_cancelled:
+                        self._handle_user_cancelled()
+                    return
+
+            self._raise_if_cancelled()
+            # 設定檔案路徑與檢查
+            self.excel.file_path = self.file_path
+            self.sync_factory_site()
+            self.check_excel_Product()
+
             # 第一階段：轉檔
             self.excel.progress_callback = self.update_progress
             new_file_path = self.excel.transform_sheet()
             if new_file_path:
-                self.run_on_main(lambda: self.progress_window.update_progress(0), wait=False)
-                self.close_progress_window()
+                self._raise_if_cancelled()
+                self.run_on_main(
+                    lambda: self.progress_window.update_progress(0) if self.progress_window else None,
+                    wait=False
+                )
+                self.close_progress_window(wait=False)
 
                 # 第二階段：處理新檔
+                self._raise_if_cancelled()
                 self.run_on_main(self.open_process_progress)
                 self.excel.progress_callback = self.update_progress
                 process_result = self.excel.process_file(file_path=new_file_path)
                 if process_result and process_result.get("ok"):
                     paths = f"{process_result['result_file']}，{process_result['report_file']}"
                     self.show_info("完成", f"完整流程完成，已輸出檔案：{paths}", close_progress=True)
+                elif (process_result and process_result.get("cancelled")) or self.excel.was_cancelled:
+                    self._handle_user_cancelled()
                 else:
                     err = self._extract_process_error(process_result)
                     self.show_error("錯誤", f"處理全部過程時出現錯誤：{err}")
-                self.close_progress_window()
+            elif self.excel.was_cancelled:
+                self._handle_user_cancelled()
             else:
                 self.show_error("錯誤", "轉檔未成功，請檢查輸入資料。")
-                self.close_progress_window()
+        except excel_processing.UserCancelledError as e:
+            self._handle_user_cancelled(e)
         except Exception as e:
             self.show_error("錯誤", f"完整流程中出現錯誤：{e}")
-            self.close_progress_window()
             print(e)
         finally:
             # 不論成功與否都釋放資源
@@ -657,14 +786,16 @@ class GUI:
                 pythoncom.CoUninitialize()
             except Exception:
                 pass
-            self.close_progress_window()
+            self.close_progress_window(wait=False)
+            self.run_on_main(self.finish_task, wait=False)
 
 
     def run_report(self, selected_area):
         """新的執行緒，作為背景線程運行"""
-        self.excel.status_callback = self.progress_window.update_status # 確保進度視窗存在，並設定狀態回呼
+        self.excel.status_callback = self._make_threadsafe_status_callback() # 確保進度視窗存在，並設定狀態回呼
         output_doc = wb = excel= None
         try:
+            self._raise_if_cancelled()
         # 呼叫 ExcelApp 的 generate_report 方法，並將選擇的區域傳入
             output_doc = self.excel.generate_report(selected_area)
             if output_doc:
@@ -674,12 +805,13 @@ class GUI:
                     wait=False,
                     close_progress=True,
                 )
+            elif self.excel.was_cancelled:
+                self._handle_user_cancelled()
+        except excel_processing.UserCancelledError as e:
+            self._handle_user_cancelled(e)
+            output_doc = None
         except Exception as e:
-            # 方法一：用 lambda 的預設參數把 e 綁進去
-            self.root.after(0, lambda err=e: (
-                messagebox.showerror("報告生成錯誤", f"生成報告時發生錯誤：{err}"),
-                self.close_progress_window()
-                ))
+            self.show_error("報告生成錯誤", f"生成報告時發生錯誤：{e}")
             print("報告生成錯誤：",e)
             output_doc = None
 
@@ -701,7 +833,8 @@ class GUI:
                 pass
 
             if self.progress_window:
-                self.close_progress_window()
+                self.close_progress_window(wait=False)
+            self.run_on_main(self.finish_task, wait=False)
 
         return output_doc                
     
@@ -710,7 +843,11 @@ class GUI:
         將 GUI 上的三個欄位數據寫入 INPUT 工作表的 B 欄
         並重新整理Excel上的連線資料庫
         """
+        excel = None
+        workbook = None
+        com_initialized = False
         try:
+            self._raise_if_cancelled()
             self.excel.status_callback("開始更新Excel資料")
 
             if self.excel.update_progress_smooth:
@@ -724,7 +861,8 @@ class GUI:
             if self.excel.update_progress_smooth:
                 self.excel.update_progress_smooth(10, 20, step=1, delay=0.02)  # 第2階段完成：20%
             # 建立 Excel COM 物件
-            pythoncom.CoInitialize() 
+            pythoncom.CoInitialize()
+            com_initialized = True
             excel = win32.DispatchEx("Excel.Application")
             excel.Visible = True  # 顯示 Excel 視窗
             excel.EnableEvents = False # 暫時關閉事件，防止因為儲存格變更而觸發其他連線的自動刷新
@@ -737,6 +875,7 @@ class GUI:
             
             # 停用支援自動刷新的連線（針對 OLEDB 連線）
             for conn in workbook.Connections:
+                self._raise_if_cancelled()
                 try:
                     conn_name = conn.Name
                     conn_type = conn.Type  # 1 = QueryTable, 2 = OLEDB 連線
@@ -784,19 +923,26 @@ class GUI:
                 self.excel.update_progress_smooth(40, 50, step=1, delay=0.02)  # 第5階段完成：50%
             self.excel.status_callback("重新刷新Excel資料...2") 
             self.safe_save_workbook(workbook) #儲存檔案(若資料還在刷新則會重新嘗試執行)
+            self._raise_if_cancelled()
             workbook.RefreshAll()#重新刷新Excel資料
             print("重新整理中...3") 
             if self.excel.update_progress_smooth:
                 self.excel.update_progress_smooth(50, 60, step=1, delay=0.02)  # 第6階段完成：60%
             self.excel.status_callback("更新中...3")
-            time.sleep(30)
+            waited = 0.0
+            while waited < 30:
+                self._raise_if_cancelled()
+                time.sleep(0.5)
+                waited += 0.5
             max_wait = 120
             start_time = time.time()
             refresh_done = False
             while time.time() - start_time < max_wait:
+                self._raise_if_cancelled()
                 # 檢查所有 QueryTable 是否都不在刷新中
                 all_done = True
                 for sh in workbook.Worksheets:
+                    self._raise_if_cancelled()
                     for qt in sh.QueryTables:
                         # 若有屬性 Refreshing 並且為 True，表示尚未完成
                         if hasattr(qt, "Refreshing") and qt.Refreshing:
@@ -809,34 +955,53 @@ class GUI:
                     break
                 time.sleep(1)
             if not refresh_done:
-                messagebox.showwarning("警告", "部分連線刷新可能未完全完成，將進行後續操作")
+                self.show_warning("警告", "部分連線刷新可能未完全完成，將進行後續操作")
             print("更新中...4")
             if self.excel.update_progress_smooth:
                 self.excel.update_progress_smooth(60, 70, step=1, delay=0.02)  # 第7階段完成：70%
             self.excel.status_callback("更新中...4")
+            self._raise_if_cancelled()
             self.safe_save_workbook(workbook)
-            workbook.Close(False)
-            excel.Quit() 
             print("完成更新Excel資料")
             if self.excel.update_progress_smooth:
                 self.excel.update_progress_smooth(70, 100, step=1, delay=0.02)  # 第6階段完成：60%
             self.excel.status_callback("完成更新Excel資料")
             # 整個流程完成後
-            self.run_on_main(lambda: self.progress_window.update_progress(0), wait=False)
-            pythoncom.CoUninitialize() 
+            self.run_on_main(lambda: self.progress_window.update_progress(0) if self.progress_window else None, wait=False)
             return True
+        except excel_processing.UserCancelledError as e:
+            self._handle_user_cancelled(e)
+            return False
         except Exception as e:
-            messagebox.showerror("錯誤", f"更新 Accton 表單時發生錯誤: {e}")
+            self.show_error("錯誤", f"更新 Accton 表單時發生錯誤: {e}")
             print(e)
             return False
+        finally:
+            try:
+                if workbook is not None:
+                    workbook.Close(False)
+            except Exception:
+                pass
+            try:
+                if excel is not None:
+                    excel.Quit()
+            except Exception:
+                pass
+            if com_initialized:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
 
     def safe_save_workbook(self, workbook, retry_count=10, wait_time=5):
         for i in range(retry_count):
             try:
+                self._raise_if_cancelled()
                 workbook.Save()
                 return True
             except Exception as e:
                 if hasattr(e, 'args') and e.args and e.args[0] == -2147418111:
+                    self._raise_if_cancelled()
                     time.sleep(wait_time)
                 else:
                     raise e
@@ -862,3 +1027,19 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = GUI(root)
     root.mainloop()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
