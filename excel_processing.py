@@ -1,9 +1,12 @@
 ﻿from datetime import datetime
+from contextlib import suppress
+from dataclasses import dataclass, field
 from docx import Document
 from docx.shared import Inches
 from docxtpl import DocxTemplate, InlineImage
 from functools import reduce
 from tkinter import filedialog, messagebox
+import logging
 import math
 # import matplotlib
 # matplotlib.use('Agg')  # 強制使用不會開視窗的 Agg 後端
@@ -20,11 +23,178 @@ import win32com.client as win32
 import xlsxwriter
 from openpyxl.styles.colors import Color
 import traceback
+import uuid
+from typing import Any, Dict, List
 
 FACTORY_OVERVIEW_INFO = {
     "竹南": {"name": "竹南廠", "address": "苗栗縣竹南鎮公義里科義街1號1、5樓"},
     "竹北": {"name": "竹北廠", "address": "新竹縣竹北市北興里智慧一路1號"},
 }
+
+COM_OPEN_RETRY_COUNT = 5
+COM_OPEN_RETRY_DELAY_SEC = 0.5
+COM_OPEN_TIMEOUT_SEC = 30.0
+COM_SAVE_RETRY_COUNT = 10
+COM_SAVE_RETRY_DELAY_SEC = 2.0
+COM_SAVE_TIMEOUT_SEC = 120.0
+COM_REFRESH_SETTLE_SEC = 30.0
+COM_REFRESH_TIMEOUT_SEC = 120.0
+COM_REFRESH_POLL_SEC = 1.0
+COM_REFRESH_RETRY_COUNT = 2
+COM_REFRESH_RETRY_DELAY_SEC = 1.0
+
+
+@dataclass
+class TaskResult:
+    ok: bool
+    error_code: str = ""
+    message: str = ""
+    artifacts: Dict[str, Any] = field(default_factory=dict)
+    elapsed_ms: int = 0
+    warnings: List[str] = field(default_factory=list)
+
+
+class ExcelComSession:
+    def __init__(
+        self,
+        visible: bool = False,
+        display_alerts: bool = False,
+        enable_events: bool = False,
+        screen_updating: bool = False,
+    ):
+        self.visible = visible
+        self.display_alerts = display_alerts
+        self.enable_events = enable_events
+        self.screen_updating = screen_updating
+        self.excel = None
+        self._opened_workbooks = []
+
+    def __enter__(self):
+        pythoncom.CoInitialize()
+        self.excel = win32.DispatchEx("Excel.Application")
+        self.excel.Visible = self.visible
+        self.excel.DisplayAlerts = self.display_alerts
+        with suppress(Exception):
+            self.excel.EnableEvents = self.enable_events
+        with suppress(Exception):
+            self.excel.ScreenUpdating = self.screen_updating
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for workbook in reversed(self._opened_workbooks):
+            with suppress(Exception):
+                workbook.Close(SaveChanges=False)
+        self._opened_workbooks.clear()
+        with suppress(Exception):
+            if self.excel is not None:
+                self.excel.Quit()
+        with suppress(Exception):
+            pythoncom.CoUninitialize()
+        self.excel = None
+        return False
+
+    def open_workbook(
+        self,
+        path: str,
+        *,
+        retry_count: int = COM_OPEN_RETRY_COUNT,
+        retry_delay_sec: float = COM_OPEN_RETRY_DELAY_SEC,
+        timeout_sec: float = COM_OPEN_TIMEOUT_SEC,
+        **kwargs,
+    ):
+        last_error = None
+        start = time.time()
+        attempt = 0
+        while attempt < max(1, retry_count) and (time.time() - start) < max(0.1, timeout_sec):
+            attempt += 1
+            try:
+                workbook = self.excel.Workbooks.Open(path, **kwargs)
+                self._opened_workbooks.append(workbook)
+                return workbook
+            except Exception as exc:
+                last_error = exc
+                time.sleep(retry_delay_sec)
+        if last_error is not None:
+            raise TimeoutError(
+                f"Workbook 開啟失敗（path={path}, retries={attempt}, timeout_sec={timeout_sec}）: {last_error}"
+            ) from last_error
+        raise RuntimeError(f"無法開啟工作簿：{path}")
+
+    def close_workbook(self, workbook, save_changes: bool = False):
+        with suppress(Exception):
+            workbook.Close(SaveChanges=save_changes)
+        with suppress(ValueError):
+            self._opened_workbooks.remove(workbook)
+
+    def save_with_retry(
+        self,
+        workbook,
+        *,
+        retry_count: int = COM_SAVE_RETRY_COUNT,
+        retry_delay_sec: float = COM_SAVE_RETRY_DELAY_SEC,
+        timeout_sec: float = COM_SAVE_TIMEOUT_SEC,
+    ) -> bool:
+        start = time.time()
+        attempt = 0
+        while attempt < max(1, retry_count) and (time.time() - start) < max(0.1, timeout_sec):
+            attempt += 1
+            try:
+                workbook.Save()
+                return True
+            except Exception as exc:
+                if hasattr(exc, "args") and exc.args and exc.args[0] == -2147418111:
+                    time.sleep(retry_delay_sec)
+                    continue
+                raise
+        raise TimeoutError(
+            f"Workbook 儲存逾時（retries={attempt}, timeout_sec={timeout_sec}）"
+        )
+
+    def refresh_all_and_wait(
+        self,
+        workbook,
+        *,
+        retry_count: int = COM_REFRESH_RETRY_COUNT,
+        retry_delay_sec: float = COM_REFRESH_RETRY_DELAY_SEC,
+        settle_sec: float = COM_REFRESH_SETTLE_SEC,
+        timeout_sec: float = COM_REFRESH_TIMEOUT_SEC,
+        poll_sec: float = COM_REFRESH_POLL_SEC,
+        cancel_callback=None,
+    ) -> bool:
+        last_error = None
+        for _ in range(max(1, retry_count)):
+            try:
+                workbook.RefreshAll()
+                waited = 0.0
+                while waited < settle_sec:
+                    if callable(cancel_callback):
+                        cancel_callback()
+                    time.sleep(0.5)
+                    waited += 0.5
+                start = time.time()
+                while time.time() - start < timeout_sec:
+                    if callable(cancel_callback):
+                        cancel_callback()
+                    all_done = True
+                    for sheet in workbook.Worksheets:
+                        for qt in sheet.QueryTables:
+                            if hasattr(qt, "Refreshing") and qt.Refreshing:
+                                all_done = False
+                                break
+                        if not all_done:
+                            break
+                    if all_done:
+                        return True
+                    time.sleep(poll_sec)
+                last_error = TimeoutError(
+                    f"RefreshAll 逾時（timeout_sec={timeout_sec}, poll_sec={poll_sec}）"
+                )
+            except Exception as exc:
+                last_error = exc
+            time.sleep(retry_delay_sec)
+        if last_error is not None:
+            raise last_error
+        return False
 
 class UserCancelledError(Exception):
     pass
@@ -48,13 +218,206 @@ class ExcelApp:
         self.factory_site = ""
         self.cancel_event = None
         self.was_cancelled = False
+        self.base_dir = self.get_base_dir()
+        self.output_root = os.path.join(self.base_dir, "output")
+        self.result_dir = os.path.join(self.output_root, "result")
+        self.report_dir = os.path.join(self.output_root, "report")
+        self.charts_dir = os.path.join(self.output_root, "charts")
+        self.tmp_dir = os.path.join(self.output_root, "tmp")
+        self.logs_dir = os.path.join(self.base_dir, "logs")
+        for folder in (
+            self.output_root,
+            self.result_dir,
+            self.report_dir,
+            self.charts_dir,
+            self.tmp_dir,
+            self.logs_dir,
+        ):
+            os.makedirs(folder, exist_ok=True)
 
-        # ──────────────────────────────────────────────────────────
-        # 自動在程式路徑下建立「結果」資料夾
-        base_dir = self.get_base_dir()
-        self.output_dir = os.path.join(base_dir, "結果")    # 程式路徑
-        os.makedirs(self.output_dir, exist_ok=True)
-        # ──────────────────────────────────────────────────────────
+        # Backward compatibility for legacy methods.
+        self.output_dir = self.result_dir
+
+        self.runtime_config = {
+            "open_retry_count": COM_OPEN_RETRY_COUNT,
+            "open_retry_delay_sec": COM_OPEN_RETRY_DELAY_SEC,
+            "open_timeout_sec": COM_OPEN_TIMEOUT_SEC,
+            "save_retry_count": COM_SAVE_RETRY_COUNT,
+            "save_retry_delay_sec": COM_SAVE_RETRY_DELAY_SEC,
+            "save_timeout_sec": COM_SAVE_TIMEOUT_SEC,
+            "refresh_retry_count": COM_REFRESH_RETRY_COUNT,
+            "refresh_retry_delay_sec": COM_REFRESH_RETRY_DELAY_SEC,
+            "refresh_settle_sec": COM_REFRESH_SETTLE_SEC,
+            "refresh_timeout_sec": COM_REFRESH_TIMEOUT_SEC,
+            "refresh_poll_sec": COM_REFRESH_POLL_SEC,
+        }
+        self.logger = self._build_logger()
+        self._warnings = []
+        self.current_run_id = ""
+
+    def _build_logger(self):
+        logger = logging.getLogger("excel_processing")
+        if logger.handlers:
+            return logger
+        logger.setLevel(logging.INFO)
+        log_path = os.path.join(self.logs_dir, "excel_processing.log")
+        formatter = logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+        logger.propagate = False
+        return logger
+
+    def _new_run_id(self) -> str:
+        return f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+    def _start_task(self, task_name: str):
+        run_id = self._new_run_id()
+        self.current_run_id = run_id
+        self._warnings = []
+        self.last_error = None
+        self.was_cancelled = False
+        self.logger.info("[run_id=%s] start %s", run_id, task_name)
+        return run_id, time.time()
+
+    def _finish_task_log(self, run_id: str, task_name: str, result: TaskResult):
+        level = logging.INFO if result.ok else logging.ERROR
+        self.logger.log(
+            level,
+            "[run_id=%s] finish %s ok=%s code=%s elapsed_ms=%s message=%s",
+            run_id,
+            task_name,
+            result.ok,
+            result.error_code,
+            result.elapsed_ms,
+            result.message,
+        )
+
+    def _elapsed_ms(self, started_at: float) -> int:
+        return int((time.time() - started_at) * 1000)
+
+    def _warn(self, message: str):
+        self._warnings.append(message)
+        self.logger.warning("[run_id=%s] %s", self.current_run_id or "-", message)
+
+    def _result_ok(self, message: str, artifacts: Dict[str, Any], started_at: float) -> TaskResult:
+        return TaskResult(
+            ok=True,
+            message=message,
+            artifacts=artifacts,
+            elapsed_ms=self._elapsed_ms(started_at),
+            warnings=list(self._warnings),
+        )
+
+    def _result_fail(
+        self,
+        *,
+        error_code: str,
+        user_message: str,
+        started_at: float,
+        exc: Exception = None,
+    ) -> TaskResult:
+        technical = traceback.format_exc() if exc is not None else ""
+        if exc is not None:
+            self.logger.exception(
+                "[run_id=%s] %s: %s", self.current_run_id or "-", error_code, user_message
+            )
+        self.last_error = user_message
+        return TaskResult(
+            ok=False,
+            error_code=error_code,
+            message=user_message,
+            artifacts={"technical_details": technical},
+            elapsed_ms=self._elapsed_ms(started_at),
+            warnings=list(self._warnings),
+        )
+
+    def _coerce_task_result(
+        self,
+        *,
+        task_name: str,
+        started_at: float,
+        value,
+        success_message: str,
+        success_artifacts_fn=None,
+    ) -> TaskResult:
+        if isinstance(value, TaskResult):
+            value.elapsed_ms = value.elapsed_ms or self._elapsed_ms(started_at)
+            if not value.warnings:
+                value.warnings = list(self._warnings)
+            return value
+        if isinstance(value, dict):
+            ok = bool(value.get("ok"))
+            if ok:
+                artifacts = dict(value)
+                return self._result_ok(success_message, artifacts=artifacts, started_at=started_at)
+            cancelled = bool(value.get("cancelled"))
+            code = "USER_CANCELLED" if cancelled else "TASK_FAILED"
+            msg = str(value.get("error") or value.get("message") or f"{task_name} 失敗")
+            return TaskResult(
+                ok=False,
+                error_code=code,
+                message=msg,
+                artifacts={"legacy_result": value},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+        if isinstance(value, bool):
+            if value:
+                artifacts = success_artifacts_fn() if callable(success_artifacts_fn) else {}
+                return self._result_ok(success_message, artifacts=artifacts, started_at=started_at)
+            code = "USER_CANCELLED" if self.was_cancelled else "TASK_FAILED"
+            msg = self.last_error or f"{task_name} 失敗"
+            return TaskResult(
+                ok=False,
+                error_code=code,
+                message=msg,
+                artifacts={},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+        if isinstance(value, str) and value:
+            artifacts = success_artifacts_fn() if callable(success_artifacts_fn) else {}
+            artifacts = dict(artifacts)
+            artifacts.setdefault("path", value)
+            return self._result_ok(success_message, artifacts=artifacts, started_at=started_at)
+        code = "USER_CANCELLED" if self.was_cancelled else "TASK_FAILED"
+        msg = self.last_error or f"{task_name} 回傳了不支援的結果型別"
+        return TaskResult(
+            ok=False,
+            error_code=code,
+            message=msg,
+            artifacts={"legacy_result": value},
+            elapsed_ms=self._elapsed_ms(started_at),
+            warnings=list(self._warnings),
+        )
+
+    def _chart_path(self, filename: str) -> str:
+        path = os.path.join(self.charts_dir, filename)
+        if not hasattr(self, "_chart_artifacts"):
+            self._chart_artifacts = []
+        self._chart_artifacts.append(path)
+        return path
+
+    def _cleanup_chart_artifacts(self):
+        paths = list(getattr(self, "_chart_artifacts", []))
+        self._chart_artifacts = []
+        for path in paths:
+            with suppress(Exception):
+                if os.path.exists(path):
+                    os.remove(path)
+        # Backward cleanup for legacy files that may have been written to project root.
+        with suppress(Exception):
+            for name in os.listdir(self.base_dir):
+                lower = name.lower()
+                if (lower.startswith("bar_chart_") or lower.startswith("pie_chart_")) and lower.endswith(".png"):
+                    os.remove(os.path.join(self.base_dir, name))
 
     def _notify_status(self, message):
         """
@@ -108,9 +471,137 @@ class ExcelApp:
         self.file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
         self.file_entry.delete(0, tk.END)
         self.file_entry.insert(0, self.file_path)
-    def process_file(self, file_path=None):
+
+    def transform_sheet(self) -> TaskResult:
+        run_id, started_at = self._start_task("transform_sheet")
+        try:
+            raw = self._transform_sheet_impl()
+            result = self._coerce_task_result(
+                task_name="transform_sheet",
+                started_at=started_at,
+                value=raw,
+                success_message="Transform 完成",
+                success_artifacts_fn=lambda: {"merged_file": getattr(self, "merged_file", "")},
+            )
+        except UserCancelledError as exc:
+            self.was_cancelled = True
+            result = self._result_fail(
+                error_code="USER_CANCELLED",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
+            )
+        except Exception as exc:
+            result = self._result_fail(
+                error_code="TRANSFORM_EXCEPTION",
+                user_message="Transform 發生未預期錯誤",
+                started_at=started_at,
+                exc=exc,
+            )
+        result.artifacts.setdefault("run_id", run_id)
+        self._finish_task_log(run_id, "transform_sheet", result)
+        return result
+
+    def process_file(self, file_path=None) -> TaskResult:
+        run_id, started_at = self._start_task("process_file")
+        try:
+            raw = self._process_file_impl(file_path=file_path)
+            result = self._coerce_task_result(
+                task_name="process_file",
+                started_at=started_at,
+                value=raw,
+                success_message="資料處理完成",
+                success_artifacts_fn=lambda: {
+                    "result_file": getattr(self, "result_file", ""),
+                    "report_file": getattr(self, "report_file", ""),
+                },
+            )
+        except UserCancelledError as exc:
+            self.was_cancelled = True
+            result = self._result_fail(
+                error_code="USER_CANCELLED",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
+            )
+        except Exception as exc:
+            result = self._result_fail(
+                error_code="PROCESS_EXCEPTION",
+                user_message="資料處理發生未預期錯誤",
+                started_at=started_at,
+                exc=exc,
+            )
+        result.artifacts.setdefault("run_id", run_id)
+        self._finish_task_log(run_id, "process_file", result)
+        return result
+
+    def generate_report(self, template_choice) -> TaskResult:
+        run_id, started_at = self._start_task("generate_report")
+        try:
+            raw = self._generate_report_impl(template_choice)
+            result = self._coerce_task_result(
+                task_name="generate_report",
+                started_at=started_at,
+                value=raw,
+                success_message="報告產生完成",
+                success_artifacts_fn=lambda: {"report_doc": raw if isinstance(raw, str) else ""},
+            )
+        except UserCancelledError as exc:
+            self.was_cancelled = True
+            result = self._result_fail(
+                error_code="USER_CANCELLED",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
+            )
+        except Exception as exc:
+            result = self._result_fail(
+                error_code="REPORT_EXCEPTION",
+                user_message="報告產生發生未預期錯誤",
+                started_at=started_at,
+                exc=exc,
+            )
+        self._cleanup_chart_artifacts()
+        result.artifacts.setdefault("run_id", run_id)
+        self._finish_task_log(run_id, "generate_report", result)
+        return result
+
+    def process_all(self) -> TaskResult:
+        run_id, started_at = self._start_task("process_all")
+        if not self.file_path:
+            result = TaskResult(
+                ok=False,
+                error_code="MISSING_INPUT",
+                message="請選擇 Excel 文件",
+                artifacts={"run_id": run_id},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+            self._finish_task_log(run_id, "process_all", result)
+            return result
+        transform_result = self.transform_sheet()
+        if not transform_result.ok:
+            transform_result.elapsed_ms = self._elapsed_ms(started_at)
+            transform_result.artifacts["run_id"] = run_id
+            self._finish_task_log(run_id, "process_all", transform_result)
+            return transform_result
+
+        merged_path = (
+            transform_result.artifacts.get("path")
+            or transform_result.artifacts.get("merged_file")
+            or transform_result.message
+        )
+        process_result = self.process_file(file_path=merged_path if isinstance(merged_path, str) else None)
+        process_result.elapsed_ms = self._elapsed_ms(started_at)
+        process_result.artifacts["run_id"] = run_id
+        if process_result.ok:
+            process_result.message = "Transform + Process 完成"
+            process_result.warnings = list(self._warnings + process_result.warnings)
+        self._finish_task_log(run_id, "process_all", process_result)
+        return process_result
+
+    def _process_file_impl(self, file_path=None):
         """數據處理"""
-        from win32com.client import DispatchEx
         if file_path is not None:
             self.file_path = file_path
         self.last_error = None
@@ -119,12 +610,7 @@ class ExcelApp:
         if not self.file_path:
             err_msg = "請選擇 Excel 文件"
             self.last_error = err_msg
-            messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return {"ok": False, "error": err_msg}
-
-        excel = None
-        com_wb = None
-        com_initialized = False
 
         try:
             self._check_cancel()
@@ -193,8 +679,8 @@ class ExcelApp:
                 self.report_file = f'report_{product_name_suffix}_{current_time}.xlsx'
             else:
                 self.report_file = f'report_{current_time}.xlsx'
-            self.report_file = os.path.join(self.output_dir, self.report_file)
-            print("路徑位置：",self.output_dir)
+            self.report_file = os.path.join(self.report_dir, self.report_file)
+            print("路徑位置：", self.report_dir)
             report_workbook.save(self.report_file)
             
             # 另存為新文件，保留原有的表格樣式，附上日期和時間
@@ -202,44 +688,40 @@ class ExcelApp:
                 self.result_file = f'result_{product_name_suffix}_{current_time}.xlsx'
             else:
                 self.result_file = f'result_{current_time}.xlsx'
-            self.result_file = os.path.join(self.output_dir, self.result_file)
+            self.result_file = os.path.join(self.result_dir, self.result_file)
             self._check_cancel()
             result_workbook.save(self.result_file)
 
-        #    3. 用 Excel COM 自動修復並輸出最終結果
+            #    3. 用 Excel COM 自動修復並輸出最終結果
             self._check_cancel()
-            pythoncom.CoInitialize()
-            com_initialized = True
             try:
-                excel = DispatchEx("Excel.Application")
-                excel.Visible = False
-                excel.DisplayAlerts = False
-                excel.EnableEvents = False
-
                 path = os.path.abspath(self.result_file)
-                # CorruptLoad=1: 自動嘗試修復任何架構問題；UpdateLinks=0: 不更新外部連結
-                # 小延遲 + 確認檔案存在
-                for _ in range(5):
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"找不到結果檔：{path}")
+                with ExcelComSession(
+                    visible=False,
+                    display_alerts=False,
+                    enable_events=False,
+                    screen_updating=False,
+                ) as session:
+                    com_wb = session.open_workbook(
+                        path,
+                        CorruptLoad=1,
+                        UpdateLinks=0,
+                        ReadOnly=False,
+                        IgnoreReadOnlyRecommended=True,
+                        retry_count=self.runtime_config["open_retry_count"],
+                        retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                        timeout_sec=self.runtime_config["open_timeout_sec"],
+                    )
                     self._check_cancel()
-                    if os.path.exists(path):
-                        try:
-                            com_wb = excel.Workbooks.Open(
-                                path,
-                                CorruptLoad=1,
-                                UpdateLinks=0,
-                                ReadOnly=False,
-                                IgnoreReadOnlyRecommended=True
-                            )
-                            break
-                        except Exception:
-                            time.sleep(0.3)
-                    time.sleep(0.2)
-
-                if com_wb is None:
-                    raise RuntimeError(f"Excel 無法開啟結果檔：{path}")
-                self._check_cancel()
-                excel.CalculateUntilAsyncQueriesDone()
-                com_wb.Save()
+                    session.excel.CalculateUntilAsyncQueriesDone()
+                    session.save_with_retry(
+                        com_wb,
+                        retry_count=self.runtime_config["save_retry_count"],
+                        retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                        timeout_sec=self.runtime_config["save_timeout_sec"],
+                    )
 
             except UserCancelledError:
                 raise
@@ -248,23 +730,6 @@ class ExcelApp:
                 err_msg = f"{e}\n{traceback.format_exc()}"
                 self.last_error = err_msg
                 return {"ok": False, "error": err_msg}  # 告知呼叫方：失敗
-
-            finally:
-                try:
-                    if com_wb:
-                        com_wb.Close(False)
-                except Exception:
-                    pass
-                try:
-                    if excel:
-                        excel.Quit()
-                except Exception:
-                    pass
-                if com_initialized:
-                    try:
-                        pythoncom.CoUninitialize()
-                    except Exception:
-                        pass
 
             return {
                 "ok": True,
@@ -746,7 +1211,7 @@ class ExcelApp:
 
         return new_sheet_rows
 
-    def transform_sheet(self):
+    def _transform_sheet_impl(self):
         """
         將自動化Excel表單轉換成盤查表單格式：
         1. 用 openpyxl 讀取模板檔案（PLCI_table_format.xlsx），取得各工作表內容。
@@ -759,17 +1224,14 @@ class ExcelApp:
         5. 利用 xlsxwriter 將調整後的所有內容寫入新檔案中。
         """
         if not self.file_path:
-            messagebox.showerror("錯誤", "請選擇 Excel 文件")
-            return
+            self.last_error = "請選擇 Excel 文件"
+            return False
 
         self.was_cancelled = False
         self._check_cancel()
 
         ok = False
         err_msg = None
-        wb_tpl = None
-        wb_new = None
-        excel = None
         try:
             self._check_cancel()
             self._format_cache.clear()  # 清空格式快取
@@ -882,7 +1344,7 @@ class ExcelApp:
                 new_file_name = f'merged_result_{product_name_suffix}_{current_datetime}.xlsx'
             else:
                 new_file_name = f'merged_result_{current_datetime}.xlsx'
-            new_file_path = os.path.join(self.output_dir, new_file_name)
+            new_file_path = os.path.join(self.result_dir, new_file_name)
             workbook = xlsxwriter.Workbook(new_file_path, {'nan_inf_to_errors': True})
             formula_entries = {}    
 
@@ -979,100 +1441,96 @@ class ExcelApp:
                 self.update_progress_smooth(80, 95, step=1, delay=0.02) # 第5階段完成：95%
             self._check_cancel()
             workbook.close()
-            time.sleep(0.1)
             print("靜態頁複製")
             self._notify_status("靜態頁複製")
             self._check_cancel()
-            pythoncom.CoInitialize()
-            excel = win32.DispatchEx("Excel.Application")
-            excel.Visible = False  # 背後跑就好
-            excel.DisplayAlerts = False    # 關閉任何提示訊息
-            excel.ScreenUpdating = False   # 關閉畫面更新
-            # 打開新檔和範本
             if not os.path.exists(target_file_path):
                 raise FileNotFoundError(f"找不到範本：{target_file_path}")
-            wb_tpl = excel.Workbooks.Open(target_file_path,
-                              CorruptLoad=1,
-                              ReadOnly=True,
-                              IgnoreReadOnlyRecommended=True)
-            #(測試)確認新檔案存在
-            print(new_file_path)
-            print("exists:", os.path.exists(new_file_path))
-            if os.path.exists(new_file_path):
-                print("size:", os.path.getsize(new_file_path))
-
-            self._check_cancel()
-            wb_new = excel.Workbooks.Open(new_file_path, CorruptLoad=1)
-            static_sheets = ['Instruction', 'overview', 'Process flow chart', 'simapro10.2.0.0']
-            for sheet_name in static_sheets:
+            with ExcelComSession(
+                visible=False,
+                display_alerts=False,
+                enable_events=False,
+                screen_updating=False,
+            ) as session:
+                wb_tpl = session.open_workbook(
+                    target_file_path,
+                    CorruptLoad=1,
+                    ReadOnly=True,
+                    IgnoreReadOnlyRecommended=True,
+                    retry_count=self.runtime_config["open_retry_count"],
+                    retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["open_timeout_sec"],
+                )
                 self._check_cancel()
-                try:
-                    # 把範本的這張 Copy 到新檔，放在第一張動態頁前面
-                    wb_tpl.Sheets(sheet_name).Copy(Before=wb_new.Sheets(1))
-                except Exception as e:
-                    print(f"複製「{sheet_name}」失敗：{e}")
-
-            # 複製完所有靜態頁後，加入以下程式碼
-            # Write back formulas after static sheet copy
-            for sheet_name, formula_list in formula_entries.items():
-                self._check_cancel()
-                try:
-                    ws_target = wb_new.Sheets(sheet_name)
-                except Exception as e:
-                    print(f"Formula writeback skipped: missing sheet {sheet_name}: {e}")
-                    continue
-                for row_idx, col_idx, formula in formula_list:
+                wb_new = session.open_workbook(
+                    new_file_path,
+                    CorruptLoad=1,
+                    ReadOnly=False,
+                    IgnoreReadOnlyRecommended=True,
+                    retry_count=self.runtime_config["open_retry_count"],
+                    retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["open_timeout_sec"],
+                )
+                static_sheets = ['Instruction', 'overview', 'Process flow chart', 'simapro10.2.0.0']
+                for sheet_name in static_sheets:
                     self._check_cancel()
                     try:
-                        ws_target.Cells(row_idx + 1, col_idx + 1).Formula = formula
+                        wb_tpl.Sheets(sheet_name).Copy(Before=wb_new.Sheets(1))
                     except Exception as e:
-                        print(f"Formula writeback failed: {sheet_name} {row_idx + 1},{col_idx + 1} {formula}: {e}")
+                        self._warn(f"複製「{sheet_name}」失敗：{e}")
 
-            try:
-                # 取得 wb_new 的 overview 工作表
+                for sheet_name, formula_list in formula_entries.items():
+                    self._check_cancel()
+                    try:
+                        ws_target = wb_new.Sheets(sheet_name)
+                    except Exception as e:
+                        self._warn(f"Formula writeback skipped: missing sheet {sheet_name}: {e}")
+                        continue
+                    for row_idx, col_idx, formula in formula_list:
+                        self._check_cancel()
+                        try:
+                            ws_target.Cells(row_idx + 1, col_idx + 1).Formula = formula
+                        except Exception as e:
+                            self._warn(
+                                f"Formula writeback failed: {sheet_name} {row_idx + 1},{col_idx + 1} {formula}: {e}"
+                            )
+
                 overview = wb_new.Sheets("overview")
-                # 在 H2 設定你要的公式，例如：合計 AB2 到 AE2
                 overview.Range("H2").Formula = "='Raw Material'!AE2+Manufacturing!AE2+Distribution!AE2+Recycling!AE2+Usage!AE2"
                 overview.Range("V2").Formula = "=Usage!$K$5"
-                overview.Range("C17").Value = input_values["product_name"] #產品F階段名稱
-                overview.Range("C18").Value = input_values["start_date"] #盤查起始時間
-                overview.Range("G18").Value = input_values["end_date"] #盤查結束時間
-                
+                overview.Range("C17").Value = input_values["product_name"]
+                overview.Range("C18").Value = input_values["start_date"]
+                overview.Range("G18").Value = input_values["end_date"]
+
                 factory_site = self.factory_site.strip() if isinstance(self.factory_site, str) else ""
                 factory_info = FACTORY_OVERVIEW_INFO.get(factory_site)
                 if factory_info:
                     overview.Range("C3").Value = factory_info["name"]
                     overview.Range("C4").Value = factory_info["address"]
-                # *新增*填入產品資訊(公司廠址名稱、盤查地址、機種、型號、時間區間、照片)
-                # 如果要寫入本地語系公式，可改用 FormulaLocal
-                # overview.Range("H2").FormulaLocal = "=SUM(AB2:AE2)"
-                print("已在 overview 工作表寫入公式")
-            except Exception as e:
-                err_msg = f"設定 overview 工作表公式失敗：{e}"
-                print(f"設定 overview 工作表公式失敗：{e}")
-                return False
-            
-            
-            try:
-                # 然後再執行 RefreshAll 並存檔
-                self._check_cancel()
-                wb_tpl.RefreshAll()
-                print("靜態頁複製完成")
-                self._notify_status("靜態頁複製完成")
 
-                # 存檔、關檔、退出
-                wb_new.Save()
-                wb_tpl.Close(False)
-                wb_new.Close(False)
+                self._check_cancel()
+                session.refresh_all_and_wait(
+                    wb_new,
+                    retry_count=self.runtime_config["refresh_retry_count"],
+                    retry_delay_sec=self.runtime_config["refresh_retry_delay_sec"],
+                    settle_sec=self.runtime_config["refresh_settle_sec"],
+                    timeout_sec=self.runtime_config["refresh_timeout_sec"],
+                    poll_sec=self.runtime_config["refresh_poll_sec"],
+                    cancel_callback=self._check_cancel,
+                )
+                session.save_with_retry(
+                    wb_new,
+                    retry_count=self.runtime_config["save_retry_count"],
+                    retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["save_timeout_sec"],
+                )
+                session.close_workbook(wb_tpl, save_changes=False)
+                session.close_workbook(wb_new, save_changes=False)
                 if self.update_progress_smooth:
-                    self.update_progress_smooth(95, 100, step=1, delay=0.01) # 第6階段完成：100%
-                # pythoncom.CoUninitialize()    
+                    self.update_progress_smooth(95, 100, step=1, delay=0.01)
                 ok = True
-            except Exception as e:
-                print(f"存檔失敗：{e}")
-                err_msg = f"存檔失敗：{e}"
-                return False
             # 成功的回傳值
+            self.merged_file = new_file_path
             return new_file_path
         except UserCancelledError as e:
             self.was_cancelled = True
@@ -1089,28 +1547,6 @@ class ExcelApp:
             print(f"處理 Transform Sheet 時出錯：{e}\n{tb}")
             return False
         finally:
-            # ── 集中清理（不論成功/失敗/何處 return 都會執行）──
-            try:
-                if wb_tpl is not None:
-                    wb_tpl.Close(SaveChanges=False)
-            except Exception:
-                pass
-            try:
-                if wb_new is not None:
-                    # 如果成功已經存檔，這裡關閉就好
-                    wb_new.Close(SaveChanges=False)
-            except Exception:
-                pass
-            try:
-                if excel is not None:
-                    excel.Quit()
-            except Exception:
-                pass
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-
             # 把錯誤訊息傳回去（可用屬性或 callback）
             if not ok:
                 # 方式 1：設成實例屬性，讓 GUI 執行緒讀取
@@ -1123,24 +1559,128 @@ class ExcelApp:
                         pass
 
 
-    def process_all(self):
+    def _process_all_impl(self):
         """處理全部"""
         if not self.file_path:
-            messagebox.showerror("錯誤", "請選擇 Excel 文件")
-            return
+            self.last_error = "請選擇 Excel 文件"
+            return False
 
         try:
             self._notify_status("開始執行 Transform Sheet")
-            new_file_path = self.transform_sheet()
-            if new_file_path:  # 確認返回值有效
-                self._notify_status("Transform Sheet 完成，開始處理數據")
-                self.process_file(file_path = new_file_path)
-                self._notify_status("處理全部完成")
+            transform_result = self.transform_sheet()
+            if not transform_result.ok:
+                self.last_error = transform_result.message
+                return False
+            merged_path = (
+                transform_result.artifacts.get("path")
+                or transform_result.artifacts.get("merged_file")
+                or None
+            )
+            self._notify_status("Transform Sheet 完成，開始處理數據")
+            process_result = self.process_file(file_path=merged_path)
+            if not process_result.ok:
+                self.last_error = process_result.message
+                return False
+            self._notify_status("處理全部完成")
             return True
         
         except Exception as e:
-            messagebox.showerror("錯誤", f"處理全部過程中出現錯誤：{e}")
+            self.last_error = f"處理全部過程中出現錯誤：{e}"
             return False
+
+    def update_input_sheet(self, file_path, product="", start_date="", end_date="") -> TaskResult:
+        run_id, started_at = self._start_task("update_input_sheet")
+        if not file_path:
+            result = TaskResult(
+                ok=False,
+                error_code="MISSING_INPUT",
+                message="缺少要更新的 Excel 檔案路徑",
+                artifacts={"run_id": run_id},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+            self._finish_task_log(run_id, "update_input_sheet", result)
+            return result
+        try:
+            self._notify_status("開始更新 INPUT 工作表")
+            with ExcelComSession(
+                visible=False,
+                display_alerts=False,
+                enable_events=False,
+                screen_updating=False,
+            ) as session:
+                workbook = session.open_workbook(
+                    file_path,
+                    ReadOnly=False,
+                    retry_count=self.runtime_config["open_retry_count"],
+                    retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["open_timeout_sec"],
+                )
+                for conn in workbook.Connections:
+                    with suppress(Exception):
+                        if hasattr(conn, "OLEDBConnection") and hasattr(conn.OLEDBConnection, "RefreshOnFileOpen"):
+                            conn.OLEDBConnection.RefreshOnFileOpen = False
+                    with suppress(Exception):
+                        if hasattr(conn, "OLEDBConnection") and hasattr(conn.OLEDBConnection, "EnableRefresh"):
+                            conn.OLEDBConnection.EnableRefresh = False
+
+                ws = workbook.Worksheets("INPUT")
+                if str(product).strip():
+                    ws.Cells(1, 2).Value = product
+                if str(start_date).strip():
+                    ws.Cells(2, 2).Value = start_date
+                if str(end_date).strip():
+                    ws.Cells(3, 2).Value = end_date
+
+                session.save_with_retry(
+                    workbook,
+                    retry_count=self.runtime_config["save_retry_count"],
+                    retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["save_timeout_sec"],
+                )
+                session.refresh_all_and_wait(
+                    workbook,
+                    retry_count=self.runtime_config["refresh_retry_count"],
+                    retry_delay_sec=self.runtime_config["refresh_retry_delay_sec"],
+                    settle_sec=self.runtime_config["refresh_settle_sec"],
+                    timeout_sec=self.runtime_config["refresh_timeout_sec"],
+                    poll_sec=self.runtime_config["refresh_poll_sec"],
+                    cancel_callback=self._check_cancel,
+                )
+                session.save_with_retry(
+                    workbook,
+                    retry_count=self.runtime_config["save_retry_count"],
+                    retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["save_timeout_sec"],
+                )
+                session.close_workbook(workbook, save_changes=False)
+
+            result = TaskResult(
+                ok=True,
+                message="INPUT 工作表更新完成",
+                artifacts={"file_path": file_path, "run_id": run_id},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+        except UserCancelledError as exc:
+            self.was_cancelled = True
+            result = self._result_fail(
+                error_code="USER_CANCELLED",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
+            )
+            result.artifacts["run_id"] = run_id
+        except Exception as exc:
+            result = self._result_fail(
+                error_code="UPDATE_INPUT_FAILED",
+                user_message="更新 INPUT 工作表失敗",
+                started_at=started_at,
+                exc=exc,
+            )
+            result.artifacts["run_id"] = run_id
+        self._finish_task_log(run_id, "update_input_sheet", result)
+        return result
         
     def update_excel_cache(self, result_file):
         """使用 Excel 更新公式快取值"""
@@ -1150,30 +1690,35 @@ class ExcelApp:
             err_msg = f"找不到檔案：{result_file}"
             return False
 
-        excel = None
-        wb = None
         ok = False
         err_msg = None  
 
         try:
             self._check_cancel()
-            pythoncom.CoInitialize()
-            # 建立 Excel 應用程式實例（不顯示）
-            excel = win32.DispatchEx("Excel.Application")
-            excel.DisplayAlerts = False        # 不跳提示框
-            wb = excel.Workbooks.Open(
-                os.path.abspath(self.result_file),
-                CorruptLoad=1,
-                UpdateLinks=0,
-                ReadOnly=False
-            )           
-            # 強制計算所有公式
-            self._check_cancel()
-            excel.CalculateUntilAsyncQueriesDone()
-            # 儲存並關閉工作簿
-            wb.Save() 
-            wb.Close(SaveChanges=True)
-            pythoncom.CoUninitialize()
+            with ExcelComSession(
+                visible=False,
+                display_alerts=False,
+                enable_events=False,
+                screen_updating=False,
+            ) as session:
+                wb = session.open_workbook(
+                    os.path.abspath(result_file),
+                    CorruptLoad=1,
+                    UpdateLinks=0,
+                    ReadOnly=False,
+                    retry_count=self.runtime_config["open_retry_count"],
+                    retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["open_timeout_sec"],
+                )
+                self._check_cancel()
+                session.excel.CalculateUntilAsyncQueriesDone()
+                session.save_with_retry(
+                    wb,
+                    retry_count=self.runtime_config["save_retry_count"],
+                    retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["save_timeout_sec"],
+                )
+                session.close_workbook(wb, save_changes=False)
             ok = True
             return True
         except UserCancelledError as e:
@@ -1185,22 +1730,6 @@ class ExcelApp:
             print(f"更新 Excel 快取值時發生錯誤：{e}")
             return False
         finally:
-            # ── 集中清理（不論成功/失敗/何處 return 都會執行）──
-            try:
-                if wb is not None:
-                    wb.Close(SaveChanges=False)
-            except Exception:
-                pass
-            try:
-                if excel is not None:
-                    excel.Quit()
-            except Exception:
-                pass
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-
             # 把錯誤訊息傳回去（可用屬性或 callback）
             if not ok:
                 # 方式 1：設成實例屬性，讓 GUI 執行緒讀取
@@ -1212,7 +1741,7 @@ class ExcelApp:
                     except Exception:
                         pass
 
-    def generate_report(self, template_choice):
+    def _generate_report_impl(self, template_choice):
         """
         數據處理完後產生完整報告書流程：
         1. 根據 template_choice 選擇 Word 模板
@@ -1330,7 +1859,7 @@ class ExcelApp:
                 # 模板中可使用 {% for item in all_contexts %} ... {% endfor %} 來逐筆列印資料
                 doc.render(self.context) #使用 docxtpl 模組來套用這些資料到 Word 模板中
                 full_output_name = f"智邦-產品碳足跡盤查總報告書_{today_date}.docx"   #命名output_doc
-                full_output_path = os.path.join(self.output_dir, full_output_name)
+                full_output_path = os.path.join(self.tmp_dir, full_output_name)
                 doc.save(full_output_path)
             except Exception as e:
                 messagebox.showerror("錯誤", f"生成報告時發生錯誤：{e}")
@@ -1400,7 +1929,7 @@ class ExcelApp:
         self._notify_status("保存文件...")
         self._check_cancel()
         full_report_file = os.path.join(
-            self.output_dir, f"智邦-產品碳足跡盤查總報告書_{today_date}.docx")
+            self.report_dir, f"智邦-產品碳足跡盤查總報告書_{today_date}.docx")
         doc.save(full_report_file)
         if self.update_progress_smooth:
             self.update_progress_smooth(95, 100, step=1, delay=0.02)  # 完全完成：100%
@@ -1627,7 +2156,8 @@ class ExcelApp:
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(sheet_names), loc='upper right')
         plt.tight_layout()  # 確保標籤、標題不重疊
-        plt.savefig('bar_chart_1.png', bbox_inches='tight')
+        bar_chart_1_path = self._chart_path("bar_chart_1.png")
+        plt.savefig(bar_chart_1_path, bbox_inches='tight')
         # plt.show()
         # ------------------- 2. 產生各 Sheet 在 fossil/biogenic/land transformation 三項佔比 (bar_chart_2) -------------------
         categories = ['fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)']
@@ -1683,16 +2213,17 @@ class ExcelApp:
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(title='Sheet Name')
         plt.tight_layout()
-        plt.savefig('bar_chart_2.png', bbox_inches='tight')
+        bar_chart_2_path = self._chart_path("bar_chart_2.png")
+        plt.savefig(bar_chart_2_path, bbox_inches='tight')
         # plt.show()
 
         # ------------------- 3. 將繪製好的圖儲存至self.context -------------------
         chart_1 = InlineImage(doc,
-                        'bar_chart_1.png',
+                        bar_chart_1_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
         chart_2 = InlineImage(doc,
-                        'bar_chart_2.png',
+                        bar_chart_2_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 
@@ -1813,7 +2344,8 @@ class ExcelApp:
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(name_values) + [remaining_name], loc='upper right')
         plt.tight_layout()
-        plt.savefig('bar_chart_3.png', bbox_inches='tight')
+        bar_chart_3_path = self._chart_path("bar_chart_3.png")
+        plt.savefig(bar_chart_3_path, bbox_inches='tight')
         # plt.show()
 
         # ------------------ 3. 繪製圓餅圖 (pie_chart_4.png) ------------------
@@ -1904,18 +2436,19 @@ class ExcelApp:
             plt.title('No Data Available')  # 設定標題，避免 `tight_layout()` 崩潰
         else:
             plt.tight_layout()
-        plt.savefig('pie_chart_4.png', bbox_inches='tight')
+        pie_chart_4_path = self._chart_path("pie_chart_4.png")
+        plt.savefig(pie_chart_4_path, bbox_inches='tight')
         # plt.show()
 
 
         # ------------------ 4. 將繪製好的圖儲存至self.context ------------------
 
         chart_3 = InlineImage(doc,
-                        'bar_chart_3.png',
+                        bar_chart_3_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
         chart_4 = InlineImage(doc,
-                        'pie_chart_4.png',
+                        pie_chart_4_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 
@@ -2021,14 +2554,15 @@ class ExcelApp:
         plt.xticks(rotation=90)
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(name_values) + ['Remaining processes'], loc='upper right')
-        # 显示图表
-        plt.tight_layout()# 调整布局，确保标签和标题不重叠
-        plt.savefig('bar_chart_5.png', bbox_inches='tight')
+        # 顯示圖表
+        plt.tight_layout()# 調整佈局，確保標籤和標題不重疊
+        bar_chart_5_path = self._chart_path("bar_chart_5.png")
+        plt.savefig(bar_chart_5_path, bbox_inches='tight')
         # plt.show()
 
 
 
-        # 创建一个圓餅图
+        # 繪製一個餅圖
         if len(name_values) < 10:
             labels = list(name_values)
             sizes = list(damage_values)
@@ -2092,13 +2626,13 @@ class ExcelApp:
                 x = wedge.r * 0.85 * np.cos(np.deg2rad(ang))
                 y = wedge.r * 0.85 * np.sin(np.deg2rad(ang))
                 percentage = f"{100 * sizes[i] / sum(sizes):1.1f}%"
-                connectionstyle = f"angle,angleA=0,angleB={ang}"# 设置指针样式
+                connectionstyle = f"angle,angleA=0,angleB={ang}"# 設定指針樣式
                 kw = dict(
                     arrowprops=dict(arrowstyle="->", connectionstyle=connectionstyle),
                     zorder=0, va="center"
                 )
                 
-                # 添加注释
+                # 新增註釋
                 plt.annotate(
                     percentage,
                     xy=(x, y),
@@ -2108,27 +2642,28 @@ class ExcelApp:
                     **kw
                 )
 
-        plt.axis('equal')  # 使得圆饼图是正圆的
+        plt.axis('equal')  # 使得圓餅圖是正圓的
         plt.subplots_adjust(left=0.3, right=0.7)
-        plt.title('Damage Assessment by Name (Pie Chart)')# 添加标题
-        legend = plt.legend(labels, loc='upper right', bbox_to_anchor=(1.5, 1))# 添加图例
+        plt.title('Damage Assessment by Name (Pie Chart)')# 新增標題
+        legend = plt.legend(labels, loc='upper right', bbox_to_anchor=(1.5, 1))# 新增圖例
 
-        # 显示图表
+        # 顯示圖表
         if labels == ['No Data']:
             plt.title('No Data Available')  # 設定標題，避免 `tight_layout()` 崩潰
         else:
             plt.tight_layout()
-        plt.savefig('pie_chart_6.png') 
+        pie_chart_6_path = self._chart_path("pie_chart_6.png")
+        plt.savefig(pie_chart_6_path) 
         # plt.show()
         print("【Process_7】已完成製造圖表生成與插入")  
         #--------------------------6. 將繪製好的圖儲存至self.context---------------------------
 
         chart_5 = InlineImage(doc,
-                        'bar_chart_5.png',
+                        bar_chart_5_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
         chart_6 = InlineImage(doc,
-                        'pie_chart_6.png',
+                        pie_chart_6_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 
@@ -2196,12 +2731,13 @@ class ExcelApp:
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(name_values), loc='upper right')
         plt.tight_layout()
-        plt.savefig('bar_chart_8.png', bbox_inches='tight')
+        bar_chart_8_path = self._chart_path("bar_chart_8.png")
+        plt.savefig(bar_chart_8_path, bbox_inches='tight')
         # plt.show()
 
         
         chart_8 = InlineImage(doc,
-            'bar_chart_8.png',
+            bar_chart_8_path,
             width=Inches(5.83),
             height=Inches(3.81))
 
@@ -2320,12 +2856,12 @@ class ExcelApp:
         plt.legend(labels=list(name_values) + ['Remaining processes'], loc='upper right')
         plt.tight_layout()
 
-        bar_chart_path = 'bar_chart_7.png'
+        bar_chart_path = self._chart_path("bar_chart_7.png")
         plt.savefig(bar_chart_path, bbox_inches='tight')
         plt.close()
         # 將繪製好的圖儲存至self.context
         chart_7 = InlineImage(doc,
-                        'bar_chart_7.png',
+                        bar_chart_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 
@@ -2458,21 +2994,21 @@ class ExcelApp:
         if pd.isna(remaining_value):
             remaining_value = 0
 
-        # 创建一个颜色列表，包含前十项的颜色和一个总和项的颜色
+        # 建立一個顏色列表，包含前十項的顏色和一個總和項的顏色
         colors = [
             '#e0e462', '#d9ed92', '#b5e48c', '#99d98c', '#76c893', 
             '#52b69a', '#34a0a4', '#168aad', '#1a759f', '#184e77', 'grey'
         ]
 
-        # 创建一个条形图
-        plt.figure(figsize=(10, 6))  # 设置图表的大小
-        bars = plt.bar(name_values, damage_values, color=colors)  # 创建条形图
-        plt.bar(remaining_name, remaining_value, color='grey')  # 创建条形图
+        # 建立一個長條圖
+        plt.figure(figsize=(10, 6))  # 設定圖表的大小
+        bars = plt.bar(name_values, damage_values, color=colors)  # 建立長條圖
+        plt.bar(remaining_name, remaining_value, color='grey')  # 建立長條圖
 
-        # 添加标签和标题
-        plt.xlabel('Name')  # x轴标签
-        plt.ylabel('Damage Assessment')  # y轴标签
-        plt.title('運輸碳排')  # 图表标题
+        # 添加標籤和標題
+        plt.xlabel('Name')  # x軸標籤
+        plt.ylabel('Damage Assessment')  # y軸標籤
+        plt.title('運輸碳排')  # 圖表標題
 
         for i, bar in enumerate(bars):
             self._check_cancel()
@@ -2480,18 +3016,19 @@ class ExcelApp:
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), ha='center', va='bottom')
 
-        # 旋转x轴标签，以避免重叠
+        # 旋轉x軸標籤，以避免重叠
         plt.xticks(rotation=45)
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(name_values) + ['Remaining processes'], loc='upper right')
 
-        # 显示图表
-        plt.tight_layout()  # 调整布局，确保标签和标题不重叠
-        plt.savefig('bar_chart_9.png', bbox_inches='tight')
+        # 顯示圖表
+        plt.tight_layout()  # 調整佈局，確保標籤和標題不重疊
+        bar_chart_9_path = self._chart_path("bar_chart_9.png")
+        plt.savefig(bar_chart_9_path, bbox_inches='tight')
         # plt.show()
         # 將繪製好的圖儲存至self.context
         chart_9 = InlineImage(doc,
-                        'bar_chart_9.png',
+                        bar_chart_9_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 

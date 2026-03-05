@@ -2,6 +2,7 @@ from excel_processing import ExcelApp
 from tkcalendar import DateEntry
 from tkinter import filedialog, messagebox, ttk
 from tkinter import ttk
+import csv
 import excel_processing
 import importlib
 import openpyxl
@@ -137,9 +138,13 @@ class GUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Excel Data Processing GUI")
-        self.root.geometry("750x500")
+        self.root.geometry("900x640")
 
         self.file_path = None
+        self.file_paths = []
+        self.current_file_path = None
+        self.batch_file_listbox = None
+        self.batch_results = []
         self.excel = ExcelApp(status_callback = self.update_status, progress_callback = self.update_progress)
         self.excel.progress_callback = None
         self.cancel_event = threading.Event()
@@ -178,6 +183,7 @@ class GUI:
         self.create_process_tab()
         self.create_all_tab()
         self.create_report_tab()
+        self.create_batch_file_panel()
 
     def create_transform_tab(self):
         frame = self.tab_transform
@@ -336,6 +342,104 @@ class GUI:
         self.report_button.grid(row=2, column=0, columnspan=2, pady=10)
         self.run_buttons.append(self.report_button)
 
+    def create_batch_file_panel(self):
+        panel = ttk.LabelFrame(self.root, text="批次匯入檔案")
+        panel.pack(fill="both", expand=False, padx=10, pady=(0, 10))
+
+        button_row = ttk.Frame(panel)
+        button_row.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Button(button_row, text="重新選擇", command=self.browse_file).pack(side="left", padx=(0, 6))
+        ttk.Button(button_row, text="加入檔案", command=self.append_files).pack(side="left", padx=(0, 6))
+        ttk.Button(button_row, text="移除選取", command=self.remove_selected_files).pack(side="left", padx=(0, 6))
+        ttk.Button(button_row, text="清空清單", command=self.clear_selected_files).pack(side="left")
+
+        list_row = ttk.Frame(panel)
+        list_row.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.batch_file_listbox = tk.Listbox(list_row, height=6, selectmode=tk.EXTENDED)
+        self.batch_file_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(list_row, orient="vertical", command=self.batch_file_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.batch_file_listbox.configure(yscrollcommand=scrollbar.set)
+
+    def _normalize_file_paths(self, paths):
+        unique_paths = []
+        seen = set()
+        for raw_path in paths:
+            path = os.path.abspath(str(raw_path))
+            if path in seen:
+                continue
+            seen.add(path)
+            unique_paths.append(path)
+        return unique_paths
+
+    def _set_selected_files(self, paths, replace=True):
+        normalized_paths = self._normalize_file_paths(paths)
+        if replace:
+            self.file_paths = normalized_paths
+        else:
+            existing = list(self.file_paths)
+            self.file_paths = self._normalize_file_paths(existing + normalized_paths)
+        self.file_path = self.file_paths[0] if self.file_paths else None
+        self.current_file_path = self.file_path
+        self._refresh_file_entries()
+        self._refresh_file_listbox()
+
+    def _refresh_file_listbox(self):
+        if not self.batch_file_listbox:
+            return
+        self.batch_file_listbox.delete(0, tk.END)
+        for idx, file_path in enumerate(self.file_paths, start=1):
+            self.batch_file_listbox.insert(tk.END, f"{idx:03d}. {file_path}")
+
+    def _build_entry_text(self):
+        if not self.file_paths:
+            return ""
+        if len(self.file_paths) == 1:
+            return self.file_paths[0]
+        return f"{self.file_paths[0]} (+{len(self.file_paths) - 1} files)"
+
+    def _refresh_file_entries(self):
+        entry_text = self._build_entry_text()
+        for entry in (
+            getattr(self, "transform_file_entry", None),
+            getattr(self, "process_file_entry", None),
+            getattr(self, "process_all_file_entry", None),
+        ):
+            if entry is None:
+                continue
+            entry.delete(0, tk.END)
+            if entry_text:
+                entry.insert(0, entry_text)
+
+    def append_files(self):
+        file_paths = filedialog.askopenfilenames(filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+        if not file_paths:
+            return
+        self._set_selected_files(file_paths, replace=False)
+
+    def remove_selected_files(self):
+        if not self.batch_file_listbox:
+            return
+        selected_indices = list(self.batch_file_listbox.curselection())
+        if not selected_indices:
+            return
+        selected_set = set(selected_indices)
+        self.file_paths = [path for idx, path in enumerate(self.file_paths) if idx not in selected_set]
+        self.file_path = self.file_paths[0] if self.file_paths else None
+        self.current_file_path = self.file_path
+        self._refresh_file_entries()
+        self._refresh_file_listbox()
+
+    def clear_selected_files(self):
+        self.file_paths = []
+        self.file_path = None
+        self.current_file_path = None
+        self._refresh_file_entries()
+        self._refresh_file_listbox()
+
+    def _get_selected_files(self):
+        return list(self.file_paths)
+
     def add_status_label(self, frame, row=5):
         ttk.Label(frame, text="狀態：").grid(row=row, column=0, padx=10, pady=10)
         self.status_label = ttk.Label(frame, text="等待操作", font=("Arial", 10))
@@ -354,21 +458,17 @@ class GUI:
         self.end_date_entry.config(state=state)
 
     def browse_file(self):
-        self.file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
-        if self.file_path:
-            self.transform_file_entry.delete(0, tk.END)
-            self.process_file_entry.delete(0, tk.END)
-            self.process_all_file_entry.delete(0, tk.END)
-            self.transform_file_entry.insert(0, self.file_path)
-            self.process_file_entry.insert(0, self.file_path)
-            self.process_all_file_entry.insert(0, self.file_path)
+        file_paths = filedialog.askopenfilenames(filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+        if not file_paths:
+            return
+        self._set_selected_files(file_paths, replace=True)
     
     def sync_factory_site(self):
         self.excel.factory_site = (self.factory_site_var.get() or "").strip()
 
     def transform_sheet(self):
-        if not self.file_path:
-            messagebox.showerror("錯誤", "請選擇 Excel 文件")
+        if not self.file_paths:
+            messagebox.showerror("錯誤", "請至少匯入 1 個 Excel 文件")
             return
         if not self.begin_task():
             return
@@ -392,9 +492,9 @@ class GUI:
 
     def process_file(self, file_path=None):
         if file_path is not None:
-            self.file_path = file_path
-        if not self.file_path:
-            messagebox.showerror("錯誤", "請選擇 Excel 文件")
+            self._set_selected_files([file_path], replace=True)
+        if not self.file_paths:
+            messagebox.showerror("錯誤", "請至少匯入 1 個 Excel 文件")
             return
         if not self.begin_task():
             return
@@ -412,8 +512,8 @@ class GUI:
             self.show_error("錯誤", f"啟動處理流程失敗：{e}")
 
     def process_all(self):
-        if not self.file_path:
-            messagebox.showerror("錯誤", "請選擇 Excel 文件")
+        if not self.file_paths:
+            messagebox.showerror("錯誤", "請至少匯入 1 個 Excel 文件")
             return
         if not self.begin_task():
             return
@@ -536,6 +636,8 @@ class GUI:
         self.run_on_main(lambda: messagebox.showerror(title, message), wait=wait)
 
     def _extract_process_error(self, result):
+        if isinstance(result, excel_processing.TaskResult):
+            return result.message
         if isinstance(result, dict):
             err = result.get("error")
             if err:
@@ -693,7 +795,7 @@ class GUI:
             self.close_progress_window(wait=False)
             self.run_on_main(self.finish_task, wait=False)
             try:
-                pythoncom.CoUninitialize()
+                pass  # legacy cleanup handled by engine session
             except Exception:
                 pass
 
@@ -783,7 +885,7 @@ class GUI:
             except Exception:
                 pass
             try:
-                pythoncom.CoUninitialize()
+                pass  # legacy cleanup handled by engine session
             except Exception:
                 pass
             self.close_progress_window(wait=False)
@@ -828,7 +930,7 @@ class GUI:
             except Exception:
                 pass
             try:
-                pythoncom.CoUninitialize()
+                pass  # legacy cleanup handled by engine session
             except Exception:
                 pass
 
@@ -861,9 +963,9 @@ class GUI:
             if self.excel.update_progress_smooth:
                 self.excel.update_progress_smooth(10, 20, step=1, delay=0.02)  # 第2階段完成：20%
             # 建立 Excel COM 物件
-            pythoncom.CoInitialize()
+            pass  # legacy init handled by engine session
             com_initialized = True
-            excel = win32.DispatchEx("Excel.Application")
+            excel = None  # legacy COM session removed
             excel.Visible = True  # 顯示 Excel 視窗
             excel.EnableEvents = False # 暫時關閉事件，防止因為儲存格變更而觸發其他連線的自動刷新
             excel.DisplayAlerts = False
@@ -989,7 +1091,7 @@ class GUI:
                 pass
             if com_initialized:
                 try:
-                    pythoncom.CoUninitialize()
+                    pass  # legacy cleanup handled by engine session
                 except Exception:
                     pass
 
@@ -1007,10 +1109,13 @@ class GUI:
                     raise e
         return False
 
-    def check_excel_Product(self):
+    def check_excel_Product(self, file_path=None):
         """檢查 Excel 表中 'INPUT' 工作表的 B1 是否有數值"""
+        target_path = file_path or self.file_path
+        if not target_path:
+            return False
         try:
-            wb = openpyxl.load_workbook(self.file_path, read_only=True)
+            wb = openpyxl.load_workbook(target_path, read_only=True)
             ws = wb["INPUT"]
             cell_value = ws["B1"].value
             wb.close()
@@ -1020,6 +1125,365 @@ class GUI:
         except Exception as e:
             messagebox.showerror("錯誤", f"檢查 Excel B1 時發生錯誤: {e}")
             return False
+
+    def _make_batch_status_callback(self, task_name, index, total, file_path):
+        short_name = os.path.basename(file_path)
+
+        def _status(status):
+            prefix = f"[{index + 1}/{total}] {task_name} | {short_name}"
+            merged = f"{prefix} | {status}" if status else prefix
+            self.root.after(
+                0,
+                lambda: self.progress_window.update_status(merged) if self.progress_window else None,
+            )
+            self.root.after(0, lambda: self.update_status(merged))
+
+        return _status
+
+    def _make_batch_progress_callback(self, index, total, stage_start=0.0, stage_span=1.0):
+        stage_start = max(0.0, min(1.0, stage_start))
+        stage_span = max(0.0, min(1.0 - stage_start, stage_span))
+
+        def _progress(value):
+            try:
+                value = float(value)
+            except Exception:
+                value = 0.0
+            value = max(0.0, min(100.0, value))
+            file_progress = stage_start + stage_span * (value / 100.0)
+            overall = ((index + file_progress) / max(1, total)) * 100.0
+            self.update_progress(int(round(overall)))
+
+        return _progress
+
+    def _task_result_to_record(self, task_name, file_path, result):
+        artifacts = {}
+        error_code = ""
+        message = ""
+        ok = False
+        if isinstance(result, excel_processing.TaskResult):
+            ok = bool(result.ok)
+            error_code = result.error_code or ""
+            message = result.message or ""
+            artifacts = dict(result.artifacts or {})
+        elif isinstance(result, dict):
+            ok = bool(result.get("ok"))
+            error_code = str(result.get("error_code") or "")
+            if result.get("cancelled"):
+                error_code = "USER_CANCELLED"
+            message = str(result.get("message") or result.get("error") or "")
+            artifacts = dict(result)
+        else:
+            message = str(result)
+
+        if ok:
+            status = "success"
+        elif error_code == "USER_CANCELLED":
+            status = "cancelled"
+        else:
+            status = "failed"
+
+        return {
+            "task": task_name,
+            "input_file": file_path,
+            "status": status,
+            "ok": ok,
+            "error_code": error_code,
+            "message": message,
+            "merged_file": artifacts.get("path") or artifacts.get("merged_file") or "",
+            "result_file": artifacts.get("result_file") or "",
+            "report_file": artifacts.get("report_file") or artifacts.get("report_doc") or "",
+            "run_id": artifacts.get("run_id") or "",
+        }
+
+    def _append_skipped_records(self, records, task_name, file_paths, start_index):
+        for idx in range(start_index, len(file_paths)):
+            records.append(
+                {
+                    "task": task_name,
+                    "input_file": file_paths[idx],
+                    "status": "skipped",
+                    "ok": False,
+                    "error_code": "SKIPPED_AFTER_CANCEL",
+                    "message": "Skipped because batch was cancelled.",
+                    "merged_file": "",
+                    "result_file": "",
+                    "report_file": "",
+                    "run_id": "",
+                }
+            )
+
+    def _write_batch_summary_csv(self, task_name, records):
+        if not records:
+            return ""
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = getattr(self.excel, "result_dir", os.getcwd())
+        os.makedirs(output_dir, exist_ok=True)
+        summary_path = os.path.join(output_dir, f"batch_summary_{task_name}_{timestamp}.csv")
+        columns = [
+            "task",
+            "input_file",
+            "status",
+            "ok",
+            "error_code",
+            "message",
+            "merged_file",
+            "result_file",
+            "report_file",
+            "run_id",
+        ]
+        with open(summary_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=columns)
+            writer.writeheader()
+            for row in records:
+                writer.writerow({col: row.get(col, "") for col in columns})
+        return summary_path
+
+    def _show_batch_summary(self, task_label, records, summary_path):
+        total = len(records)
+        success = sum(1 for item in records if item.get("status") == "success")
+        failed = sum(1 for item in records if item.get("status") == "failed")
+        cancelled = sum(1 for item in records if item.get("status") == "cancelled")
+        skipped = sum(1 for item in records if item.get("status") == "skipped")
+        message_lines = [
+            f"{task_label} batch complete.",
+            f"Total: {total}",
+            f"Success: {success}",
+            f"Failed: {failed}",
+            f"Cancelled: {cancelled}",
+            f"Skipped: {skipped}",
+        ]
+        if summary_path:
+            message_lines.append(f"Summary CSV: {summary_path}")
+        if failed > 0:
+            message_lines.append("")
+            message_lines.append("Failed files:")
+            for item in records:
+                if item.get("status") != "failed":
+                    continue
+                short_name = os.path.basename(item.get("input_file", ""))
+                reason = item.get("message") or item.get("error_code") or "Unknown error"
+                message_lines.append(f"- {short_name}: {reason}")
+        self.show_info("Batch Result", "\n".join(message_lines), wait=False, close_progress=True)
+
+
+    # Overrides: use TaskResult and delegate COM lifecycle to engine.
+    def run_transform(self, data):
+        file_paths = self._get_selected_files()
+        total = len(file_paths)
+        records = []
+        try:
+            self.sync_factory_site()
+            for idx, file_path in enumerate(file_paths):
+                self._raise_if_cancelled()
+                self.current_file_path = file_path
+                self.file_path = file_path
+                self.excel.file_path = file_path
+                self.excel.status_callback = self._make_batch_status_callback("Transform", idx, total, file_path)
+                self.excel.progress_callback = self._make_batch_progress_callback(idx, total)
+                result = self.excel.transform_sheet()
+                record = self._task_result_to_record("transform", file_path, result)
+                records.append(record)
+                self.update_progress(int(round(((idx + 1) / max(1, total)) * 100)))
+                if record["status"] == "cancelled":
+                    self._append_skipped_records(records, "transform", file_paths, idx + 1)
+                    break
+            summary_path = self._write_batch_summary_csv("transform", records)
+            self._show_batch_summary("Transform", records, summary_path)
+        except excel_processing.UserCancelledError as e:
+            if records:
+                processed = len(records)
+                self._append_skipped_records(records, "transform", file_paths, processed)
+                summary_path = self._write_batch_summary_csv("transform", records)
+                self._show_batch_summary("Transform", records, summary_path)
+            else:
+                self._handle_user_cancelled(e)
+        except Exception as e:
+            self.show_error("Error", f"Transform execution error: {e}")
+        finally:
+            self.close_progress_window(wait=False)
+            self.run_on_main(self.finish_task, wait=False)
+
+    def run_process(self):
+        file_paths = self._get_selected_files()
+        total = len(file_paths)
+        records = []
+        try:
+            self.sync_factory_site()
+            for idx, file_path in enumerate(file_paths):
+                self._raise_if_cancelled()
+                self.current_file_path = file_path
+                self.file_path = file_path
+                self.excel.file_path = file_path
+                self.excel.status_callback = self._make_batch_status_callback("Process", idx, total, file_path)
+                self.excel.progress_callback = self._make_batch_progress_callback(idx, total)
+                result = self.excel.process_file(file_path=file_path)
+                record = self._task_result_to_record("process", file_path, result)
+                records.append(record)
+                self.update_progress(int(round(((idx + 1) / max(1, total)) * 100)))
+                if record["status"] == "cancelled":
+                    self._append_skipped_records(records, "process", file_paths, idx + 1)
+                    break
+            summary_path = self._write_batch_summary_csv("process", records)
+            self._show_batch_summary("Process", records, summary_path)
+        except excel_processing.UserCancelledError as e:
+            if records:
+                processed = len(records)
+                self._append_skipped_records(records, "process", file_paths, processed)
+                summary_path = self._write_batch_summary_csv("process", records)
+                self._show_batch_summary("Process", records, summary_path)
+            else:
+                self._handle_user_cancelled(e)
+        except Exception as e:
+            self.show_error("Error", f"Processing execution error: {e}")
+        finally:
+            self.close_progress_window(wait=False)
+            self.run_on_main(self.finish_task, wait=False)
+
+    def run_process_all(self, data):
+        file_paths = self._get_selected_files()
+        total = len(file_paths)
+        records = []
+        try:
+            self.sync_factory_site()
+            for idx, file_path in enumerate(file_paths):
+                self._raise_if_cancelled()
+                self.current_file_path = file_path
+                self.file_path = file_path
+                self.excel.file_path = file_path
+
+                if self.enable_refresh.get():
+                    self.excel.status_callback = self._make_batch_status_callback("Refresh INPUT", idx, total, file_path)
+                    if not self.update_input_sheet(file_path, reset_progress=False):
+                        if self.excel.was_cancelled:
+                            records.append(
+                                {
+                                    "task": "process_all",
+                                    "input_file": file_path,
+                                    "status": "cancelled",
+                                    "ok": False,
+                                    "error_code": "USER_CANCELLED",
+                                    "message": "Cancelled during INPUT refresh.",
+                                    "merged_file": "",
+                                    "result_file": "",
+                                    "report_file": "",
+                                    "run_id": "",
+                                }
+                            )
+                            self._append_skipped_records(records, "process_all", file_paths, idx + 1)
+                            break
+                        records.append(
+                            {
+                                "task": "process_all",
+                                "input_file": file_path,
+                                "status": "failed",
+                                "ok": False,
+                                "error_code": "UPDATE_INPUT_FAILED",
+                                "message": getattr(self.excel, "last_error", "Update INPUT failed."),
+                                "merged_file": "",
+                                "result_file": "",
+                                "report_file": "",
+                                "run_id": "",
+                            }
+                        )
+                        continue
+
+                self.excel.status_callback = self._make_batch_status_callback("Transform", idx, total, file_path)
+                self.excel.progress_callback = self._make_batch_progress_callback(idx, total, stage_start=0.0, stage_span=0.5)
+                transform_result = self.excel.transform_sheet()
+                transform_record = self._task_result_to_record("process_all_transform", file_path, transform_result)
+                if transform_record["status"] != "success":
+                    records.append(transform_record)
+                    if transform_record["status"] == "cancelled":
+                        self._append_skipped_records(records, "process_all", file_paths, idx + 1)
+                        break
+                    continue
+
+                merged_file = transform_record["merged_file"]
+                if not merged_file:
+                    records.append(
+                        {
+                            "task": "process_all",
+                            "input_file": file_path,
+                            "status": "failed",
+                            "ok": False,
+                            "error_code": "MISSING_TRANSFORM_OUTPUT",
+                            "message": "Transform completed but merged file path is missing.",
+                            "merged_file": "",
+                            "result_file": "",
+                            "report_file": "",
+                            "run_id": transform_record.get("run_id", ""),
+                        }
+                    )
+                    continue
+                self.excel.status_callback = self._make_batch_status_callback("Process", idx, total, file_path)
+                self.excel.progress_callback = self._make_batch_progress_callback(idx, total, stage_start=0.5, stage_span=0.5)
+                process_result = self.excel.process_file(file_path=merged_file)
+                process_record = self._task_result_to_record("process_all", file_path, process_result)
+                process_record["merged_file"] = merged_file
+                records.append(process_record)
+                self.update_progress(int(round(((idx + 1) / max(1, total)) * 100)))
+                if process_record["status"] == "cancelled":
+                    self._append_skipped_records(records, "process_all", file_paths, idx + 1)
+                    break
+
+            summary_path = self._write_batch_summary_csv("process_all", records)
+            self._show_batch_summary("Process All", records, summary_path)
+        except excel_processing.UserCancelledError as e:
+            if records:
+                processed = len(records)
+                self._append_skipped_records(records, "process_all", file_paths, processed)
+                summary_path = self._write_batch_summary_csv("process_all", records)
+                self._show_batch_summary("Process All", records, summary_path)
+            else:
+                self._handle_user_cancelled(e)
+        except Exception as e:
+            self.show_error("Error", f"Full flow execution error: {e}")
+        finally:
+            self.close_progress_window(wait=False)
+            self.run_on_main(self.finish_task, wait=False)
+
+    def run_report(self, selected_area):
+        self.excel.status_callback = self._make_threadsafe_status_callback()
+        try:
+            self._raise_if_cancelled()
+            result = self.excel.generate_report(selected_area)
+            if result.ok:
+                output_doc = result.artifacts.get("report_doc") or result.artifacts.get("path") or ""
+                self.show_info("Done", f"Report complete:\n{output_doc}", wait=False, close_progress=True)
+            elif result.error_code == "USER_CANCELLED" or self.excel.was_cancelled:
+                self._handle_user_cancelled()
+            else:
+                run_id = result.artifacts.get("run_id", "")
+                suffix = f"\nrun_id: {run_id}" if run_id else ""
+                self.show_error("Error", f"Report failed: {result.message}{suffix}")
+        except excel_processing.UserCancelledError as e:
+            self._handle_user_cancelled(e)
+        except Exception as e:
+            self.show_error("Error", f"Report execution error: {e}")
+        finally:
+            if self.progress_window:
+                self.close_progress_window(wait=False)
+            self.run_on_main(self.finish_task, wait=False)
+
+    def update_input_sheet(self, file_path, reset_progress=True):
+        result = self.excel.update_input_sheet(
+            file_path=file_path,
+            product=self.product_f_entry.get() or "",
+            start_date=self.start_date_entry.get() or "",
+            end_date=self.end_date_entry.get() or "",
+        )
+        if result.ok:
+            if reset_progress:
+                self.run_on_main(lambda: self.progress_window.update_progress(0) if self.progress_window else None, wait=False)
+            return True
+        if result.error_code == "USER_CANCELLED":
+            self.excel.was_cancelled = True
+            return False
+        run_id = result.artifacts.get("run_id", "")
+        suffix = f"\nrun_id: {run_id}" if run_id else ""
+        self.excel.last_error = f"{result.message}{suffix}"
+        return False
 
 if __name__ == "__main__":
     # os.system("taskkill /f /im excel.exe >nul 2>&1")        #將Excel檔案清除
