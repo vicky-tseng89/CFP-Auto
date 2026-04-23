@@ -1,4 +1,7 @@
-﻿from datetime import datetime
+﻿from transport_distance import compute_transport_distance
+from datetime import datetime
+from transport_distance import compute_transport_distance_from_queries
+from transport_distance import geocode_place, transport_type_to_mode
 from contextlib import suppress
 from dataclasses import dataclass, field
 from docx import Document
@@ -17,12 +20,14 @@ import os
 import pandas as pd
 import pythoncom
 import re
+import shutil
 import time
 import tkinter as tk
 import win32com.client as win32
 import xlsxwriter
 from openpyxl.styles.colors import Color
 import traceback
+import unicodedata
 import uuid
 from typing import Any, Dict, List
 
@@ -42,6 +47,15 @@ COM_REFRESH_TIMEOUT_SEC = 120.0
 COM_REFRESH_POLL_SEC = 1.0
 COM_REFRESH_RETRY_COUNT = 2
 COM_REFRESH_RETRY_DELAY_SEC = 1.0
+TRANSPORT_LOCATION_MAPPING_FILENAME = "airport_port_land_location_mapping.xlsx"
+ROAD_TRANSPORT_TYPES = {
+    "road",
+    "rord",
+    "road transport",
+    "local land transport",
+    "land",
+    "truck",
+}
 
 
 @dataclass
@@ -224,6 +238,7 @@ class ExcelApp:
         self.report_dir = os.path.join(self.output_root, "report")
         self.charts_dir = os.path.join(self.output_root, "charts")
         self.tmp_dir = os.path.join(self.output_root, "tmp")
+        self.spreadsheet_dir = os.path.join(self.output_root, "spreadsheet")
         self.logs_dir = os.path.join(self.base_dir, "logs")
         for folder in (
             self.output_root,
@@ -231,6 +246,7 @@ class ExcelApp:
             self.report_dir,
             self.charts_dir,
             self.tmp_dir,
+            self.spreadsheet_dir,
             self.logs_dir,
         ):
             os.makedirs(folder, exist_ok=True)
@@ -254,6 +270,10 @@ class ExcelApp:
         self.logger = self._build_logger()
         self._warnings = []
         self.current_run_id = ""
+        self._transport_place_cache = {}
+        self._transport_route_cache = {}
+        self._transport_location_mapping = None
+        self._transport_mapping_missing_warned = False
 
     def _build_logger(self):
         logger = logging.getLogger("excel_processing")
@@ -600,6 +620,328 @@ class ExcelApp:
         self._finish_task_log(run_id, "process_all", process_result)
         return process_result
 
+    @staticmethod
+    def _normalize_column_name(value):
+        if value is None:
+            return ""
+        return re.sub(r"\s+", " ", str(value).strip().lower())
+
+    def _find_table_column(self, columns, target_name):
+        target = self._normalize_column_name(target_name)
+        for idx, name in enumerate(columns, start=1):
+            if self._normalize_column_name(name) == target:
+                return idx, name
+        return None, None
+
+    @staticmethod
+    def _coerce_numeric(value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float, np.number)):
+            if pd.isna(value):
+                return None
+            return float(value)
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _normalize_transport_lookup_key(value):
+        if value is None:
+            return ""
+        text = unicodedata.normalize("NFKC", str(value).strip())
+        text = re.sub(r"\s+", " ", text)
+        return text.casefold()
+
+    def _is_road_transport_type(self, transport_type):
+        normalized = self._normalize_column_name(transport_type)
+        normalized = re.sub(r"[\s\-_/,;:]+", " ", normalized).strip()
+        return normalized in ROAD_TRANSPORT_TYPES
+
+    def _transport_mapping_candidates(self):
+        return [
+            os.path.join(self.spreadsheet_dir, TRANSPORT_LOCATION_MAPPING_FILENAME),
+            os.path.join(self.base_dir, "output", "spreadsheet", TRANSPORT_LOCATION_MAPPING_FILENAME),
+            os.path.join(self.base_dir, TRANSPORT_LOCATION_MAPPING_FILENAME),
+        ]
+
+    def _load_transport_location_mapping(self):
+        if self._transport_location_mapping is not None:
+            return self._transport_location_mapping
+
+        mapping_path = next(
+            (path for path in self._transport_mapping_candidates() if os.path.exists(path)),
+            None,
+        )
+        if not mapping_path:
+            if not self._transport_mapping_missing_warned:
+                self._warn(
+                    f"找不到運輸端點對照表 {TRANSPORT_LOCATION_MAPPING_FILENAME}，Road 端點將直接使用原始文字查詢。"
+                )
+                self._transport_mapping_missing_warned = True
+            self._transport_location_mapping = {}
+            return self._transport_location_mapping
+
+        mapping = {}
+        copied_mapping_path = None
+        try:
+            try:
+                workbook = openpyxl.load_workbook(mapping_path, read_only=True, data_only=True)
+            except PermissionError:
+                copied_mapping_path = os.path.join(
+                    self.tmp_dir,
+                    f"{os.path.splitext(TRANSPORT_LOCATION_MAPPING_FILENAME)[0]}_readcopy_{os.getpid()}.xlsx",
+                )
+                shutil.copy2(mapping_path, copied_mapping_path)
+                workbook = openpyxl.load_workbook(copied_mapping_path, read_only=True, data_only=True)
+
+            def add_lookup(raw_key, record, *, overwrite=False):
+                key = self._normalize_transport_lookup_key(raw_key)
+                if not key:
+                    return
+                if overwrite or key not in mapping:
+                    mapping[key] = record
+
+            def load_mapping_sheet(worksheet, *, overwrite):
+                rows = worksheet.iter_rows(values_only=True)
+                headers = next(rows, None)
+                if not headers:
+                    return
+
+                header_index = {
+                    self._normalize_transport_lookup_key(name): idx
+                    for idx, name in enumerate(headers)
+                    if name is not None
+                }
+
+                def col(name):
+                    return header_index.get(self._normalize_transport_lookup_key(name))
+
+                lookup_idx = col("lookup_key")
+                road_location_idx = col("road_location_for_geocode")
+                aliases_idx = col("aliases")
+                if lookup_idx is None or road_location_idx is None:
+                    return
+
+                for row in rows:
+                    if not row:
+                        continue
+                    lookup_key = row[lookup_idx] if lookup_idx < len(row) else None
+                    road_location = row[road_location_idx] if road_location_idx < len(row) else None
+                    if not lookup_key or not road_location:
+                        continue
+                    record = {
+                        str(headers[idx]): row[idx] if idx < len(row) else None
+                        for idx in range(len(headers))
+                        if headers[idx] is not None
+                    }
+                    record["mapping_path"] = mapping_path
+                    record["mapping_sheet"] = worksheet.title
+                    add_lookup(lookup_key, record, overwrite=overwrite)
+
+                    aliases = row[aliases_idx] if aliases_idx is not None and aliases_idx < len(row) else None
+                    for alias in str(aliases or "").split(";"):
+                        add_lookup(alias.strip(), record)
+
+            if "Source" in workbook.sheetnames:
+                load_mapping_sheet(workbook["Source"], overwrite=False)
+            if "mapping" in workbook.sheetnames:
+                load_mapping_sheet(workbook["mapping"], overwrite=True)
+            if not mapping and workbook.sheetnames:
+                load_mapping_sheet(workbook.active, overwrite=True)
+
+            workbook.close()
+            if copied_mapping_path:
+                with suppress(Exception):
+                    os.remove(copied_mapping_path)
+        except Exception as exc:
+            self._warn(
+                f"讀取運輸端點對照表失敗，Road 端點將直接使用原始文字查詢: {mapping_path} | {exc}"
+            )
+            mapping = {}
+            if copied_mapping_path:
+                with suppress(Exception):
+                    os.remove(copied_mapping_path)
+
+        self._transport_location_mapping = mapping
+        return self._transport_location_mapping
+
+    def _resolve_road_transport_endpoint(self, transport_type, endpoint):
+        return self._resolve_road_transport_endpoint_details(transport_type, endpoint)["query"]
+
+    @staticmethod
+    def _record_lat_lon(record):
+        if not record:
+            return None
+        try:
+            lat = float(record.get("latitude"))
+            lon = float(record.get("longitude"))
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return None
+        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            return None
+        return lat, lon
+
+    def _resolve_road_transport_endpoint_details(self, transport_type, endpoint):
+        endpoint_text = str(endpoint or "").strip()
+        if not endpoint_text or not self._is_road_transport_type(transport_type):
+            return {"query": endpoint_text, "record": None, "lat_lon": None}
+
+        mapping = self._load_transport_location_mapping()
+        record = mapping.get(self._normalize_transport_lookup_key(endpoint_text))
+        if not record:
+            return {"query": endpoint_text, "record": None, "lat_lon": None}
+        return {
+            "query": str(record.get("road_location_for_geocode") or endpoint_text).strip(),
+            "record": record,
+            "lat_lon": self._record_lat_lon(record),
+        }
+
+    def _transport_place_from_endpoint_details(self, endpoint_details, transport_type):
+        lat_lon = endpoint_details.get("lat_lon")
+        query = endpoint_details.get("query") or ""
+        if lat_lon is not None:
+            lat, lon = lat_lon
+            record = endpoint_details.get("record") or {}
+            return {
+                "query": query,
+                "lat": lat,
+                "lon": lon,
+                "label": str(record.get("name_en") or record.get("lookup_key") or query),
+                "provider": str(record.get("mapping_sheet") or "mapping"),
+            }
+        return geocode_place(
+            query,
+            transport_type=transport_type,
+            cache=self._transport_place_cache,
+        )
+
+    def calculate_transport_distances(self, workbook, distribution_tables):
+        if "Distribution" not in workbook.sheetnames:
+            self._warn("找不到 Distribution 工作表，略過距離計算。")
+            return distribution_tables
+
+        sheet = workbook["Distribution"]
+        route_count = 0
+        updated_count = 0
+        skipped_existing_count = 0
+
+        for table_idx, (start_idx, sheet_data) in enumerate(distribution_tables, start=1):
+            distance_col_idx, distance_col_name = self._find_table_column(sheet_data.columns, "distance transported (km)")
+            _, start_col_name = self._find_table_column(sheet_data.columns, "starting point")
+            _, end_col_name = self._find_table_column(sheet_data.columns, "end point")
+            _, transport_col_name = self._find_table_column(sheet_data.columns, "type of transport")
+            _, ton_km_col_name = self._find_table_column(sheet_data.columns, "Ton‧Km")
+            _, weight_col_name = self._find_table_column(sheet_data.columns, "Weight (product+package)（Kg）")
+
+            required = {
+                "starting point": start_col_name,
+                "end point": end_col_name,
+                "type of transport": transport_col_name,
+                "distance transported (km)": distance_col_name,
+            }
+            missing = [name for name, actual in required.items() if actual is None]
+            if missing:
+                raise ValueError(f"【Distribution 第 {table_idx} 個表格】缺少必要欄位: {missing}")
+
+            for row_offset, row in sheet_data.iterrows():
+                self._check_cancel()
+                transport_type = str(row.get(transport_col_name) or "").strip()
+                start_point = str(row.get(start_col_name) or "").strip()
+                end_point = str(row.get(end_col_name) or "").strip()
+                if not transport_type or not start_point or not end_point:
+                    continue
+
+                excel_row = start_idx + 4 + row_offset
+                existing_distance_km = self._coerce_numeric(row.get(distance_col_name))
+                if existing_distance_km is not None and not math.isclose(existing_distance_km, 0.0, abs_tol=1e-12):
+                    if ton_km_col_name is not None and weight_col_name is not None:
+                        weight_kg = self._coerce_numeric(row.get(weight_col_name))
+                        if weight_kg is not None:
+                            sheet_data.at[row_offset, ton_km_col_name] = (weight_kg / 1000.0) * existing_distance_km
+                    skipped_existing_count += 1
+                    continue
+
+                route_count += 1
+                resolved_start = self._resolve_road_transport_endpoint_details(transport_type, start_point)
+                resolved_end = self._resolve_road_transport_endpoint_details(transport_type, end_point)
+                resolved_start_point = resolved_start["query"]
+                resolved_end_point = resolved_end["query"]
+                self._notify_status(
+                    f"計算 Distribution 運輸距離... {route_count} | {transport_type}: {start_point} -> {end_point}"
+                )
+                route_cache_key = (
+                    self._normalize_column_name(transport_type),
+                    self._normalize_transport_lookup_key(resolved_start_point),
+                    self._normalize_transport_lookup_key(resolved_end_point),
+                )
+                try:
+                    result = self._transport_route_cache.get(route_cache_key)
+                    if result is None:
+                        if resolved_start.get("lat_lon") is not None or resolved_end.get("lat_lon") is not None:
+                            from_place = self._transport_place_from_endpoint_details(resolved_start, transport_type)
+                            to_place = self._transport_place_from_endpoint_details(resolved_end, transport_type)
+                            result = compute_transport_distance(
+                                mode=transport_type_to_mode(transport_type),
+                                from_lat=float(from_place["lat"]),
+                                from_lon=float(from_place["lon"]),
+                                to_lat=float(to_place["lat"]),
+                                to_lon=float(to_place["lon"]),
+                            )
+                            result.metadata.update(
+                                {
+                                    "transport_type": transport_type,
+                                    "from_query": resolved_start_point,
+                                    "to_query": resolved_end_point,
+                                    "from_place": from_place,
+                                    "to_place": to_place,
+                                }
+                            )
+                        else:
+                            result = compute_transport_distance_from_queries(
+                                transport_type=transport_type,
+                                from_query=resolved_start_point,
+                                to_query=resolved_end_point,
+                                geocode_cache=self._transport_place_cache,
+                            )
+                        self._transport_route_cache[route_cache_key] = result
+                        result.metadata.update(
+                            {
+                                "original_from_query": start_point,
+                                "original_to_query": end_point,
+                                "resolved_from_query": resolved_start_point,
+                                "resolved_to_query": resolved_end_point,
+                            }
+                        )
+
+                    distance_km = round(result.distance_m / 1000.0, 4)
+                    sheet_data.at[row_offset, distance_col_name] = distance_km
+                    sheet.cell(row=excel_row, column=distance_col_idx).value = distance_km
+
+                    if ton_km_col_name is not None and weight_col_name is not None:
+                        weight_kg = self._coerce_numeric(row.get(weight_col_name))
+                        if weight_kg is not None:
+                            sheet_data.at[row_offset, ton_km_col_name] = (weight_kg / 1000.0) * distance_km
+
+                    updated_count += 1
+                except Exception as exc:
+                    self._warn(
+                        f"Distribution 第 {table_idx} 個表格第 {excel_row} 列距離計算失敗: "
+                        f"{transport_type} | {start_point} -> {end_point} "
+                        f"(resolved: {resolved_start_point} -> {resolved_end_point}) | {exc}"
+                    )
+
+        self._notify_status(
+            f"Distribution 運輸距離更新完成，共更新 {updated_count} 筆，沿用既有距離 {skipped_existing_count} 筆。"
+        )
+        return distribution_tables
+
     def _process_file_impl(self, file_path=None):
         """數據處理"""
         if file_path is not None:
@@ -625,6 +967,8 @@ class ExcelApp:
             sheet_D_tables = self.read_multiple_tables('Distribution', self.file_path)      #將每個工作表中多個獨立的資料表格區段解析為 pandas DataFrame 清單
             sheet_E_tables = self.read_multiple_tables('Usage', self.file_path)
             sheet_F_tables = self.read_multiple_tables('Recycling', self.file_path)
+            self._notify_status("更新 Distribution 運輸距離...")
+            sheet_D_tables = self.calculate_transport_distances(result_workbook, sheet_D_tables)
             
             self.update_progress_smooth(10, 40, step=1, delay=0.05) # 階段2：讀取工作表B，處理工作表並計算數值，模擬進度從 10% 到 40%
             # 以 pandas 讀入另一張關鍵對照表（sheet_B，如 simapro10.2.0.0）
@@ -1136,6 +1480,8 @@ class ExcelApp:
                     fmt['right_color'] = side_colors['right']
 
         return fmt
+
+
 
 
     def _get_format(self, fmt_dict, workbook):

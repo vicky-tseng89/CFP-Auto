@@ -1,4 +1,4 @@
-from excel_processing import ExcelApp
+﻿from excel_processing import ExcelApp
 from tkcalendar import DateEntry
 from tkinter import filedialog, messagebox, ttk
 from tkinter import ttk
@@ -8,6 +8,7 @@ import importlib
 import openpyxl
 import os
 import pythoncom
+import subprocess
 import sys
 import threading
 import time
@@ -15,6 +16,36 @@ import tkinter as tk
 import win32com.client as win32
 #
 importlib.reload(excel_processing) # 調用 excel_processing 模組
+
+DEFAULT_APP_VERSION = "v1.1.4"
+
+
+def resolve_app_version(default_version=DEFAULT_APP_VERSION):
+    """
+    版本號來源優先順序：
+    1) 環境變數 CFP_AUTO_VERSION（便於打包/部署時指定）
+    2) git describe --tags（開發環境）
+    3) 預設版號
+    """
+    env_version = os.getenv("CFP_AUTO_VERSION", "").strip()
+    if env_version:
+        return env_version
+
+    try:
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        git_version = subprocess.check_output(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            cwd=repo_dir,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.5,
+        ).strip()
+        if git_version:
+            return git_version
+    except Exception:
+        pass
+
+    return default_version
 
 class ProgressBarWindow:
     def __init__(self, master, maximum=100, on_user_close=None):
@@ -137,8 +168,12 @@ class ProgressBarWindow:
 class GUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Excel Data Processing GUI")
+        self.app_version = resolve_app_version()
+        self.root.title(f"Excel Data Processing GUI | Version {self.app_version}")
         self.root.geometry("900x640")
+
+        self.version_label = ttk.Label(self.root, text=f"Version: {self.app_version}", font=("Arial", 9))
+        self.version_label.pack(side="bottom", anchor="e", padx=12, pady=(0, 8))
 
         self.file_path = None
         self.file_paths = []
