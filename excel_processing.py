@@ -47,6 +47,7 @@ COM_REFRESH_TIMEOUT_SEC = 120.0
 COM_REFRESH_POLL_SEC = 1.0
 COM_REFRESH_RETRY_COUNT = 2
 COM_REFRESH_RETRY_DELAY_SEC = 1.0
+INVALID_EXTERNAL_FORMULA_RE = re.compile(r"\[\d+\]Sheet!", re.IGNORECASE)
 TRANSPORT_LOCATION_MAPPING_FILENAME = "airport_port_land_location_mapping.xlsx"
 ROAD_TRANSPORT_TYPES = {
     "road",
@@ -451,6 +452,34 @@ class ExcelApp:
             callback = self._no_op_status_callback
             self._has_status_callback = False
         callback(message)
+
+    def _sanitize_invalid_external_formulas(self, workbook) -> int:
+        """
+        Remove legacy formulas like [1]Sheet! that Excel repairs/removes on open.
+        openpyxl can preserve them, but Excel COM rejects the workbook before repair.
+        """
+        removed_cells = []
+        for sheet in workbook.worksheets:
+            for row in sheet.iter_rows():
+                for cell in row:
+                    value = cell.value
+                    if (
+                        isinstance(value, str)
+                        and value.startswith("=")
+                        and INVALID_EXTERNAL_FORMULA_RE.search(value)
+                    ):
+                        removed_cells.append(f"{sheet.title}!{cell.coordinate}")
+                        cell.value = None
+
+        if removed_cells:
+            sample = ", ".join(removed_cells[:8])
+            if len(removed_cells) > 8:
+                sample += ", ..."
+            self._warn(
+                f"已移除 {len(removed_cells)} 個 Excel 無效外部參照公式，避免結果檔開啟時修復失敗。"
+                f" 位置: {sample}"
+            )
+        return len(removed_cells)
 
     def set_cancel_event(self, cancel_event):
         self.cancel_event = cancel_event
@@ -1026,6 +1055,8 @@ class ExcelApp:
             self.report_file = os.path.join(self.report_dir, self.report_file)
             print("路徑位置：", self.report_dir)
             report_workbook.save(self.report_file)
+            with suppress(Exception):
+                report_workbook.close()
             
             # 另存為新文件，保留原有的表格樣式，附上日期和時間
             if product_name_suffix:
@@ -1034,7 +1065,10 @@ class ExcelApp:
                 self.result_file = f'result_{current_time}.xlsx'
             self.result_file = os.path.join(self.result_dir, self.result_file)
             self._check_cancel()
+            self._sanitize_invalid_external_formulas(result_workbook)
             result_workbook.save(self.result_file)
+            with suppress(Exception):
+                result_workbook.close()
 
             #    3. 用 Excel COM 自動修復並輸出最終結果
             self._check_cancel()
@@ -1093,6 +1127,42 @@ class ExcelApp:
 
 
 
+    def _excel_col_letter(self, col_num):
+        """Return the Excel column letter for a 1-based column index."""
+        result = ""
+        while col_num:
+            col_num, remainder = divmod(col_num - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
+
+    def _normalize_table_columns(self, header):
+        """
+        Make table headers safe for pandas operations.
+
+        Excel templates may intentionally leave spacer columns blank. Pandas reads
+        those blanks as NaN column names, and recent pandas versions reject merges
+        when duplicate NaN columns are present.
+        """
+        normalized = []
+        seen = set()
+
+        for idx, col in enumerate(header, start=1):
+            if pd.isna(col) or str(col).strip() == "":
+                base_name = f"_blank_{self._excel_col_letter(idx)}"
+            else:
+                base_name = str(col).strip()
+
+            candidate = base_name
+            suffix = 1
+            while candidate in seen:
+                candidate = f"{base_name}_{suffix}"
+                suffix += 1
+
+            seen.add(candidate)
+            normalized.append(candidate)
+
+        return normalized
+
     def read_multiple_tables(self, sheet_name, file_path):
         """
         讀取工作表（如 Raw Material、Manufacturing 等）
@@ -1112,7 +1182,7 @@ class ExcelApp:
                     # 保存表格並使用第三行作為欄位名稱
                     header = sheet.iloc[start_idx + 2]
                     table = sheet.iloc[start_idx + 3:idx].reset_index(drop=True)
-                    table.columns = header
+                    table.columns = self._normalize_table_columns(header)
                     tables.append((start_idx, table))
                 # 更新新的表格開始位置
                 start_idx = idx
@@ -1120,7 +1190,7 @@ class ExcelApp:
         # 添加最後一個表格，並使用第三行作為欄位名稱
         header = sheet.iloc[start_idx + 2]
         table = sheet.iloc[start_idx + 3:].reset_index(drop=True)
-        table.columns = header
+        table.columns = self._normalize_table_columns(header)
         tables.append((start_idx, table))
 
         # 返回表格數據

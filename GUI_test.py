@@ -1,10 +1,7 @@
-﻿from excel_processing import ExcelApp
-from tkcalendar import DateEntry
+﻿from tkcalendar import DateEntry
 from tkinter import filedialog, messagebox, ttk
-from tkinter import ttk
 import csv
 import excel_processing
-import importlib
 import openpyxl
 import os
 import pythoncom
@@ -14,8 +11,9 @@ import threading
 import time
 import tkinter as tk
 import win32com.client as win32
-#
-importlib.reload(excel_processing) # 調用 excel_processing 模組
+
+
+ExcelApp = excel_processing.ExcelApp
 
 DEFAULT_APP_VERSION = "v1.1.4"
 
@@ -668,7 +666,95 @@ class GUI:
         self.run_on_main(lambda: messagebox.showwarning(title, message), wait=wait)
 
     def show_error(self, title, message, wait=False):
-        self.run_on_main(lambda: messagebox.showerror(title, message), wait=wait)
+        self.run_on_main(lambda: self._show_copyable_error_dialog(title, message), wait=wait)
+
+    def _show_copyable_error_dialog(self, title, message):
+        message = str(message)
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(True, True)
+
+        width = min(max(self.root.winfo_width(), 520), 900)
+        height = 320
+        x = self.root.winfo_rootx() + max((self.root.winfo_width() - width) // 2, 0)
+        y = self.root.winfo_rooty() + max((self.root.winfo_height() - height) // 2, 0)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+        container = ttk.Frame(dialog, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=1)
+
+        ttk.Label(container, text="錯誤訊息").grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        text_frame = ttk.Frame(container)
+        text_frame.grid(row=1, column=0, sticky="nsew")
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+
+        error_text = tk.Text(text_frame, wrap="word", height=10, undo=False)
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=error_text.yview)
+        error_text.configure(yscrollcommand=scrollbar.set)
+        error_text.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        error_text.insert("1.0", message)
+
+        button_frame = ttk.Frame(container)
+        button_frame.grid(row=2, column=0, sticky="e", pady=(10, 0))
+
+        def copy_to_clipboard(text):
+            dialog.clipboard_clear()
+            dialog.clipboard_append(text)
+            dialog.update()
+
+        def copy_all(event=None):
+            copy_to_clipboard(message)
+            return "break"
+
+        def copy_selection(event=None):
+            try:
+                selected = error_text.get("sel.first", "sel.last")
+            except tk.TclError:
+                selected = message
+            copy_to_clipboard(selected)
+            return "break"
+
+        def select_all(event=None):
+            error_text.tag_add("sel", "1.0", "end-1c")
+            error_text.mark_set("insert", "1.0")
+            error_text.see("insert")
+            return "break"
+
+        def block_edit(event=None):
+            return "break"
+
+        error_text.bind("<Control-a>", select_all)
+        error_text.bind("<Control-A>", select_all)
+        error_text.bind("<Control-c>", copy_selection)
+        error_text.bind("<Control-C>", copy_selection)
+        error_text.bind("<Key>", block_edit)
+        error_text.bind("<<Paste>>", block_edit)
+
+        context_menu = tk.Menu(dialog, tearoff=False)
+        context_menu.add_command(label="複製選取", command=copy_selection)
+        context_menu.add_command(label="全選", command=select_all)
+        context_menu.add_command(label="複製全部", command=copy_all)
+
+        def show_context_menu(event):
+            try:
+                context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                context_menu.grab_release()
+
+        error_text.bind("<Button-3>", show_context_menu)
+
+        ttk.Button(button_frame, text="複製", command=copy_all).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(button_frame, text="關閉", command=dialog.destroy).pack(side=tk.LEFT)
+
+        dialog.bind("<Escape>", lambda event: dialog.destroy())
+        error_text.focus_set()
 
     def _extract_process_error(self, result):
         if isinstance(result, excel_processing.TaskResult):
@@ -925,7 +1011,14 @@ class GUI:
                 short_name = os.path.basename(item.get("input_file", ""))
                 reason = item.get("message") or item.get("error_code") or "Unknown error"
                 message_lines.append(f"- {short_name}: {reason}")
-        self.show_info("Batch Result", "\n".join(message_lines), wait=False, close_progress=True)
+        message = "\n".join(message_lines)
+        if failed > 0:
+            def _show_failed_summary():
+                self.close_progress_window(wait=True)
+                self._show_copyable_error_dialog("Batch Result", message)
+            self.run_on_main(_show_failed_summary, wait=False)
+        else:
+            self.show_info("Batch Result", message, wait=False, close_progress=True)
 
 
     # Overrides: use TaskResult and delegate COM lifecycle to engine.
