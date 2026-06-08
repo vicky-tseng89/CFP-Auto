@@ -25,12 +25,18 @@ pip install -r requirements.txt
 - `pywin32`
 - `tkcalendar`
 
-## 必要檔案（需與程式放同層）
-- `PLCI_table_format.xlsx`
-- `report_temp.xlsx`
-- `智邦-產品碳足跡盤查總報告書_竹南_temp.docx`
-- `智邦-產品碳足跡盤查總報告書_竹北_temp.docx`
-- `智邦-產品碳足跡盤查總報告書_越南_temp.docx`
+## 必要資源檔案
+以下模板與資源檔案預設應放在 `resources/` 目錄：
+- `resources/PLCI_table_format.xlsx`
+- `resources/report_temp.xlsx`
+- `resources/智邦-產品碳足跡盤查總報告書_竹南_temp.docx`
+- `resources/智邦-產品碳足跡盤查總報告書_竹北_temp.docx`
+- `resources/智邦-產品碳足跡盤查總報告書_越南_temp.docx`
+
+程式會優先從 `resources/` 讀取模板；若找不到，才會回頭檢查舊版的程式同層路徑。因此：
+- 開發模式：請放在專案根目錄下的 `resources/`
+- 打包成 `exe`：請放在 `exe` 同層的 `resources/`
+- 舊版相容：根目錄同名檔案仍可作為備援，但不建議再作為正式放置位置
 
 ## 輸入 Excel 基本要求
 程式流程會使用以下工作表名稱（需一致）：
@@ -86,7 +92,7 @@ python GUI_test.py
 - `logs/excel_processing.log`：執行紀錄
 
 ## 常見問題
-- 找不到模板檔：請確認上述必要檔案都在程式同層目錄。
+- 找不到模板檔：請優先確認上述必要資源檔案都放在 `resources/` 目錄。
 - Excel 無法儲存或被鎖定：關閉所有 Excel 視窗後重試。
 - 欄位或工作表錯誤：請確認輸入檔工作表名稱與程式要求完全一致。
 

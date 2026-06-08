@@ -1,5 +1,5 @@
 ﻿from transport_distance import compute_transport_distance
-from datetime import datetime
+from datetime import date, datetime
 from transport_distance import compute_transport_distance_from_queries
 from transport_distance import geocode_place, transport_type_to_mode
 from contextlib import suppress
@@ -26,6 +26,7 @@ import tkinter as tk
 import win32com.client as win32
 import xlsxwriter
 from openpyxl.styles.colors import Color
+from openpyxl.utils.datetime import MAC_EPOCH, WINDOWS_EPOCH, to_excel
 import traceback
 import unicodedata
 import uuid
@@ -34,6 +35,13 @@ from typing import Any, Dict, List
 FACTORY_OVERVIEW_INFO = {
     "竹南": {"name": "竹南廠", "address": "苗栗縣竹南鎮公義里科義街1號1、5樓"},
     "竹北": {"name": "竹北廠", "address": "新竹縣竹北市北興里智慧一路1號"},
+}
+FACTORY_SITE_ALIASES = {
+    "": "",
+    "竹南": "竹南",
+    "竹南廠": "竹南",
+    "竹北": "竹北",
+    "竹北廠": "竹北",
 }
 
 COM_OPEN_RETRY_COUNT = 5
@@ -49,6 +57,21 @@ COM_REFRESH_RETRY_COUNT = 2
 COM_REFRESH_RETRY_DELAY_SEC = 1.0
 INVALID_EXTERNAL_FORMULA_RE = re.compile(r"\[\d+\]Sheet!", re.IGNORECASE)
 TRANSPORT_LOCATION_MAPPING_FILENAME = "airport_port_land_location_mapping.xlsx"
+RESOURCES_DIRNAME = "resources"
+REPORT_WORKBOOK_TEMPLATE_FILENAME = "report_temp.xlsx"
+PLCI_TABLE_FORMAT_FILENAME = "PLCI_table_format.xlsx"
+REPORT_TEMPLATE_FILENAMES = {
+    "竹南": "智邦-產品碳足跡盤查總報告書_竹南_temp.docx",
+    "竹北": "智邦-產品碳足跡盤查總報告書_竹北_temp.docx",
+    "越南": "智邦-產品碳足跡盤查總報告書_越南_temp.docx",
+}
+CARBON_STAGE_OPTIONS = (
+    ("Raw Material", "原料取得"),
+    ("Manufacturing", "製造"),
+    ("Distribution", "配送"),
+    ("Usage", "使用"),
+    ("Recycling", "廢棄回收"),
+)
 ROAD_TRANSPORT_TYPES = {
     "road",
     "rord",
@@ -56,6 +79,7 @@ ROAD_TRANSPORT_TYPES = {
     "local land transport",
     "land",
     "truck",
+    "express",
 }
 
 
@@ -76,11 +100,13 @@ class ExcelComSession:
         display_alerts: bool = False,
         enable_events: bool = False,
         screen_updating: bool = False,
+        logger=None,
     ):
         self.visible = visible
         self.display_alerts = display_alerts
         self.enable_events = enable_events
         self.screen_updating = screen_updating
+        self.logger = logger
         self.excel = None
         self._opened_workbooks = []
 
@@ -97,16 +123,62 @@ class ExcelComSession:
 
     def __exit__(self, exc_type, exc, tb):
         for workbook in reversed(self._opened_workbooks):
-            with suppress(Exception):
+            try:
                 workbook.Close(SaveChanges=False)
+            except Exception as close_exc:
+                self._log_cleanup_warning("workbook.Close", close_exc, workbook)
         self._opened_workbooks.clear()
-        with suppress(Exception):
-            if self.excel is not None:
-                self.excel.Quit()
+        if self.excel is not None:
+            quit_error = None
+            for attempt in range(3):
+                try:
+                    self.excel.Quit()
+                    quit_error = None
+                    break
+                except Exception as exc:
+                    quit_error = exc
+                    if (
+                        hasattr(exc, "args")
+                        and exc.args
+                        and exc.args[0] == -2147418111
+                        and attempt < 2
+                    ):
+                        time.sleep(0.5)
+                        continue
+                    break
+            if quit_error is not None:
+                self._log_cleanup_warning("excel.Quit", quit_error)
         with suppress(Exception):
             pythoncom.CoUninitialize()
         self.excel = None
         return False
+
+    def _describe_dispatch(self, dispatch_obj) -> str:
+        if dispatch_obj is None:
+            return "<None>"
+        parts = [f"type={type(dispatch_obj).__name__}"]
+        username = getattr(dispatch_obj, "_username_", "")
+        if username:
+            parts.append(f"username={username}")
+        with suppress(Exception):
+            name = getattr(dispatch_obj, "Name", "")
+            if name:
+                parts.append(f"name={name}")
+        with suppress(Exception):
+            full_name = getattr(dispatch_obj, "FullName", "")
+            if full_name:
+                parts.append(f"full_name={full_name}")
+        parts.append(f"repr={dispatch_obj!r}")
+        return ", ".join(parts)
+
+    def _log_cleanup_warning(self, action: str, exc: Exception, dispatch_obj=None):
+        if self.logger is None:
+            return
+        detail = self._describe_dispatch(dispatch_obj) if dispatch_obj is not None else ""
+        if detail:
+            self.logger.warning("ExcelComSession cleanup failed during %s: %s | %s", action, exc, detail)
+        else:
+            self.logger.warning("ExcelComSession cleanup failed during %s: %s", action, exc)
 
     def open_workbook(
         self,
@@ -149,6 +221,8 @@ class ExcelComSession:
         retry_delay_sec: float = COM_SAVE_RETRY_DELAY_SEC,
         timeout_sec: float = COM_SAVE_TIMEOUT_SEC,
     ) -> bool:
+        if workbook is None:
+            raise ValueError("Workbook 儲存失敗：workbook 為 None")
         start = time.time()
         attempt = 0
         while attempt < max(1, retry_count) and (time.time() - start) < max(0.1, timeout_sec):
@@ -157,6 +231,10 @@ class ExcelComSession:
                 workbook.Save()
                 return True
             except Exception as exc:
+                if isinstance(exc, AttributeError):
+                    raise AttributeError(
+                        f"{exc} | workbook_proxy={self._describe_dispatch(workbook)}"
+                    ) from exc
                 if hasattr(exc, "args") and exc.args and exc.args[0] == -2147418111:
                     time.sleep(retry_delay_sec)
                     continue
@@ -175,8 +253,27 @@ class ExcelComSession:
         timeout_sec: float = COM_REFRESH_TIMEOUT_SEC,
         poll_sec: float = COM_REFRESH_POLL_SEC,
         cancel_callback=None,
+        progress_callback=None,
     ) -> bool:
         last_error = None
+        last_progress = 0.0
+
+        def _report_progress(fraction: float):
+            nonlocal last_progress
+            if not callable(progress_callback):
+                return
+            try:
+                fraction = float(fraction)
+            except Exception:
+                fraction = 0.0
+            fraction = max(0.0, min(1.0, fraction))
+            if fraction < last_progress:
+                fraction = last_progress
+            last_progress = fraction
+            progress_callback(fraction)
+
+        total_budget = max(0.1, float(settle_sec) + float(timeout_sec))
+        _report_progress(0.0)
         for _ in range(max(1, retry_count)):
             try:
                 workbook.RefreshAll()
@@ -186,6 +283,7 @@ class ExcelComSession:
                         cancel_callback()
                     time.sleep(0.5)
                     waited += 0.5
+                    _report_progress(waited / total_budget)
                 start = time.time()
                 while time.time() - start < timeout_sec:
                     if callable(cancel_callback):
@@ -199,7 +297,10 @@ class ExcelComSession:
                         if not all_done:
                             break
                     if all_done:
+                        _report_progress(1.0)
                         return True
+                    elapsed = settle_sec + (time.time() - start)
+                    _report_progress(elapsed / total_budget)
                     time.sleep(poll_sec)
                 last_error = TimeoutError(
                     f"RefreshAll 逾時（timeout_sec={timeout_sec}, poll_sec={poll_sec}）"
@@ -228,12 +329,15 @@ class ExcelApp:
         self.progress_callback = progress_callback
         self.file_path = None
         self.last_error = None
+        self.last_run_id = ""
+        self.last_technical_summary = ""
         self.error_callback = None
         self._format_cache = {}
         self.factory_site = ""
         self.cancel_event = None
         self.was_cancelled = False
         self.base_dir = self.get_base_dir()
+        self.resources_dir = os.path.join(self.base_dir, RESOURCES_DIRNAME)
         self.output_root = os.path.join(self.base_dir, "output")
         self.result_dir = os.path.join(self.output_root, "result")
         self.report_dir = os.path.join(self.output_root, "report")
@@ -242,6 +346,7 @@ class ExcelApp:
         self.spreadsheet_dir = os.path.join(self.output_root, "spreadsheet")
         self.logs_dir = os.path.join(self.base_dir, "logs")
         for folder in (
+            self.resources_dir,
             self.output_root,
             self.result_dir,
             self.report_dir,
@@ -273,6 +378,7 @@ class ExcelApp:
         self.current_run_id = ""
         self._transport_place_cache = {}
         self._transport_route_cache = {}
+        self._transport_endpoint_place_cache = {}
         self._transport_location_mapping = None
         self._transport_mapping_missing_warned = False
 
@@ -303,7 +409,10 @@ class ExcelApp:
         self.current_run_id = run_id
         self._warnings = []
         self.last_error = None
+        self.last_run_id = run_id
+        self.last_technical_summary = ""
         self.was_cancelled = False
+        self._transport_endpoint_place_cache = {}
         self.logger.info("[run_id=%s] start %s", run_id, task_name)
         return run_id, time.time()
 
@@ -322,6 +431,39 @@ class ExcelApp:
 
     def _elapsed_ms(self, started_at: float) -> int:
         return int((time.time() - started_at) * 1000)
+
+    def _emit_progress(self, value):
+        if not callable(self.progress_callback):
+            return
+        try:
+            value = float(value)
+        except Exception:
+            return
+        value = max(0.0, min(100.0, value))
+        self.progress_callback(int(round(value)))
+
+    def _make_stage_progress_callback(self, start, end):
+        try:
+            start = float(start)
+        except Exception:
+            start = 0.0
+        try:
+            end = float(end)
+        except Exception:
+            end = start
+        start = max(0.0, min(100.0, start))
+        end = max(start, min(100.0, end))
+        span = end - start
+
+        def _callback(fraction):
+            try:
+                fraction = float(fraction)
+            except Exception:
+                fraction = 0.0
+            fraction = max(0.0, min(1.0, fraction))
+            self._emit_progress(start + span * fraction)
+
+        return _callback
 
     def _warn(self, message: str):
         self._warnings.append(message)
@@ -350,6 +492,7 @@ class ExcelApp:
                 "[run_id=%s] %s: %s", self.current_run_id or "-", error_code, user_message
             )
         self.last_error = user_message
+        self.last_technical_summary = self.summarize_technical_details(technical)
         return TaskResult(
             ok=False,
             error_code=error_code,
@@ -358,6 +501,20 @@ class ExcelApp:
             elapsed_ms=self._elapsed_ms(started_at),
             warnings=list(self._warnings),
         )
+
+    @staticmethod
+    def summarize_technical_details(technical: str) -> str:
+        text = str(technical or "").strip()
+        if not text:
+            return ""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if line.startswith("Traceback "):
+                continue
+            if line.startswith('File "'):
+                continue
+            return line
+        return lines[-1] if lines else ""
 
     def _coerce_task_result(
         self,
@@ -551,10 +708,14 @@ class ExcelApp:
         self._finish_task_log(run_id, "transform_sheet", result)
         return result
 
-    def process_file(self, file_path=None) -> TaskResult:
+    def process_file(self, file_path=None, selected_stages=None, calculate_distances=True) -> TaskResult:
         run_id, started_at = self._start_task("process_file")
         try:
-            raw = self._process_file_impl(file_path=file_path)
+            raw = self._process_file_impl(
+                file_path=file_path,
+                selected_stages=selected_stages,
+                calculate_distances=calculate_distances,
+            )
             result = self._coerce_task_result(
                 task_name="process_file",
                 started_at=started_at,
@@ -564,6 +725,13 @@ class ExcelApp:
                     "result_file": getattr(self, "result_file", ""),
                     "report_file": getattr(self, "report_file", ""),
                 },
+            )
+        except ValueError as exc:
+            result = self._result_fail(
+                error_code="INVALID_STAGE_SELECTION",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
             )
         except UserCancelledError as exc:
             self.was_cancelled = True
@@ -584,16 +752,19 @@ class ExcelApp:
         self._finish_task_log(run_id, "process_file", result)
         return result
 
-    def generate_report(self, template_choice) -> TaskResult:
+    def generate_report(self, template_choice, result_file=None) -> TaskResult:
         run_id, started_at = self._start_task("generate_report")
         try:
-            raw = self._generate_report_impl(template_choice)
+            raw = self._generate_report_impl(template_choice, result_file=result_file)
             result = self._coerce_task_result(
                 task_name="generate_report",
                 started_at=started_at,
                 value=raw,
                 success_message="報告產生完成",
-                success_artifacts_fn=lambda: {"report_doc": raw if isinstance(raw, str) else ""},
+                success_artifacts_fn=lambda: {
+                    "report_doc": raw if isinstance(raw, str) else "",
+                    "source_file": os.path.abspath(result_file) if result_file else getattr(self, "result_file", ""),
+                },
             )
         except UserCancelledError as exc:
             self.was_cancelled = True
@@ -679,6 +850,25 @@ class ExcelApp:
             return None
 
     @staticmethod
+    def _to_excel_date_serial(value, epoch=WINDOWS_EPOCH):
+        if value is None or value == "":
+            return ""
+        if pd.isna(value):
+            return ""
+        if isinstance(value, datetime):
+            return int(to_excel(value.date(), epoch=epoch))
+        if isinstance(value, date):
+            return int(to_excel(value, epoch=epoch))
+
+        text = str(value).strip()
+        if not text:
+            return ""
+        parsed = pd.to_datetime(text, errors="coerce")
+        if pd.isna(parsed):
+            return text
+        return int(to_excel(parsed.date(), epoch=epoch))
+
+    @staticmethod
     def _normalize_transport_lookup_key(value):
         if value is None:
             return ""
@@ -686,17 +876,68 @@ class ExcelApp:
         text = re.sub(r"\s+", " ", text)
         return text.casefold()
 
+    def _get_cached_endpoint_place(self, endpoint_text):
+        return self._transport_endpoint_place_cache.get(
+            self._normalize_transport_lookup_key(endpoint_text)
+        )
+
+    def _cache_endpoint_place(self, endpoint_text, place):
+        key = self._normalize_transport_lookup_key(endpoint_text)
+        if not key or not isinstance(place, dict):
+            return
+        try:
+            lat = float(place.get("lat"))
+            lon = float(place.get("lon"))
+        except (TypeError, ValueError):
+            return
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return
+        self._transport_endpoint_place_cache[key] = {
+            "query": str(place.get("query") or endpoint_text or "").strip(),
+            "lat": lat,
+            "lon": lon,
+            "label": str(place.get("label") or endpoint_text or "").strip(),
+            "provider": str(place.get("provider") or "previous_segment"),
+        }
+
     def _is_road_transport_type(self, transport_type):
         normalized = self._normalize_column_name(transport_type)
         normalized = re.sub(r"[\s\-_/,;:]+", " ", normalized).strip()
         return normalized in ROAD_TRANSPORT_TYPES
 
+    def _resource_candidates(self, filename, *legacy_paths):
+        candidates = [os.path.join(self.resources_dir, filename), *legacy_paths]
+        unique_candidates = []
+        seen = set()
+        for path in candidates:
+            normalized = os.path.normcase(os.path.normpath(path))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_candidates.append(path)
+        return unique_candidates
+
+    def _find_existing_resource(self, filename, *legacy_paths):
+        return next(
+            (path for path in self._resource_candidates(filename, *legacy_paths) if os.path.exists(path)),
+            None,
+        )
+
+    def _get_required_resource_path(self, filename, label, *legacy_paths):
+        resource_path = self._find_existing_resource(filename, *legacy_paths)
+        if resource_path:
+            return resource_path
+
+        searched_paths = "\n".join(self._resource_candidates(filename, *legacy_paths))
+        raise FileNotFoundError(f"找不到{label}：{filename}\n已檢查路徑：\n{searched_paths}")
+
     def _transport_mapping_candidates(self):
-        return [
+        return self._resource_candidates(
+            TRANSPORT_LOCATION_MAPPING_FILENAME,
             os.path.join(self.spreadsheet_dir, TRANSPORT_LOCATION_MAPPING_FILENAME),
             os.path.join(self.base_dir, "output", "spreadsheet", TRANSPORT_LOCATION_MAPPING_FILENAME),
             os.path.join(self.base_dir, TRANSPORT_LOCATION_MAPPING_FILENAME),
-        ]
+        )
 
     def _load_transport_location_mapping(self):
         if self._transport_location_mapping is not None:
@@ -799,6 +1040,27 @@ class ExcelApp:
         self._transport_location_mapping = mapping
         return self._transport_location_mapping
 
+    @staticmethod
+    def normalize_factory_site(factory_site):
+        text = str(factory_site or "").strip()
+        return FACTORY_SITE_ALIASES.get(text, text)
+
+    def _apply_factory_overview_info(self, workbook):
+        if "overview" not in workbook.sheetnames:
+            return
+
+        factory_site = self.normalize_factory_site(self.factory_site)
+        overview = workbook["overview"]
+        if not factory_site:
+            overview["C3"] = ""
+            overview["C4"] = ""
+            return
+
+        factory_info = FACTORY_OVERVIEW_INFO.get(factory_site)
+        if factory_info:
+            overview["C3"] = factory_info["name"]
+            overview["C4"] = factory_info["address"]
+
     def _resolve_road_transport_endpoint(self, transport_type, endpoint):
         return self._resolve_road_transport_endpoint_details(transport_type, endpoint)["query"]
 
@@ -820,19 +1082,33 @@ class ExcelApp:
     def _resolve_road_transport_endpoint_details(self, transport_type, endpoint):
         endpoint_text = str(endpoint or "").strip()
         if not endpoint_text or not self._is_road_transport_type(transport_type):
-            return {"query": endpoint_text, "record": None, "lat_lon": None}
+            return {"query": endpoint_text, "record": None, "lat_lon": None, "place": None}
 
         mapping = self._load_transport_location_mapping()
         record = mapping.get(self._normalize_transport_lookup_key(endpoint_text))
-        if not record:
-            return {"query": endpoint_text, "record": None, "lat_lon": None}
-        return {
-            "query": str(record.get("road_location_for_geocode") or endpoint_text).strip(),
-            "record": record,
-            "lat_lon": self._record_lat_lon(record),
-        }
+        if record:
+            return {
+                "query": str(record.get("road_location_for_geocode") or endpoint_text).strip(),
+                "record": record,
+                "lat_lon": self._record_lat_lon(record),
+                "place": None,
+            }
+
+        cached_place = self._get_cached_endpoint_place(endpoint_text)
+        if cached_place is not None:
+            return {
+                "query": endpoint_text,
+                "record": None,
+                "lat_lon": (float(cached_place["lat"]), float(cached_place["lon"])),
+                "place": dict(cached_place),
+            }
+
+        return {"query": endpoint_text, "record": None, "lat_lon": None, "place": None}
 
     def _transport_place_from_endpoint_details(self, endpoint_details, transport_type):
+        cached_place = endpoint_details.get("place")
+        if isinstance(cached_place, dict):
+            return dict(cached_place)
         lat_lon = endpoint_details.get("lat_lon")
         query = endpoint_details.get("query") or ""
         if lat_lon is not None:
@@ -851,23 +1127,87 @@ class ExcelApp:
             cache=self._transport_place_cache,
         )
 
-    def calculate_transport_distances(self, workbook, distribution_tables):
-        if "Distribution" not in workbook.sheetnames:
-            self._warn("找不到 Distribution 工作表，略過距離計算。")
-            return distribution_tables
+    def calculate_transport_distances(self, workbook, transport_tables, sheet_name="Distribution", table_indexes=None):
+        if sheet_name not in workbook.sheetnames:
+            self._warn(f"找不到 {sheet_name} 工作表，略過距離計算。")
+            return transport_tables
 
-        sheet = workbook["Distribution"]
-        route_count = 0
+        sheet = workbook[sheet_name]
+        is_raw_material = self._normalize_column_name(sheet_name) == "raw material"
+        pending_jobs = []
+        route_jobs = {}
+        route_keys = []
         updated_count = 0
         skipped_existing_count = 0
+        table_index_set = set(table_indexes) if table_indexes is not None else None
 
-        for table_idx, (start_idx, sheet_data) in enumerate(distribution_tables, start=1):
+        def column_name_at(columns, column_idx):
+            if column_idx is None or column_idx < 1 or column_idx > len(columns):
+                return None
+            return columns[column_idx - 1]
+
+        def raw_numeric_factor(row, column_name):
+            if column_name is None:
+                return None
+            value = row.get(column_name)
+            if value is None or value == "" or pd.isna(value):
+                return 0.0
+            return self._coerce_numeric(value)
+
+        def calculate_ton_km_factor(row, weight_col_name, raw_material_col_names=None):
+            if is_raw_material:
+                if raw_material_col_names is None:
+                    return None
+                manufacturer_alloc = raw_numeric_factor(row, raw_material_col_names["manufacturer_alloc"])
+                part_source_alloc = raw_numeric_factor(row, raw_material_col_names["part_source_alloc"])
+                weight_parts = raw_numeric_factor(row, raw_material_col_names["weight_parts"])
+                bom_quantity = raw_numeric_factor(row, raw_material_col_names["bom_quantity"])
+                if None in (manufacturer_alloc, part_source_alloc, weight_parts, bom_quantity):
+                    return None
+                return weight_parts * bom_quantity * part_source_alloc * manufacturer_alloc / 1000.0
+
+            if weight_col_name is None:
+                return None
+            weight_kg = self._coerce_numeric(row.get(weight_col_name))
+            if weight_kg is None:
+                return None
+            return weight_kg / 1000.0
+
+        for table_idx, (start_idx, sheet_data) in enumerate(transport_tables, start=1):
+            if table_index_set is not None and table_idx not in table_index_set:
+                continue
+
             distance_col_idx, distance_col_name = self._find_table_column(sheet_data.columns, "distance transported (km)")
             _, start_col_name = self._find_table_column(sheet_data.columns, "starting point")
             _, end_col_name = self._find_table_column(sheet_data.columns, "end point")
             _, transport_col_name = self._find_table_column(sheet_data.columns, "type of transport")
-            _, ton_km_col_name = self._find_table_column(sheet_data.columns, "Ton‧Km")
+            ton_km_col_idx, ton_km_col_name = self._find_table_column(sheet_data.columns, "Ton‧Km")
             _, weight_col_name = self._find_table_column(sheet_data.columns, "Weight (product+package)（Kg）")
+            if ton_km_col_name is not None:
+                sheet_data[ton_km_col_name] = sheet_data[ton_km_col_name].astype(object)
+            raw_material_col_names = None
+            if is_raw_material:
+                _, manufacturer_alloc_col_name = self._find_table_column(
+                    sheet_data.columns,
+                    "allocated proportion (Manufacturer)",
+                )
+                _, part_source_alloc_col_name = self._find_table_column(
+                    sheet_data.columns,
+                    "allocated proportion (Part source)",
+                )
+                _, weight_parts_col_name = self._find_table_column(sheet_data.columns, "Weight of Parts")
+                _, bom_quantity_col_name = self._find_table_column(sheet_data.columns, "BOM Quantity")
+                next_column_idx = distance_col_idx if distance_col_idx is not None else 0
+                raw_material_col_names = {
+                    "manufacturer_alloc": manufacturer_alloc_col_name
+                    or column_name_at(sheet_data.columns, next_column_idx + 1),
+                    "part_source_alloc": part_source_alloc_col_name
+                    or column_name_at(sheet_data.columns, next_column_idx + 2),
+                    "weight_parts": weight_parts_col_name
+                    or column_name_at(sheet_data.columns, next_column_idx + 3),
+                    "bom_quantity": bom_quantity_col_name
+                    or column_name_at(sheet_data.columns, next_column_idx + 4),
+                }
 
             required = {
                 "starting point": start_col_name,
@@ -877,104 +1217,204 @@ class ExcelApp:
             }
             missing = [name for name, actual in required.items() if actual is None]
             if missing:
-                raise ValueError(f"【Distribution 第 {table_idx} 個表格】缺少必要欄位: {missing}")
+                raise ValueError(f"【{sheet_name} 第 {table_idx} 個表格】缺少必要欄位: {missing}")
 
             for row_offset, row in sheet_data.iterrows():
                 self._check_cancel()
-                transport_type = str(row.get(transport_col_name) or "").strip()
-                start_point = str(row.get(start_col_name) or "").strip()
-                end_point = str(row.get(end_col_name) or "").strip()
-                if not transport_type or not start_point or not end_point:
-                    continue
-
                 excel_row = start_idx + 4 + row_offset
                 existing_distance_km = self._coerce_numeric(row.get(distance_col_name))
                 if existing_distance_km is not None and not math.isclose(existing_distance_km, 0.0, abs_tol=1e-12):
-                    if ton_km_col_name is not None and weight_col_name is not None:
-                        weight_kg = self._coerce_numeric(row.get(weight_col_name))
-                        if weight_kg is not None:
-                            sheet_data.at[row_offset, ton_km_col_name] = (weight_kg / 1000.0) * existing_distance_km
+                    ton_km_factor = calculate_ton_km_factor(row, weight_col_name, raw_material_col_names)
+                    if ton_km_col_name is not None and ton_km_factor is not None:
+                        ton_km_value = ton_km_factor * existing_distance_km
+                        sheet_data.at[row_offset, ton_km_col_name] = ton_km_value
+                        if ton_km_col_idx is not None:
+                            sheet.cell(row=excel_row, column=ton_km_col_idx).value = ton_km_value
                     skipped_existing_count += 1
                     continue
 
-                route_count += 1
+                transport_type_raw = row.get(transport_col_name)
+                start_point_raw = row.get(start_col_name)
+                end_point_raw = row.get(end_col_name)
+                if pd.isna(transport_type_raw) or pd.isna(start_point_raw) or pd.isna(end_point_raw):
+                    continue
+                transport_type = str(transport_type_raw or "").strip()
+                start_point = str(start_point_raw or "").strip()
+                end_point = str(end_point_raw or "").strip()
+                if not transport_type or not start_point or not end_point:
+                    continue
+
                 resolved_start = self._resolve_road_transport_endpoint_details(transport_type, start_point)
                 resolved_end = self._resolve_road_transport_endpoint_details(transport_type, end_point)
                 resolved_start_point = resolved_start["query"]
                 resolved_end_point = resolved_end["query"]
-                self._notify_status(
-                    f"計算 Distribution 運輸距離... {route_count} | {transport_type}: {start_point} -> {end_point}"
-                )
                 route_cache_key = (
                     self._normalize_column_name(transport_type),
                     self._normalize_transport_lookup_key(resolved_start_point),
                     self._normalize_transport_lookup_key(resolved_end_point),
                 )
-                try:
-                    result = self._transport_route_cache.get(route_cache_key)
-                    if result is None:
-                        if resolved_start.get("lat_lon") is not None or resolved_end.get("lat_lon") is not None:
-                            from_place = self._transport_place_from_endpoint_details(resolved_start, transport_type)
-                            to_place = self._transport_place_from_endpoint_details(resolved_end, transport_type)
-                            result = compute_transport_distance(
-                                mode=transport_type_to_mode(transport_type),
-                                from_lat=float(from_place["lat"]),
-                                from_lon=float(from_place["lon"]),
-                                to_lat=float(to_place["lat"]),
-                                to_lon=float(to_place["lon"]),
-                            )
-                            result.metadata.update(
-                                {
-                                    "transport_type": transport_type,
-                                    "from_query": resolved_start_point,
-                                    "to_query": resolved_end_point,
-                                    "from_place": from_place,
-                                    "to_place": to_place,
-                                }
-                            )
-                        else:
-                            result = compute_transport_distance_from_queries(
-                                transport_type=transport_type,
-                                from_query=resolved_start_point,
-                                to_query=resolved_end_point,
-                                geocode_cache=self._transport_place_cache,
-                            )
-                        self._transport_route_cache[route_cache_key] = result
+                job = {
+                    "table_idx": table_idx,
+                    "sheet_data": sheet_data,
+                    "row_offset": row_offset,
+                    "excel_row": excel_row,
+                    "distance_col_idx": distance_col_idx,
+                    "distance_col_name": distance_col_name,
+                    "ton_km_col_idx": ton_km_col_idx,
+                    "ton_km_col_name": ton_km_col_name,
+                    "transport_type": transport_type,
+                    "start_point": start_point,
+                    "end_point": end_point,
+                    "resolved_start": resolved_start,
+                    "resolved_end": resolved_end,
+                    "resolved_start_point": resolved_start_point,
+                    "resolved_end_point": resolved_end_point,
+                    "ton_km_factor": calculate_ton_km_factor(row, weight_col_name, raw_material_col_names),
+                }
+                pending_jobs.append(job)
+                if route_cache_key not in route_jobs:
+                    route_jobs[route_cache_key] = []
+                    route_keys.append(route_cache_key)
+                route_jobs[route_cache_key].append(job)
+
+        if pending_jobs:
+            self._notify_status(
+                f"{sheet_name} 運輸距離待計算 {len(pending_jobs)} 筆，去重後 {len(route_keys)} 條路線。"
+            )
+
+        route_results = {}
+        route_errors = {}
+        for route_idx, route_cache_key in enumerate(route_keys, start=1):
+            self._check_cancel()
+            representative_job = route_jobs[route_cache_key][0]
+            transport_type = representative_job["transport_type"]
+            start_point = representative_job["start_point"]
+            end_point = representative_job["end_point"]
+            resolved_start = representative_job["resolved_start"]
+            resolved_end = representative_job["resolved_end"]
+            resolved_start_point = representative_job["resolved_start_point"]
+            resolved_end_point = representative_job["resolved_end_point"]
+            self._notify_status(
+                f"計算 {sheet_name} 唯一路線... {route_idx}/{len(route_keys)} | "
+                f"{transport_type}: {start_point} -> {end_point}"
+            )
+            try:
+                result = self._transport_route_cache.get(route_cache_key)
+                if result is None:
+                    if resolved_start.get("lat_lon") is not None or resolved_end.get("lat_lon") is not None:
+                        from_place = self._transport_place_from_endpoint_details(resolved_start, transport_type)
+                        to_place = self._transport_place_from_endpoint_details(resolved_end, transport_type)
+                        result = compute_transport_distance(
+                            mode=transport_type_to_mode(transport_type),
+                            from_lat=float(from_place["lat"]),
+                            from_lon=float(from_place["lon"]),
+                            to_lat=float(to_place["lat"]),
+                            to_lon=float(to_place["lon"]),
+                        )
                         result.metadata.update(
                             {
-                                "original_from_query": start_point,
-                                "original_to_query": end_point,
-                                "resolved_from_query": resolved_start_point,
-                                "resolved_to_query": resolved_end_point,
+                                "transport_type": transport_type,
+                                "from_query": resolved_start_point,
+                                "to_query": resolved_end_point,
+                                "from_place": from_place,
+                                "to_place": to_place,
                             }
                         )
-
-                    distance_km = round(result.distance_m / 1000.0, 4)
-                    sheet_data.at[row_offset, distance_col_name] = distance_km
-                    sheet.cell(row=excel_row, column=distance_col_idx).value = distance_km
-
-                    if ton_km_col_name is not None and weight_col_name is not None:
-                        weight_kg = self._coerce_numeric(row.get(weight_col_name))
-                        if weight_kg is not None:
-                            sheet_data.at[row_offset, ton_km_col_name] = (weight_kg / 1000.0) * distance_km
-
-                    updated_count += 1
-                except Exception as exc:
-                    self._warn(
-                        f"Distribution 第 {table_idx} 個表格第 {excel_row} 列距離計算失敗: "
-                        f"{transport_type} | {start_point} -> {end_point} "
-                        f"(resolved: {resolved_start_point} -> {resolved_end_point}) | {exc}"
+                    else:
+                        result = compute_transport_distance_from_queries(
+                            transport_type=transport_type,
+                            from_query=resolved_start_point,
+                            to_query=resolved_end_point,
+                            geocode_cache=self._transport_place_cache,
+                        )
+                    self._transport_route_cache[route_cache_key] = result
+                    result.metadata.update(
+                        {
+                            "original_from_query": start_point,
+                            "original_to_query": end_point,
+                            "resolved_from_query": resolved_start_point,
+                            "resolved_to_query": resolved_end_point,
+                        }
                     )
+                route_results[route_cache_key] = result
+            except Exception as exc:
+                route_errors[route_cache_key] = exc
+
+        for route_cache_key in route_keys:
+            self._check_cancel()
+            result = route_results.get(route_cache_key)
+            if result is None:
+                exc = route_errors.get(route_cache_key)
+                for job in route_jobs[route_cache_key]:
+                    self._warn(
+                        f"{sheet_name} 第 {job['table_idx']} 個表格第 {job['excel_row']} 列距離計算失敗: "
+                        f"{job['transport_type']} | {job['start_point']} -> {job['end_point']} "
+                        f"(resolved: {job['resolved_start_point']} -> {job['resolved_end_point']}) | {exc}"
+                    )
+                continue
+
+            first_job = route_jobs[route_cache_key][0]
+            self._cache_endpoint_place(
+                first_job["start_point"],
+                result.metadata.get("from_place"),
+            )
+            self._cache_endpoint_place(
+                first_job["resolved_start_point"],
+                result.metadata.get("from_place"),
+            )
+            self._cache_endpoint_place(
+                first_job["end_point"],
+                result.metadata.get("to_place"),
+            )
+            self._cache_endpoint_place(
+                first_job["resolved_end_point"],
+                result.metadata.get("to_place"),
+            )
+
+            distance_km = round(result.distance_m / 1000.0, 4)
+            for job in route_jobs[route_cache_key]:
+                sheet_data = job["sheet_data"]
+                row_offset = job["row_offset"]
+                sheet_data.at[row_offset, job["distance_col_name"]] = distance_km
+                sheet.cell(row=job["excel_row"], column=job["distance_col_idx"]).value = distance_km
+
+                ton_km_col_name = job["ton_km_col_name"]
+                ton_km_col_idx = job["ton_km_col_idx"]
+                ton_km_factor = job["ton_km_factor"]
+                if ton_km_col_name is not None and ton_km_factor is not None:
+                    ton_km_value = ton_km_factor * distance_km
+                    sheet_data.at[row_offset, ton_km_col_name] = ton_km_value
+                    if ton_km_col_idx is not None:
+                        sheet.cell(row=job["excel_row"], column=ton_km_col_idx).value = ton_km_value
+
+                updated_count += 1
 
         self._notify_status(
-            f"Distribution 運輸距離更新完成，共更新 {updated_count} 筆，沿用既有距離 {skipped_existing_count} 筆。"
+            f"{sheet_name} 運輸距離更新完成，共更新 {updated_count} 筆，沿用既有距離 {skipped_existing_count} 筆。"
         )
-        return distribution_tables
+        return transport_tables
 
-    def _process_file_impl(self, file_path=None):
+    def _normalize_selected_carbon_stages(self, selected_stages=None):
+        valid_stages = [stage for stage, _ in CARBON_STAGE_OPTIONS]
+        if selected_stages is None:
+            return valid_stages
+
+        selected = []
+        for stage in selected_stages:
+            stage_name = str(stage or "").strip()
+            if stage_name in valid_stages and stage_name not in selected:
+                selected.append(stage_name)
+
+        if not selected:
+            raise ValueError("請至少勾選一個要計算碳排的階段。")
+        return selected
+
+    def _process_file_impl(self, file_path=None, selected_stages=None, calculate_distances=True):
         """數據處理"""
         if file_path is not None:
             self.file_path = file_path
+        selected_stage_list = self._normalize_selected_carbon_stages(selected_stages)
+        selected_stage_set = set(selected_stage_list)
         self.last_error = None
         self.was_cancelled = False
         self._check_cancel()
@@ -991,13 +1431,25 @@ class ExcelApp:
             print("讀取 Excel 文件...")
             self._check_cancel()
             result_workbook = openpyxl.load_workbook(self.file_path, keep_vba=False, keep_links=False)
-            sheet_A_tables = self.read_multiple_tables('Raw Material', self.file_path)      #呼叫 read_multiple_tables(sheet_name, file_path) 
-            sheet_C_tables = self.read_multiple_tables('Manufacturing', self.file_path)     #讀取特定數個工作表（如 Raw Material、Manufacturing 等）
-            sheet_D_tables = self.read_multiple_tables('Distribution', self.file_path)      #將每個工作表中多個獨立的資料表格區段解析為 pandas DataFrame 清單
-            sheet_E_tables = self.read_multiple_tables('Usage', self.file_path)
-            sheet_F_tables = self.read_multiple_tables('Recycling', self.file_path)
-            self._notify_status("更新 Distribution 運輸距離...")
-            sheet_D_tables = self.calculate_transport_distances(result_workbook, sheet_D_tables)
+            stage_tables = {}
+            for stage_name in selected_stage_list:
+                stage_tables[stage_name] = self.read_multiple_tables(stage_name, self.file_path)
+
+            if calculate_distances and "Raw Material" in selected_stage_set:
+                self._notify_status("更新 Raw Material 運輸距離...")
+                stage_tables["Raw Material"] = self.calculate_transport_distances(
+                    result_workbook,
+                    stage_tables["Raw Material"],
+                    sheet_name="Raw Material",
+                    table_indexes=[3, 4],
+                )
+            if calculate_distances and "Distribution" in selected_stage_set:
+                self._notify_status("更新 Distribution 運輸距離...")
+                stage_tables["Distribution"] = self.calculate_transport_distances(
+                    result_workbook,
+                    stage_tables["Distribution"],
+                    sheet_name="Distribution",
+                )
             
             self.update_progress_smooth(10, 40, step=1, delay=0.05) # 階段2：讀取工作表B，處理工作表並計算數值，模擬進度從 10% 到 40%
             # 以 pandas 讀入另一張關鍵對照表（sheet_B，如 simapro10.2.0.0）
@@ -1005,18 +1457,32 @@ class ExcelApp:
             sheet_B = pd.read_excel(self.file_path, sheet_name='simapro10.2.0.0', usecols=['單位對照', 'fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)', 'unit']).dropna(subset=['單位對照'])
             self._notify_status("處理工作表並獲取總值...")
             print("處理工作表並獲取總值...")
-            total_A = self.process_tables(sheet_A_tables, 'Raw Material', 'W', result_workbook, sheet_B)
-            total_C = self.process_tables(sheet_C_tables, 'Manufacturing', 'W', result_workbook, sheet_B)
-            total_D = self.process_tables(sheet_D_tables, 'Distribution', 'U', result_workbook, sheet_B)
-            total_E = self.process_tables(sheet_E_tables, 'Usage', 'Q', result_workbook, sheet_B)
-            total_F = self.process_tables(sheet_F_tables, 'Recycling', 'Q', result_workbook, sheet_B)
+            stage_calc_columns = {
+                "Raw Material": "W",
+                "Manufacturing": "W",
+                "Distribution": "U",
+                "Usage": "Q",
+                "Recycling": "Q",
+            }
+            stage_totals = {stage_name: (0, 0, 0) for stage_name, _ in CARBON_STAGE_OPTIONS}
+            for stage_name in selected_stage_list:
+                stage_totals[stage_name] = self.process_tables(
+                    stage_tables[stage_name],
+                    stage_name,
+                    stage_calc_columns[stage_name],
+                    result_workbook,
+                    sheet_B,
+                )
 
 
             self.update_progress_smooth(40, 70, step=1, delay=0.02) # 階段3：更新報告模板，模擬進度從 40% 到 70%
             self._notify_status("讀取報告模板並寫入計算的數值...")
             print("讀取報告模板並寫入計算的數值...")
-            base_dir = os.path.dirname(os.path.abspath(__file__))       # Temp檔路徑下
-            report_path = os.path.join(base_dir, 'report_temp.xlsx')    # 將結果寫入報告範本 Excel (report_temp.xlsx) 中預定的儲存格
+            report_path = self._get_required_resource_path(
+                REPORT_WORKBOOK_TEMPLATE_FILENAME,
+                "Excel 報告模板",
+                os.path.join(self.base_dir, REPORT_WORKBOOK_TEMPLATE_FILENAME),
+            )
             self._check_cancel()
             report_workbook = openpyxl.load_workbook(report_path)
             # 確保選擇報告中的 'general' 工作表
@@ -1028,14 +1494,15 @@ class ExcelApp:
             self._notify_status("每個工作表的加總值寫入指定的單元格...")
             print("每個工作表的加總值寫入指定的單元格...")
             # 將每個工作表的加總值寫入指定的單元格
-            report_sheet['B2'], report_sheet['B3'], report_sheet['B4'] = total_A
-            report_sheet['C2'], report_sheet['C3'], report_sheet['C4'] = total_C
-            report_sheet['D2'], report_sheet['D3'], report_sheet['D4'] = total_D
-            report_sheet['E2'], report_sheet['E3'], report_sheet['E4'] = total_E
-            report_sheet['F2'], report_sheet['F3'], report_sheet['F4'] = total_F
+            report_sheet['B2'], report_sheet['B3'], report_sheet['B4'] = stage_totals["Raw Material"]
+            report_sheet['C2'], report_sheet['C3'], report_sheet['C4'] = stage_totals["Manufacturing"]
+            report_sheet['D2'], report_sheet['D3'], report_sheet['D4'] = stage_totals["Distribution"]
+            report_sheet['E2'], report_sheet['E3'], report_sheet['E4'] = stage_totals["Usage"]
+            report_sheet['F2'], report_sheet['F3'], report_sheet['F4'] = stage_totals["Recycling"]
             self.update_progress_smooth(70, 95, step=1, delay=0.05) # 階段4：儲存結果，模擬進度從 70% 到 99%
             # 獲取當前的日期和時間，用於生成檔案名稱
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._apply_factory_overview_info(result_workbook)
             product_name_suffix = ""
             if "overview" in result_workbook.sheetnames:
                 product_name_suffix = str(result_workbook["overview"]["C17"].value or "").strip()
@@ -1081,6 +1548,7 @@ class ExcelApp:
                     display_alerts=False,
                     enable_events=False,
                     screen_updating=False,
+                    logger=self.logger,
                 ) as session:
                     com_wb = session.open_workbook(
                         path,
@@ -1113,6 +1581,7 @@ class ExcelApp:
                 "ok": True,
                 "result_file": self.result_file,
                 "report_file": self.report_file,
+                "selected_stages": selected_stage_list,
             }
         except UserCancelledError as e:
             self.was_cancelled = True
@@ -1232,6 +1701,17 @@ class ExcelApp:
                     f"需包含 'total'、'Ton‧Km'、'consumed amount allocated to single product (energy/product unit)' 或 'total amount'。\n"
                     f"實際欄位有: {list(sheet_data.columns)}"
                 )
+
+            quantity_col_idx = list(sheet_data.columns).index(quantity_column) + 1
+            quantity_col_letter = self._excel_col_letter(quantity_col_idx)
+            coefficient_col_idx, _ = self._find_table_column(sheet_data.columns, "Coefficient value")
+            coefficient_col_letter = (
+                self._excel_col_letter(coefficient_col_idx)
+                if coefficient_col_idx is not None
+                else None
+            )
+            if coefficient_col_letter is None:
+                self._warn(f"【{sheet_name} 第 {i+1} 個表格】找不到 Coefficient value 欄位，略過係數公式寫入。")
             
             # 1) 保留原本表格內既有的 result（若有）
             for col in [
@@ -1324,7 +1804,11 @@ class ExcelApp:
                 biogenic_cell = f"{chr(ord(col_start) + 1)}{row_num}"
                 land_cell = f"{chr(ord(col_start) + 2)}{row_num}"
                 # 將 Damage Assessment 欄位設為公式
-                sheet[f'{chr(ord(col_start) + 3)}{row_num}'] = f"={fossil_cell}+{biogenic_cell}+{land_cell}"
+                damage_cell = f'{chr(ord(col_start) + 3)}{row_num}'
+                sheet[damage_cell] = f"={fossil_cell}+{biogenic_cell}+{land_cell}"
+                if coefficient_col_letter is not None:
+                    quantity_cell = f"{quantity_col_letter}{row_num}"
+                    sheet[f"{coefficient_col_letter}{row_num}"] = f'=IFERROR({damage_cell}/{quantity_cell},"")'
             
             self._notify_status("計算加總值並寫入每個表格的第一行...")
             # 計算加總值並寫入每個表格的第一行，並做小數點後 4 位四捨五入捨去
@@ -1673,8 +2157,11 @@ class ExcelApp:
                 except Exception:
                     pass
 
-            base_dir = os.path.dirname(os.path.abspath(__file__))   # 取得目前 script 所在的資料夾/Temp檔路徑下
-            target_file_path = os.path.join(base_dir, "PLCI_table_format.xlsx")
+            target_file_path = self._get_required_resource_path(
+                PLCI_TABLE_FORMAT_FILENAME,
+                "PLCI 格式模板",
+                os.path.join(self.base_dir, PLCI_TABLE_FORMAT_FILENAME),
+            )
             # 用 openpyxl 讀取模板
             self._check_cancel()
             template_wb = openpyxl.load_workbook(target_file_path)
@@ -1867,6 +2354,7 @@ class ExcelApp:
                 display_alerts=False,
                 enable_events=False,
                 screen_updating=False,
+                logger=self.logger,
             ) as session:
                 wb_tpl = session.open_workbook(
                     target_file_path,
@@ -1915,16 +2403,26 @@ class ExcelApp:
                 overview.Range("H2").Formula = "='Raw Material'!AE2+Manufacturing!AE2+Distribution!AE2+Recycling!AE2+Usage!AE2"
                 overview.Range("V2").Formula = "=Usage!$K$5"
                 overview.Range("C17").Value = input_values["product_name"]
-                overview.Range("C18").Value = input_values["start_date"]
-                overview.Range("G18").Value = input_values["end_date"]
+                date_epoch = WINDOWS_EPOCH
+                with suppress(Exception):
+                    if wb_new.Date1904:
+                        date_epoch = MAC_EPOCH
+                overview.Range("C18").Value2 = self._to_excel_date_serial(input_values["start_date"], epoch=date_epoch)
+                overview.Range("G18").Value2 = self._to_excel_date_serial(input_values["end_date"], epoch=date_epoch)
+                overview.Range("C18").NumberFormat = "yyyy/m/d"
+                overview.Range("G18").NumberFormat = "yyyy/m/d"
 
-                factory_site = self.factory_site.strip() if isinstance(self.factory_site, str) else ""
+                factory_site = self.normalize_factory_site(self.factory_site)
                 factory_info = FACTORY_OVERVIEW_INFO.get(factory_site)
-                if factory_info:
+                if not factory_site:
+                    overview.Range("C3").Value = ""
+                    overview.Range("C4").Value = ""
+                elif factory_info:
                     overview.Range("C3").Value = factory_info["name"]
                     overview.Range("C4").Value = factory_info["address"]
 
                 self._check_cancel()
+                self._notify_status("重新整理 Excel 公式與查詢...")
                 session.refresh_all_and_wait(
                     wb_new,
                     retry_count=self.runtime_config["refresh_retry_count"],
@@ -1933,7 +2431,9 @@ class ExcelApp:
                     timeout_sec=self.runtime_config["refresh_timeout_sec"],
                     poll_sec=self.runtime_config["refresh_poll_sec"],
                     cancel_callback=self._check_cancel,
+                    progress_callback=self._make_stage_progress_callback(95, 99),
                 )
+                self._notify_status("保存重新整理後的結果...")
                 session.save_with_retry(
                     wb_new,
                     retry_count=self.runtime_config["save_retry_count"],
@@ -1943,7 +2443,7 @@ class ExcelApp:
                 session.close_workbook(wb_tpl, save_changes=False)
                 session.close_workbook(wb_new, save_changes=False)
                 if self.update_progress_smooth:
-                    self.update_progress_smooth(95, 100, step=1, delay=0.01)
+                    self.update_progress_smooth(99, 100, step=1, delay=0.01)
                 ok = True
             # 成功的回傳值
             self.merged_file = new_file_path
@@ -2019,11 +2519,13 @@ class ExcelApp:
             return result
         try:
             self._notify_status("開始更新 INPUT 工作表")
+            self._emit_progress(0)
             with ExcelComSession(
                 visible=False,
                 display_alerts=False,
                 enable_events=False,
                 screen_updating=False,
+                logger=self.logger,
             ) as session:
                 workbook = session.open_workbook(
                     file_path,
@@ -2032,6 +2534,7 @@ class ExcelApp:
                     retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
                     timeout_sec=self.runtime_config["open_timeout_sec"],
                 )
+                self._emit_progress(10)
                 for conn in workbook.Connections:
                     with suppress(Exception):
                         if hasattr(conn, "OLEDBConnection") and hasattr(conn.OLEDBConnection, "RefreshOnFileOpen"):
@@ -2041,19 +2544,31 @@ class ExcelApp:
                             conn.OLEDBConnection.EnableRefresh = False
 
                 ws = workbook.Worksheets("INPUT")
-                if str(product).strip():
-                    ws.Cells(1, 2).Value = product
-                if str(start_date).strip():
-                    ws.Cells(2, 2).Value = start_date
-                if str(end_date).strip():
-                    ws.Cells(3, 2).Value = end_date
+                input_range = ws.Range("B1:B3")
+                current_values = input_range.Value
+                if not current_values:
+                    current_values = (("",), ("",), ("",))
 
+                updated_values = [list(row) for row in current_values]
+                if str(product).strip():
+                    updated_values[0][0] = product
+                if str(start_date).strip():
+                    updated_values[1][0] = start_date
+                if str(end_date).strip():
+                    updated_values[2][0] = end_date
+
+                input_range.Value = tuple((row[0],) for row in updated_values)
+                self._emit_progress(20)
+
+                self._notify_status("儲存 INPUT 更新內容...")
                 session.save_with_retry(
                     workbook,
                     retry_count=self.runtime_config["save_retry_count"],
                     retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
                     timeout_sec=self.runtime_config["save_timeout_sec"],
                 )
+                self._emit_progress(30)
+                self._notify_status("重新整理 Excel 連線與公式...")
                 session.refresh_all_and_wait(
                     workbook,
                     retry_count=self.runtime_config["refresh_retry_count"],
@@ -2062,15 +2577,19 @@ class ExcelApp:
                     timeout_sec=self.runtime_config["refresh_timeout_sec"],
                     poll_sec=self.runtime_config["refresh_poll_sec"],
                     cancel_callback=self._check_cancel,
+                    progress_callback=self._make_stage_progress_callback(30, 85),
                 )
+                self._notify_status("保存重新整理後的結果...")
                 session.save_with_retry(
                     workbook,
                     retry_count=self.runtime_config["save_retry_count"],
                     retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
                     timeout_sec=self.runtime_config["save_timeout_sec"],
                 )
+                self._emit_progress(95)
                 session.close_workbook(workbook, save_changes=False)
 
+            self._emit_progress(100)
             result = TaskResult(
                 ok=True,
                 message="INPUT 工作表更新完成",
@@ -2116,6 +2635,7 @@ class ExcelApp:
                 display_alerts=False,
                 enable_events=False,
                 screen_updating=False,
+                logger=self.logger,
             ) as session:
                 wb = session.open_workbook(
                     os.path.abspath(result_file),
@@ -2157,11 +2677,35 @@ class ExcelApp:
                     except Exception:
                         pass
 
-    def _generate_report_impl(self, template_choice):
+    def _validate_report_source_workbook(self, result_file):
+        required_sheets = [
+            "overview",
+            "Raw Material",
+            "Manufacturing",
+            "Distribution",
+            "Usage",
+            "Recycling",
+        ]
+        workbook = None
+        try:
+            workbook = openpyxl.load_workbook(result_file, read_only=True, data_only=False)
+            missing_sheets = [sheet for sheet in required_sheets if sheet not in workbook.sheetnames]
+        except Exception as exc:
+            raise ValueError(f"無法讀取報告來源檔案：{result_file}\n{exc}") from exc
+        finally:
+            if workbook is not None:
+                with suppress(Exception):
+                    workbook.close()
+
+        if missing_sheets:
+            missing_text = "、".join(missing_sheets)
+            raise ValueError(f"報告來源檔案不是已處理盤查表單，缺少工作表：{missing_text}")
+
+    def _generate_report_impl(self, template_choice, result_file=None):
         """
         數據處理完後產生完整報告書流程：
         1. 根據 template_choice 選擇 Word 模板
-        2. 使用 self.result_file 作為數據來源，依序執行盤查表單各項函式：
+        2. 使用指定的 result_file 或 self.result_file 作為數據來源，依序執行盤查表單各項函式：
             - 統整各工作表數據 (process_all_worksheets)
             - 將數據插入 Word (insert_data_to_word)
             - 生成圖表 (generate_bar_chart)
@@ -2173,13 +2717,24 @@ class ExcelApp:
         self.was_cancelled = False
         self._check_cancel()
         # 檢查是否已有數據處理過的檔案，才能進行
-        if not hasattr(self, 'result_file') or not hasattr(self, 'report_file'):
-            messagebox.showerror("錯誤", "請先處理檔案，再產生報告。")
-            return
+        selected_result_file = result_file or getattr(self, "result_file", "")
+        if not selected_result_file:
+            self.last_error = "請先處理檔案或選擇已處理盤查表單，再產生報告。"
+            return False
         # === 1. 讀取 Excel 盤查表單，並開啟 Word 模板 ===
         # 使用先前數據處理後產生的檔案名稱
-        result_file = os.path.abspath(self.result_file)
+        result_file = os.path.abspath(selected_result_file)
+        if not os.path.exists(result_file):
+            self.last_error = f"找不到已處理盤查表單：{result_file}"
+            return False
+        self.result_file = result_file
         print(result_file)
+
+        try:
+            self._validate_report_source_workbook(result_file)
+        except ValueError as e:
+            self.last_error = str(e)
+            return False
 
         # # test code
         # result_file = r'D:\OneDrive - Accton Technology Corporation\Python\code\Excel_Vlookup_Python\結果\result_20250519_174550.xlsx'
@@ -2196,28 +2751,21 @@ class ExcelApp:
                 messagebox.showerror("錯誤", f"{e}")
                 return  False
 
-        base_dir = os.path.dirname(os.path.abspath(__file__))   # 取得目前 script 所在的資料夾
         self._check_cancel()
         # 依據 template_choice 選擇不同模板
-        if template_choice == "竹南":
-            template_file = os.path.join(base_dir, "智邦-產品碳足跡盤查總報告書_竹南_temp.docx")
-        elif template_choice == "竹北":
-            template_file = os.path.join(base_dir, "智邦-產品碳足跡盤查總報告書_竹北_temp.docx")
-        elif template_choice == "越南":
-            template_file = os.path.join(base_dir, "智邦-產品碳足跡盤查總報告書_越南_temp.docx")
-        else:
+        template_filename = REPORT_TEMPLATE_FILENAMES.get(template_choice)
+        if not template_filename:
             messagebox.showerror("錯誤", "未知的報告模板選項")
             return
+        template_file = self._get_required_resource_path(
+            template_filename,
+            "Word 報告模板",
+            os.path.join(self.base_dir, template_filename),
+        )
         if self.update_progress_smooth:
             self.update_progress_smooth(0, 10, step=1, delay=0.02)  # 第一階段完成：10%
         
         # 開啟選定的 Word 模板
-        if not os.path.exists(template_file):
-            messagebox.showerror(
-                "錯誤",
-                f"找不到 Word 模板檔：{template_file}"
-            )
-            return  False
         try:
             self._check_cancel()
             doc = Document(template_file)
@@ -2371,9 +2919,9 @@ class ExcelApp:
             group_data = df.iloc[start_idx:end_idx, :]
 
             # 删除第一列和第二列的无效数据，并将第三列作为列标题
-            group_data = group_data.iloc[2:, 1:]
+            group_data = group_data.iloc[2:, 1:].copy()
             group_data.columns = group_data.iloc[0, :]
-            group_data = group_data.iloc[1:, :]
+            group_data = group_data.iloc[1:, :].copy()
 
             num_cols = [
             'fossil(kg CO2-eq)',
@@ -2384,7 +2932,7 @@ class ExcelApp:
             # 1) 型別轉換與空值補 0
             for c in num_cols:
                 self._check_cancel()
-                group_data[c] = group_data[c].astype(float).fillna(0)
+                group_data[c] = pd.to_numeric(group_data[c], errors='coerce').fillna(0)
             # 2) 過濾：只保留「至少一個數值欄位非 0」的列
             mask = group_data[num_cols].sum(axis=1) != 0
             group_data = group_data.loc[mask]
