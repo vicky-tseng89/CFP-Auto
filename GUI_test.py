@@ -445,14 +445,30 @@ class GUI:
         self.root.after(0, wrapper)
         done.wait()
 
-    def show_info(self, title, message, wait=True):
-        self.run_on_main(lambda: messagebox.showinfo(title, message), wait=wait)
+    def show_info(self, title, message, wait=True, close_progress=False):
+        def _show():
+            if close_progress:
+                self.close_progress_window(wait=True)
+            messagebox.showinfo(title, message)
+        self.run_on_main(_show, wait=wait)
 
     def show_warning(self, title, message, wait=False):
         self.run_on_main(lambda: messagebox.showwarning(title, message), wait=wait)
 
     def show_error(self, title, message, wait=False):
         self.run_on_main(lambda: messagebox.showerror(title, message), wait=wait)
+
+    def _extract_process_error(self, result):
+        if isinstance(result, dict):
+            err = result.get("error")
+            if err:
+                return err
+        last_err = getattr(self.excel, "last_error", None)
+        if last_err:
+            return last_err
+        if result is None:
+            return "process_file() 沒有回傳結果，請檢查 process_file 成功路徑的 return。"
+        return f"非預期回傳內容：{result!r}"
 
     def ask_yes_no(self, title, message):
         response = {"value": False}
@@ -539,8 +555,7 @@ class GUI:
         result = self.excel.transform_sheet()
 
         if result:      # 成功：顯示完成並關視窗（都丟回主執行緒）
-            self.root.after(0, lambda: messagebox.showinfo("完成", f"轉換完成：{result}"))
-            self.close_progress_window(wait=False)
+            self.show_info("完成", f"轉換完成：{result}", wait=False, close_progress=True)
         else:           # 失敗：讀錯誤訊息並顯示，再關視窗
             msg = getattr(self.excel, "last_error", "處理失敗（未提供詳細訊息）")
             self.root.after(0, lambda: messagebox.showerror("錯誤", msg))
@@ -555,9 +570,9 @@ class GUI:
             result = self.excel.process_file()
             if result and result.get("ok"):
                 paths = f"{result['result_file']}，{result['report_file']}"
-                self.show_info("完成", f"處理完成，已輸出檔案：{paths}")
+                self.show_info("完成", f"處理完成，已輸出檔案：{paths}", close_progress=True)
             else:
-                err = (result or {}).get("error", "未知錯誤")
+                err = self._extract_process_error(result)
                 self.show_error("錯誤", f"處理檔案時出現錯誤：{err}")
         finally:
             self.close_progress_window()
@@ -609,9 +624,9 @@ class GUI:
                 process_result = self.excel.process_file(file_path=new_file_path)
                 if process_result and process_result.get("ok"):
                     paths = f"{process_result['result_file']}，{process_result['report_file']}"
-                    self.show_info("完成", f"完整流程完成，已輸出檔案：{paths}")
+                    self.show_info("完成", f"完整流程完成，已輸出檔案：{paths}", close_progress=True)
                 else:
-                    err = (process_result or {}).get("error", "未知錯誤")
+                    err = self._extract_process_error(process_result)
                     self.show_error("錯誤", f"處理全部過程時出現錯誤：{err}")
                 self.close_progress_window()
             else:
@@ -653,10 +668,12 @@ class GUI:
         # 呼叫 ExcelApp 的 generate_report 方法，並將選擇的區域傳入
             output_doc = self.excel.generate_report(selected_area)
             if output_doc:
-                self.root.after(0, lambda: messagebox.showinfo("完整報告書生成", 
-                    f"報告書生成完成，檔案為：{output_doc}"))
-            if self.progress_window:
-                self.close_progress_window()
+                self.show_info(
+                    "完整報告書生成",
+                    f"報告書生成完成，檔案為：{output_doc}",
+                    wait=False,
+                    close_progress=True,
+                )
         except Exception as e:
             # 方法一：用 lambda 的預設參數把 e 綁進去
             self.root.after(0, lambda err=e: (
