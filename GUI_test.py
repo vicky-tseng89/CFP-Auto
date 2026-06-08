@@ -1046,6 +1046,18 @@ class GUI:
             return "process_file() 沒有回傳結果，請檢查 process_file 成功路徑的 return。"
         return f"非預期回傳內容：{result!r}"
 
+    def _extract_process_error(self, result):
+        if isinstance(result, dict):
+            err = result.get("error")
+            if err:
+                return err
+        last_err = getattr(self.excel, "last_error", None)
+        if last_err:
+            return last_err
+        if result is None:
+            return "process_file() 沒有回傳結果，請檢查 process_file 成功路徑的 return。"
+        return f"非預期回傳內容：{result!r}"
+
     def ask_yes_no(self, title, message):
         response = {"value": False}
         def ask():

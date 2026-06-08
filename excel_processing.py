@@ -1588,6 +1588,12 @@ class ExcelApp:
             self.last_error = str(e)
             return {"ok": False, "cancelled": True, "error": str(e)}
 
+            return {
+                "ok": True,
+                "result_file": self.result_file,
+                "report_file": self.report_file,
+            }
+
         except Exception as e:
             err_msg = f"{e}\n{traceback.format_exc()}"
             self.last_error = err_msg
