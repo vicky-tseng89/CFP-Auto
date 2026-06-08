@@ -1,9 +1,15 @@
-from datetime import datetime
+﻿from transport_distance import compute_transport_distance
+from datetime import date, datetime
+from transport_distance import compute_transport_distance_from_queries
+from transport_distance import geocode_place, transport_type_to_mode
+from contextlib import suppress
+from dataclasses import dataclass, field
 from docx import Document
 from docx.shared import Inches
 from docxtpl import DocxTemplate, InlineImage
 from functools import reduce
 from tkinter import filedialog, messagebox
+import logging
 import math
 # import matplotlib
 # matplotlib.use('Agg')  # 強制使用不會開視窗的 Agg 後端
@@ -14,17 +20,301 @@ import os
 import pandas as pd
 import pythoncom
 import re
+import shutil
 import time
 import tkinter as tk
 import win32com.client as win32
 import xlsxwriter
 from openpyxl.styles.colors import Color
+from openpyxl.utils.datetime import MAC_EPOCH, WINDOWS_EPOCH, to_excel
 import traceback
+import unicodedata
+import uuid
+from typing import Any, Dict, List
 
 FACTORY_OVERVIEW_INFO = {
     "竹南": {"name": "竹南廠", "address": "苗栗縣竹南鎮公義里科義街1號1、5樓"},
     "竹北": {"name": "竹北廠", "address": "新竹縣竹北市北興里智慧一路1號"},
 }
+FACTORY_SITE_ALIASES = {
+    "": "",
+    "竹南": "竹南",
+    "竹南廠": "竹南",
+    "竹北": "竹北",
+    "竹北廠": "竹北",
+}
+
+COM_OPEN_RETRY_COUNT = 5
+COM_OPEN_RETRY_DELAY_SEC = 0.5
+COM_OPEN_TIMEOUT_SEC = 30.0
+COM_SAVE_RETRY_COUNT = 10
+COM_SAVE_RETRY_DELAY_SEC = 2.0
+COM_SAVE_TIMEOUT_SEC = 120.0
+COM_REFRESH_SETTLE_SEC = 30.0
+COM_REFRESH_TIMEOUT_SEC = 120.0
+COM_REFRESH_POLL_SEC = 1.0
+COM_REFRESH_RETRY_COUNT = 2
+COM_REFRESH_RETRY_DELAY_SEC = 1.0
+INVALID_EXTERNAL_FORMULA_RE = re.compile(r"\[\d+\]Sheet!", re.IGNORECASE)
+TRANSPORT_LOCATION_MAPPING_FILENAME = "airport_port_land_location_mapping.xlsx"
+RESOURCES_DIRNAME = "resources"
+REPORT_WORKBOOK_TEMPLATE_FILENAME = "report_temp.xlsx"
+PLCI_TABLE_FORMAT_FILENAME = "PLCI_table_format.xlsx"
+REPORT_TEMPLATE_FILENAMES = {
+    "竹南": "智邦-產品碳足跡盤查總報告書_竹南_temp.docx",
+    "竹北": "智邦-產品碳足跡盤查總報告書_竹北_temp.docx",
+    "越南": "智邦-產品碳足跡盤查總報告書_越南_temp.docx",
+}
+CARBON_STAGE_OPTIONS = (
+    ("Raw Material", "原料取得"),
+    ("Manufacturing", "製造"),
+    ("Distribution", "配送"),
+    ("Usage", "使用"),
+    ("Recycling", "廢棄回收"),
+)
+ROAD_TRANSPORT_TYPES = {
+    "road",
+    "rord",
+    "road transport",
+    "local land transport",
+    "land",
+    "truck",
+    "express",
+}
+
+
+@dataclass
+class TaskResult:
+    ok: bool
+    error_code: str = ""
+    message: str = ""
+    artifacts: Dict[str, Any] = field(default_factory=dict)
+    elapsed_ms: int = 0
+    warnings: List[str] = field(default_factory=list)
+
+
+class ExcelComSession:
+    def __init__(
+        self,
+        visible: bool = False,
+        display_alerts: bool = False,
+        enable_events: bool = False,
+        screen_updating: bool = False,
+        logger=None,
+    ):
+        self.visible = visible
+        self.display_alerts = display_alerts
+        self.enable_events = enable_events
+        self.screen_updating = screen_updating
+        self.logger = logger
+        self.excel = None
+        self._opened_workbooks = []
+
+    def __enter__(self):
+        pythoncom.CoInitialize()
+        self.excel = win32.DispatchEx("Excel.Application")
+        self.excel.Visible = self.visible
+        self.excel.DisplayAlerts = self.display_alerts
+        with suppress(Exception):
+            self.excel.EnableEvents = self.enable_events
+        with suppress(Exception):
+            self.excel.ScreenUpdating = self.screen_updating
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for workbook in reversed(self._opened_workbooks):
+            try:
+                workbook.Close(SaveChanges=False)
+            except Exception as close_exc:
+                self._log_cleanup_warning("workbook.Close", close_exc, workbook)
+        self._opened_workbooks.clear()
+        if self.excel is not None:
+            quit_error = None
+            for attempt in range(3):
+                try:
+                    self.excel.Quit()
+                    quit_error = None
+                    break
+                except Exception as exc:
+                    quit_error = exc
+                    if (
+                        hasattr(exc, "args")
+                        and exc.args
+                        and exc.args[0] == -2147418111
+                        and attempt < 2
+                    ):
+                        time.sleep(0.5)
+                        continue
+                    break
+            if quit_error is not None:
+                self._log_cleanup_warning("excel.Quit", quit_error)
+        with suppress(Exception):
+            pythoncom.CoUninitialize()
+        self.excel = None
+        return False
+
+    def _describe_dispatch(self, dispatch_obj) -> str:
+        if dispatch_obj is None:
+            return "<None>"
+        parts = [f"type={type(dispatch_obj).__name__}"]
+        username = getattr(dispatch_obj, "_username_", "")
+        if username:
+            parts.append(f"username={username}")
+        with suppress(Exception):
+            name = getattr(dispatch_obj, "Name", "")
+            if name:
+                parts.append(f"name={name}")
+        with suppress(Exception):
+            full_name = getattr(dispatch_obj, "FullName", "")
+            if full_name:
+                parts.append(f"full_name={full_name}")
+        parts.append(f"repr={dispatch_obj!r}")
+        return ", ".join(parts)
+
+    def _log_cleanup_warning(self, action: str, exc: Exception, dispatch_obj=None):
+        if self.logger is None:
+            return
+        detail = self._describe_dispatch(dispatch_obj) if dispatch_obj is not None else ""
+        if detail:
+            self.logger.warning("ExcelComSession cleanup failed during %s: %s | %s", action, exc, detail)
+        else:
+            self.logger.warning("ExcelComSession cleanup failed during %s: %s", action, exc)
+
+    def open_workbook(
+        self,
+        path: str,
+        *,
+        retry_count: int = COM_OPEN_RETRY_COUNT,
+        retry_delay_sec: float = COM_OPEN_RETRY_DELAY_SEC,
+        timeout_sec: float = COM_OPEN_TIMEOUT_SEC,
+        **kwargs,
+    ):
+        last_error = None
+        start = time.time()
+        attempt = 0
+        while attempt < max(1, retry_count) and (time.time() - start) < max(0.1, timeout_sec):
+            attempt += 1
+            try:
+                workbook = self.excel.Workbooks.Open(path, **kwargs)
+                self._opened_workbooks.append(workbook)
+                return workbook
+            except Exception as exc:
+                last_error = exc
+                time.sleep(retry_delay_sec)
+        if last_error is not None:
+            raise TimeoutError(
+                f"Workbook 開啟失敗（path={path}, retries={attempt}, timeout_sec={timeout_sec}）: {last_error}"
+            ) from last_error
+        raise RuntimeError(f"無法開啟工作簿：{path}")
+
+    def close_workbook(self, workbook, save_changes: bool = False):
+        with suppress(Exception):
+            workbook.Close(SaveChanges=save_changes)
+        with suppress(ValueError):
+            self._opened_workbooks.remove(workbook)
+
+    def save_with_retry(
+        self,
+        workbook,
+        *,
+        retry_count: int = COM_SAVE_RETRY_COUNT,
+        retry_delay_sec: float = COM_SAVE_RETRY_DELAY_SEC,
+        timeout_sec: float = COM_SAVE_TIMEOUT_SEC,
+    ) -> bool:
+        if workbook is None:
+            raise ValueError("Workbook 儲存失敗：workbook 為 None")
+        start = time.time()
+        attempt = 0
+        while attempt < max(1, retry_count) and (time.time() - start) < max(0.1, timeout_sec):
+            attempt += 1
+            try:
+                workbook.Save()
+                return True
+            except Exception as exc:
+                if isinstance(exc, AttributeError):
+                    raise AttributeError(
+                        f"{exc} | workbook_proxy={self._describe_dispatch(workbook)}"
+                    ) from exc
+                if hasattr(exc, "args") and exc.args and exc.args[0] == -2147418111:
+                    time.sleep(retry_delay_sec)
+                    continue
+                raise
+        raise TimeoutError(
+            f"Workbook 儲存逾時（retries={attempt}, timeout_sec={timeout_sec}）"
+        )
+
+    def refresh_all_and_wait(
+        self,
+        workbook,
+        *,
+        retry_count: int = COM_REFRESH_RETRY_COUNT,
+        retry_delay_sec: float = COM_REFRESH_RETRY_DELAY_SEC,
+        settle_sec: float = COM_REFRESH_SETTLE_SEC,
+        timeout_sec: float = COM_REFRESH_TIMEOUT_SEC,
+        poll_sec: float = COM_REFRESH_POLL_SEC,
+        cancel_callback=None,
+        progress_callback=None,
+    ) -> bool:
+        last_error = None
+        last_progress = 0.0
+
+        def _report_progress(fraction: float):
+            nonlocal last_progress
+            if not callable(progress_callback):
+                return
+            try:
+                fraction = float(fraction)
+            except Exception:
+                fraction = 0.0
+            fraction = max(0.0, min(1.0, fraction))
+            if fraction < last_progress:
+                fraction = last_progress
+            last_progress = fraction
+            progress_callback(fraction)
+
+        total_budget = max(0.1, float(settle_sec) + float(timeout_sec))
+        _report_progress(0.0)
+        for _ in range(max(1, retry_count)):
+            try:
+                workbook.RefreshAll()
+                waited = 0.0
+                while waited < settle_sec:
+                    if callable(cancel_callback):
+                        cancel_callback()
+                    time.sleep(0.5)
+                    waited += 0.5
+                    _report_progress(waited / total_budget)
+                start = time.time()
+                while time.time() - start < timeout_sec:
+                    if callable(cancel_callback):
+                        cancel_callback()
+                    all_done = True
+                    for sheet in workbook.Worksheets:
+                        for qt in sheet.QueryTables:
+                            if hasattr(qt, "Refreshing") and qt.Refreshing:
+                                all_done = False
+                                break
+                        if not all_done:
+                            break
+                    if all_done:
+                        _report_progress(1.0)
+                        return True
+                    elapsed = settle_sec + (time.time() - start)
+                    _report_progress(elapsed / total_budget)
+                    time.sleep(poll_sec)
+                last_error = TimeoutError(
+                    f"RefreshAll 逾時（timeout_sec={timeout_sec}, poll_sec={poll_sec}）"
+                )
+            except Exception as exc:
+                last_error = exc
+            time.sleep(retry_delay_sec)
+        if last_error is not None:
+            raise last_error
+        return False
+
+class UserCancelledError(Exception):
+    pass
+
 
 class ExcelApp:
     def __init__(self, status_callback=None, progress_callback=None):
@@ -39,16 +329,273 @@ class ExcelApp:
         self.progress_callback = progress_callback
         self.file_path = None
         self.last_error = None
+        self.last_run_id = ""
+        self.last_technical_summary = ""
         self.error_callback = None
         self._format_cache = {}
         self.factory_site = ""
+        self.cancel_event = None
+        self.was_cancelled = False
+        self.base_dir = self.get_base_dir()
+        self.resources_dir = os.path.join(self.base_dir, RESOURCES_DIRNAME)
+        self.output_root = os.path.join(self.base_dir, "output")
+        self.result_dir = os.path.join(self.output_root, "result")
+        self.report_dir = os.path.join(self.output_root, "report")
+        self.charts_dir = os.path.join(self.output_root, "charts")
+        self.tmp_dir = os.path.join(self.output_root, "tmp")
+        self.spreadsheet_dir = os.path.join(self.output_root, "spreadsheet")
+        self.logs_dir = os.path.join(self.base_dir, "logs")
+        for folder in (
+            self.resources_dir,
+            self.output_root,
+            self.result_dir,
+            self.report_dir,
+            self.charts_dir,
+            self.tmp_dir,
+            self.spreadsheet_dir,
+            self.logs_dir,
+        ):
+            os.makedirs(folder, exist_ok=True)
 
-        # ──────────────────────────────────────────────────────────
-        # 自動在程式路徑下建立「結果」資料夾
-        base_dir = self.get_base_dir()
-        self.output_dir = os.path.join(base_dir, "結果")    # 程式路徑
-        os.makedirs(self.output_dir, exist_ok=True)
-        # ──────────────────────────────────────────────────────────
+        # Backward compatibility for legacy methods.
+        self.output_dir = self.result_dir
+
+        self.runtime_config = {
+            "open_retry_count": COM_OPEN_RETRY_COUNT,
+            "open_retry_delay_sec": COM_OPEN_RETRY_DELAY_SEC,
+            "open_timeout_sec": COM_OPEN_TIMEOUT_SEC,
+            "save_retry_count": COM_SAVE_RETRY_COUNT,
+            "save_retry_delay_sec": COM_SAVE_RETRY_DELAY_SEC,
+            "save_timeout_sec": COM_SAVE_TIMEOUT_SEC,
+            "refresh_retry_count": COM_REFRESH_RETRY_COUNT,
+            "refresh_retry_delay_sec": COM_REFRESH_RETRY_DELAY_SEC,
+            "refresh_settle_sec": COM_REFRESH_SETTLE_SEC,
+            "refresh_timeout_sec": COM_REFRESH_TIMEOUT_SEC,
+            "refresh_poll_sec": COM_REFRESH_POLL_SEC,
+        }
+        self.logger = self._build_logger()
+        self._warnings = []
+        self.current_run_id = ""
+        self._transport_place_cache = {}
+        self._transport_route_cache = {}
+        self._transport_endpoint_place_cache = {}
+        self._transport_location_mapping = None
+        self._transport_mapping_missing_warned = False
+
+    def _build_logger(self):
+        logger = logging.getLogger("excel_processing")
+        if logger.handlers:
+            return logger
+        logger.setLevel(logging.INFO)
+        log_path = os.path.join(self.logs_dir, "excel_processing.log")
+        formatter = logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+        logger.propagate = False
+        return logger
+
+    def _new_run_id(self) -> str:
+        return f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+    def _start_task(self, task_name: str):
+        run_id = self._new_run_id()
+        self.current_run_id = run_id
+        self._warnings = []
+        self.last_error = None
+        self.last_run_id = run_id
+        self.last_technical_summary = ""
+        self.was_cancelled = False
+        self._transport_endpoint_place_cache = {}
+        self.logger.info("[run_id=%s] start %s", run_id, task_name)
+        return run_id, time.time()
+
+    def _finish_task_log(self, run_id: str, task_name: str, result: TaskResult):
+        level = logging.INFO if result.ok else logging.ERROR
+        self.logger.log(
+            level,
+            "[run_id=%s] finish %s ok=%s code=%s elapsed_ms=%s message=%s",
+            run_id,
+            task_name,
+            result.ok,
+            result.error_code,
+            result.elapsed_ms,
+            result.message,
+        )
+
+    def _elapsed_ms(self, started_at: float) -> int:
+        return int((time.time() - started_at) * 1000)
+
+    def _emit_progress(self, value):
+        if not callable(self.progress_callback):
+            return
+        try:
+            value = float(value)
+        except Exception:
+            return
+        value = max(0.0, min(100.0, value))
+        self.progress_callback(int(round(value)))
+
+    def _make_stage_progress_callback(self, start, end):
+        try:
+            start = float(start)
+        except Exception:
+            start = 0.0
+        try:
+            end = float(end)
+        except Exception:
+            end = start
+        start = max(0.0, min(100.0, start))
+        end = max(start, min(100.0, end))
+        span = end - start
+
+        def _callback(fraction):
+            try:
+                fraction = float(fraction)
+            except Exception:
+                fraction = 0.0
+            fraction = max(0.0, min(1.0, fraction))
+            self._emit_progress(start + span * fraction)
+
+        return _callback
+
+    def _warn(self, message: str):
+        self._warnings.append(message)
+        self.logger.warning("[run_id=%s] %s", self.current_run_id or "-", message)
+
+    def _result_ok(self, message: str, artifacts: Dict[str, Any], started_at: float) -> TaskResult:
+        return TaskResult(
+            ok=True,
+            message=message,
+            artifacts=artifacts,
+            elapsed_ms=self._elapsed_ms(started_at),
+            warnings=list(self._warnings),
+        )
+
+    def _result_fail(
+        self,
+        *,
+        error_code: str,
+        user_message: str,
+        started_at: float,
+        exc: Exception = None,
+    ) -> TaskResult:
+        technical = traceback.format_exc() if exc is not None else ""
+        if exc is not None:
+            self.logger.exception(
+                "[run_id=%s] %s: %s", self.current_run_id or "-", error_code, user_message
+            )
+        self.last_error = user_message
+        self.last_technical_summary = self.summarize_technical_details(technical)
+        return TaskResult(
+            ok=False,
+            error_code=error_code,
+            message=user_message,
+            artifacts={"technical_details": technical},
+            elapsed_ms=self._elapsed_ms(started_at),
+            warnings=list(self._warnings),
+        )
+
+    @staticmethod
+    def summarize_technical_details(technical: str) -> str:
+        text = str(technical or "").strip()
+        if not text:
+            return ""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if line.startswith("Traceback "):
+                continue
+            if line.startswith('File "'):
+                continue
+            return line
+        return lines[-1] if lines else ""
+
+    def _coerce_task_result(
+        self,
+        *,
+        task_name: str,
+        started_at: float,
+        value,
+        success_message: str,
+        success_artifacts_fn=None,
+    ) -> TaskResult:
+        if isinstance(value, TaskResult):
+            value.elapsed_ms = value.elapsed_ms or self._elapsed_ms(started_at)
+            if not value.warnings:
+                value.warnings = list(self._warnings)
+            return value
+        if isinstance(value, dict):
+            ok = bool(value.get("ok"))
+            if ok:
+                artifacts = dict(value)
+                return self._result_ok(success_message, artifacts=artifacts, started_at=started_at)
+            cancelled = bool(value.get("cancelled"))
+            code = "USER_CANCELLED" if cancelled else "TASK_FAILED"
+            msg = str(value.get("error") or value.get("message") or f"{task_name} 失敗")
+            return TaskResult(
+                ok=False,
+                error_code=code,
+                message=msg,
+                artifacts={"legacy_result": value},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+        if isinstance(value, bool):
+            if value:
+                artifacts = success_artifacts_fn() if callable(success_artifacts_fn) else {}
+                return self._result_ok(success_message, artifacts=artifacts, started_at=started_at)
+            code = "USER_CANCELLED" if self.was_cancelled else "TASK_FAILED"
+            msg = self.last_error or f"{task_name} 失敗"
+            return TaskResult(
+                ok=False,
+                error_code=code,
+                message=msg,
+                artifacts={},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+        if isinstance(value, str) and value:
+            artifacts = success_artifacts_fn() if callable(success_artifacts_fn) else {}
+            artifacts = dict(artifacts)
+            artifacts.setdefault("path", value)
+            return self._result_ok(success_message, artifacts=artifacts, started_at=started_at)
+        code = "USER_CANCELLED" if self.was_cancelled else "TASK_FAILED"
+        msg = self.last_error or f"{task_name} 回傳了不支援的結果型別"
+        return TaskResult(
+            ok=False,
+            error_code=code,
+            message=msg,
+            artifacts={"legacy_result": value},
+            elapsed_ms=self._elapsed_ms(started_at),
+            warnings=list(self._warnings),
+        )
+
+    def _chart_path(self, filename: str) -> str:
+        path = os.path.join(self.charts_dir, filename)
+        if not hasattr(self, "_chart_artifacts"):
+            self._chart_artifacts = []
+        self._chart_artifacts.append(path)
+        return path
+
+    def _cleanup_chart_artifacts(self):
+        paths = list(getattr(self, "_chart_artifacts", []))
+        self._chart_artifacts = []
+        for path in paths:
+            with suppress(Exception):
+                if os.path.exists(path):
+                    os.remove(path)
+        # Backward cleanup for legacy files that may have been written to project root.
+        with suppress(Exception):
+            for name in os.listdir(self.base_dir):
+                lower = name.lower()
+                if (lower.startswith("bar_chart_") or lower.startswith("pie_chart_")) and lower.endswith(".png"):
+                    os.remove(os.path.join(self.base_dir, name))
 
     def _notify_status(self, message):
         """
@@ -62,6 +609,51 @@ class ExcelApp:
             callback = self._no_op_status_callback
             self._has_status_callback = False
         callback(message)
+
+    def _sanitize_invalid_external_formulas(self, workbook) -> int:
+        """
+        Remove legacy formulas like [1]Sheet! that Excel repairs/removes on open.
+        openpyxl can preserve them, but Excel COM rejects the workbook before repair.
+        """
+        removed_cells = []
+        for sheet in workbook.worksheets:
+            for row in sheet.iter_rows():
+                for cell in row:
+                    value = cell.value
+                    if (
+                        isinstance(value, str)
+                        and value.startswith("=")
+                        and INVALID_EXTERNAL_FORMULA_RE.search(value)
+                    ):
+                        removed_cells.append(f"{sheet.title}!{cell.coordinate}")
+                        cell.value = None
+
+        if removed_cells:
+            sample = ", ".join(removed_cells[:8])
+            if len(removed_cells) > 8:
+                sample += ", ..."
+            self._warn(
+                f"已移除 {len(removed_cells)} 個 Excel 無效外部參照公式，避免結果檔開啟時修復失敗。"
+                f" 位置: {sample}"
+            )
+        return len(removed_cells)
+
+    def set_cancel_event(self, cancel_event):
+        self.cancel_event = cancel_event
+
+    def clear_cancel(self):
+        self.was_cancelled = False
+        if self.cancel_event is not None:
+            self.cancel_event.clear()
+
+    def request_cancel(self):
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+
+    def _check_cancel(self):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            self.was_cancelled = True
+            raise UserCancelledError("Operation cancelled by user.\n已取消作業，未寫入任何檔案。")
 
     def get_base_dir(self):
         """
@@ -85,51 +677,813 @@ class ExcelApp:
         self.file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
         self.file_entry.delete(0, tk.END)
         self.file_entry.insert(0, self.file_path)
-    def process_file(self, file_path=None):
+
+    def transform_sheet(self) -> TaskResult:
+        run_id, started_at = self._start_task("transform_sheet")
+        try:
+            raw = self._transform_sheet_impl()
+            result = self._coerce_task_result(
+                task_name="transform_sheet",
+                started_at=started_at,
+                value=raw,
+                success_message="Transform 完成",
+                success_artifacts_fn=lambda: {"merged_file": getattr(self, "merged_file", "")},
+            )
+        except UserCancelledError as exc:
+            self.was_cancelled = True
+            result = self._result_fail(
+                error_code="USER_CANCELLED",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
+            )
+        except Exception as exc:
+            result = self._result_fail(
+                error_code="TRANSFORM_EXCEPTION",
+                user_message="Transform 發生未預期錯誤",
+                started_at=started_at,
+                exc=exc,
+            )
+        result.artifacts.setdefault("run_id", run_id)
+        self._finish_task_log(run_id, "transform_sheet", result)
+        return result
+
+    def process_file(self, file_path=None, selected_stages=None, calculate_distances=True) -> TaskResult:
+        run_id, started_at = self._start_task("process_file")
+        try:
+            raw = self._process_file_impl(
+                file_path=file_path,
+                selected_stages=selected_stages,
+                calculate_distances=calculate_distances,
+            )
+            result = self._coerce_task_result(
+                task_name="process_file",
+                started_at=started_at,
+                value=raw,
+                success_message="資料處理完成",
+                success_artifacts_fn=lambda: {
+                    "result_file": getattr(self, "result_file", ""),
+                    "report_file": getattr(self, "report_file", ""),
+                },
+            )
+        except ValueError as exc:
+            result = self._result_fail(
+                error_code="INVALID_STAGE_SELECTION",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
+            )
+        except UserCancelledError as exc:
+            self.was_cancelled = True
+            result = self._result_fail(
+                error_code="USER_CANCELLED",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
+            )
+        except Exception as exc:
+            result = self._result_fail(
+                error_code="PROCESS_EXCEPTION",
+                user_message="資料處理發生未預期錯誤",
+                started_at=started_at,
+                exc=exc,
+            )
+        result.artifacts.setdefault("run_id", run_id)
+        self._finish_task_log(run_id, "process_file", result)
+        return result
+
+    def generate_report(self, template_choice, result_file=None) -> TaskResult:
+        run_id, started_at = self._start_task("generate_report")
+        try:
+            raw = self._generate_report_impl(template_choice, result_file=result_file)
+            result = self._coerce_task_result(
+                task_name="generate_report",
+                started_at=started_at,
+                value=raw,
+                success_message="報告產生完成",
+                success_artifacts_fn=lambda: {
+                    "report_doc": raw if isinstance(raw, str) else "",
+                    "source_file": os.path.abspath(result_file) if result_file else getattr(self, "result_file", ""),
+                },
+            )
+        except UserCancelledError as exc:
+            self.was_cancelled = True
+            result = self._result_fail(
+                error_code="USER_CANCELLED",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
+            )
+        except Exception as exc:
+            result = self._result_fail(
+                error_code="REPORT_EXCEPTION",
+                user_message="報告產生發生未預期錯誤",
+                started_at=started_at,
+                exc=exc,
+            )
+        self._cleanup_chart_artifacts()
+        result.artifacts.setdefault("run_id", run_id)
+        self._finish_task_log(run_id, "generate_report", result)
+        return result
+
+    def process_all(self) -> TaskResult:
+        run_id, started_at = self._start_task("process_all")
+        if not self.file_path:
+            result = TaskResult(
+                ok=False,
+                error_code="MISSING_INPUT",
+                message="請選擇 Excel 文件",
+                artifacts={"run_id": run_id},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+            self._finish_task_log(run_id, "process_all", result)
+            return result
+        transform_result = self.transform_sheet()
+        if not transform_result.ok:
+            transform_result.elapsed_ms = self._elapsed_ms(started_at)
+            transform_result.artifacts["run_id"] = run_id
+            self._finish_task_log(run_id, "process_all", transform_result)
+            return transform_result
+
+        merged_path = (
+            transform_result.artifacts.get("path")
+            or transform_result.artifacts.get("merged_file")
+            or transform_result.message
+        )
+        process_result = self.process_file(file_path=merged_path if isinstance(merged_path, str) else None)
+        process_result.elapsed_ms = self._elapsed_ms(started_at)
+        process_result.artifacts["run_id"] = run_id
+        if process_result.ok:
+            process_result.message = "Transform + Process 完成"
+            process_result.warnings = list(self._warnings + process_result.warnings)
+        self._finish_task_log(run_id, "process_all", process_result)
+        return process_result
+
+    @staticmethod
+    def _normalize_column_name(value):
+        if value is None:
+            return ""
+        return re.sub(r"\s+", " ", str(value).strip().lower())
+
+    def _find_table_column(self, columns, target_name):
+        target = self._normalize_column_name(target_name)
+        for idx, name in enumerate(columns, start=1):
+            if self._normalize_column_name(name) == target:
+                return idx, name
+        return None, None
+
+    @staticmethod
+    def _coerce_numeric(value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float, np.number)):
+            if pd.isna(value):
+                return None
+            return float(value)
+        text = str(value).strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _to_excel_date_serial(value, epoch=WINDOWS_EPOCH):
+        if value is None or value == "":
+            return ""
+        if pd.isna(value):
+            return ""
+        if isinstance(value, datetime):
+            return int(to_excel(value.date(), epoch=epoch))
+        if isinstance(value, date):
+            return int(to_excel(value, epoch=epoch))
+
+        text = str(value).strip()
+        if not text:
+            return ""
+        parsed = pd.to_datetime(text, errors="coerce")
+        if pd.isna(parsed):
+            return text
+        return int(to_excel(parsed.date(), epoch=epoch))
+
+    @staticmethod
+    def _normalize_transport_lookup_key(value):
+        if value is None:
+            return ""
+        text = unicodedata.normalize("NFKC", str(value).strip())
+        text = re.sub(r"\s+", " ", text)
+        return text.casefold()
+
+    def _get_cached_endpoint_place(self, endpoint_text):
+        return self._transport_endpoint_place_cache.get(
+            self._normalize_transport_lookup_key(endpoint_text)
+        )
+
+    def _cache_endpoint_place(self, endpoint_text, place):
+        key = self._normalize_transport_lookup_key(endpoint_text)
+        if not key or not isinstance(place, dict):
+            return
+        try:
+            lat = float(place.get("lat"))
+            lon = float(place.get("lon"))
+        except (TypeError, ValueError):
+            return
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return
+        self._transport_endpoint_place_cache[key] = {
+            "query": str(place.get("query") or endpoint_text or "").strip(),
+            "lat": lat,
+            "lon": lon,
+            "label": str(place.get("label") or endpoint_text or "").strip(),
+            "provider": str(place.get("provider") or "previous_segment"),
+        }
+
+    def _is_road_transport_type(self, transport_type):
+        normalized = self._normalize_column_name(transport_type)
+        normalized = re.sub(r"[\s\-_/,;:]+", " ", normalized).strip()
+        return normalized in ROAD_TRANSPORT_TYPES
+
+    def _resource_candidates(self, filename, *legacy_paths):
+        candidates = [os.path.join(self.resources_dir, filename), *legacy_paths]
+        unique_candidates = []
+        seen = set()
+        for path in candidates:
+            normalized = os.path.normcase(os.path.normpath(path))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_candidates.append(path)
+        return unique_candidates
+
+    def _find_existing_resource(self, filename, *legacy_paths):
+        return next(
+            (path for path in self._resource_candidates(filename, *legacy_paths) if os.path.exists(path)),
+            None,
+        )
+
+    def _get_required_resource_path(self, filename, label, *legacy_paths):
+        resource_path = self._find_existing_resource(filename, *legacy_paths)
+        if resource_path:
+            return resource_path
+
+        searched_paths = "\n".join(self._resource_candidates(filename, *legacy_paths))
+        raise FileNotFoundError(f"找不到{label}：{filename}\n已檢查路徑：\n{searched_paths}")
+
+    def _transport_mapping_candidates(self):
+        return self._resource_candidates(
+            TRANSPORT_LOCATION_MAPPING_FILENAME,
+            os.path.join(self.spreadsheet_dir, TRANSPORT_LOCATION_MAPPING_FILENAME),
+            os.path.join(self.base_dir, "output", "spreadsheet", TRANSPORT_LOCATION_MAPPING_FILENAME),
+            os.path.join(self.base_dir, TRANSPORT_LOCATION_MAPPING_FILENAME),
+        )
+
+    def _load_transport_location_mapping(self):
+        if self._transport_location_mapping is not None:
+            return self._transport_location_mapping
+
+        mapping_path = next(
+            (path for path in self._transport_mapping_candidates() if os.path.exists(path)),
+            None,
+        )
+        if not mapping_path:
+            if not self._transport_mapping_missing_warned:
+                self._warn(
+                    f"找不到運輸端點對照表 {TRANSPORT_LOCATION_MAPPING_FILENAME}，Road 端點將直接使用原始文字查詢。"
+                )
+                self._transport_mapping_missing_warned = True
+            self._transport_location_mapping = {}
+            return self._transport_location_mapping
+
+        mapping = {}
+        copied_mapping_path = None
+        try:
+            try:
+                workbook = openpyxl.load_workbook(mapping_path, read_only=True, data_only=True)
+            except PermissionError:
+                copied_mapping_path = os.path.join(
+                    self.tmp_dir,
+                    f"{os.path.splitext(TRANSPORT_LOCATION_MAPPING_FILENAME)[0]}_readcopy_{os.getpid()}.xlsx",
+                )
+                shutil.copy2(mapping_path, copied_mapping_path)
+                workbook = openpyxl.load_workbook(copied_mapping_path, read_only=True, data_only=True)
+
+            def add_lookup(raw_key, record, *, overwrite=False):
+                key = self._normalize_transport_lookup_key(raw_key)
+                if not key:
+                    return
+                if overwrite or key not in mapping:
+                    mapping[key] = record
+
+            def load_mapping_sheet(worksheet, *, overwrite):
+                rows = worksheet.iter_rows(values_only=True)
+                headers = next(rows, None)
+                if not headers:
+                    return
+
+                header_index = {
+                    self._normalize_transport_lookup_key(name): idx
+                    for idx, name in enumerate(headers)
+                    if name is not None
+                }
+
+                def col(name):
+                    return header_index.get(self._normalize_transport_lookup_key(name))
+
+                lookup_idx = col("lookup_key")
+                road_location_idx = col("road_location_for_geocode")
+                aliases_idx = col("aliases")
+                if lookup_idx is None or road_location_idx is None:
+                    return
+
+                for row in rows:
+                    if not row:
+                        continue
+                    lookup_key = row[lookup_idx] if lookup_idx < len(row) else None
+                    road_location = row[road_location_idx] if road_location_idx < len(row) else None
+                    if not lookup_key or not road_location:
+                        continue
+                    record = {
+                        str(headers[idx]): row[idx] if idx < len(row) else None
+                        for idx in range(len(headers))
+                        if headers[idx] is not None
+                    }
+                    record["mapping_path"] = mapping_path
+                    record["mapping_sheet"] = worksheet.title
+                    add_lookup(lookup_key, record, overwrite=overwrite)
+
+                    aliases = row[aliases_idx] if aliases_idx is not None and aliases_idx < len(row) else None
+                    for alias in str(aliases or "").split(";"):
+                        add_lookup(alias.strip(), record)
+
+            if "Source" in workbook.sheetnames:
+                load_mapping_sheet(workbook["Source"], overwrite=False)
+            if "mapping" in workbook.sheetnames:
+                load_mapping_sheet(workbook["mapping"], overwrite=True)
+            if not mapping and workbook.sheetnames:
+                load_mapping_sheet(workbook.active, overwrite=True)
+
+            workbook.close()
+            if copied_mapping_path:
+                with suppress(Exception):
+                    os.remove(copied_mapping_path)
+        except Exception as exc:
+            self._warn(
+                f"讀取運輸端點對照表失敗，Road 端點將直接使用原始文字查詢: {mapping_path} | {exc}"
+            )
+            mapping = {}
+            if copied_mapping_path:
+                with suppress(Exception):
+                    os.remove(copied_mapping_path)
+
+        self._transport_location_mapping = mapping
+        return self._transport_location_mapping
+
+    @staticmethod
+    def normalize_factory_site(factory_site):
+        text = str(factory_site or "").strip()
+        return FACTORY_SITE_ALIASES.get(text, text)
+
+    def _apply_factory_overview_info(self, workbook):
+        if "overview" not in workbook.sheetnames:
+            return
+
+        factory_site = self.normalize_factory_site(self.factory_site)
+        overview = workbook["overview"]
+        if not factory_site:
+            overview["C3"] = ""
+            overview["C4"] = ""
+            return
+
+        factory_info = FACTORY_OVERVIEW_INFO.get(factory_site)
+        if factory_info:
+            overview["C3"] = factory_info["name"]
+            overview["C4"] = factory_info["address"]
+
+    def _resolve_road_transport_endpoint(self, transport_type, endpoint):
+        return self._resolve_road_transport_endpoint_details(transport_type, endpoint)["query"]
+
+    @staticmethod
+    def _record_lat_lon(record):
+        if not record:
+            return None
+        try:
+            lat = float(record.get("latitude"))
+            lon = float(record.get("longitude"))
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return None
+        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            return None
+        return lat, lon
+
+    def _resolve_road_transport_endpoint_details(self, transport_type, endpoint):
+        endpoint_text = str(endpoint or "").strip()
+        if not endpoint_text or not self._is_road_transport_type(transport_type):
+            return {"query": endpoint_text, "record": None, "lat_lon": None, "place": None}
+
+        mapping = self._load_transport_location_mapping()
+        record = mapping.get(self._normalize_transport_lookup_key(endpoint_text))
+        if record:
+            return {
+                "query": str(record.get("road_location_for_geocode") or endpoint_text).strip(),
+                "record": record,
+                "lat_lon": self._record_lat_lon(record),
+                "place": None,
+            }
+
+        cached_place = self._get_cached_endpoint_place(endpoint_text)
+        if cached_place is not None:
+            return {
+                "query": endpoint_text,
+                "record": None,
+                "lat_lon": (float(cached_place["lat"]), float(cached_place["lon"])),
+                "place": dict(cached_place),
+            }
+
+        return {"query": endpoint_text, "record": None, "lat_lon": None, "place": None}
+
+    def _transport_place_from_endpoint_details(self, endpoint_details, transport_type):
+        cached_place = endpoint_details.get("place")
+        if isinstance(cached_place, dict):
+            return dict(cached_place)
+        lat_lon = endpoint_details.get("lat_lon")
+        query = endpoint_details.get("query") or ""
+        if lat_lon is not None:
+            lat, lon = lat_lon
+            record = endpoint_details.get("record") or {}
+            return {
+                "query": query,
+                "lat": lat,
+                "lon": lon,
+                "label": str(record.get("name_en") or record.get("lookup_key") or query),
+                "provider": str(record.get("mapping_sheet") or "mapping"),
+            }
+        return geocode_place(
+            query,
+            transport_type=transport_type,
+            cache=self._transport_place_cache,
+        )
+
+    def calculate_transport_distances(self, workbook, transport_tables, sheet_name="Distribution", table_indexes=None):
+        if sheet_name not in workbook.sheetnames:
+            self._warn(f"找不到 {sheet_name} 工作表，略過距離計算。")
+            return transport_tables
+
+        sheet = workbook[sheet_name]
+        is_raw_material = self._normalize_column_name(sheet_name) == "raw material"
+        pending_jobs = []
+        route_jobs = {}
+        route_keys = []
+        updated_count = 0
+        skipped_existing_count = 0
+        table_index_set = set(table_indexes) if table_indexes is not None else None
+
+        def column_name_at(columns, column_idx):
+            if column_idx is None or column_idx < 1 or column_idx > len(columns):
+                return None
+            return columns[column_idx - 1]
+
+        def raw_numeric_factor(row, column_name):
+            if column_name is None:
+                return None
+            value = row.get(column_name)
+            if value is None or value == "" or pd.isna(value):
+                return 0.0
+            return self._coerce_numeric(value)
+
+        def calculate_ton_km_factor(row, weight_col_name, raw_material_col_names=None):
+            if is_raw_material:
+                if raw_material_col_names is None:
+                    return None
+                manufacturer_alloc = raw_numeric_factor(row, raw_material_col_names["manufacturer_alloc"])
+                part_source_alloc = raw_numeric_factor(row, raw_material_col_names["part_source_alloc"])
+                weight_parts = raw_numeric_factor(row, raw_material_col_names["weight_parts"])
+                bom_quantity = raw_numeric_factor(row, raw_material_col_names["bom_quantity"])
+                if None in (manufacturer_alloc, part_source_alloc, weight_parts, bom_quantity):
+                    return None
+                return weight_parts * bom_quantity * part_source_alloc * manufacturer_alloc / 1000.0
+
+            if weight_col_name is None:
+                return None
+            weight_kg = self._coerce_numeric(row.get(weight_col_name))
+            if weight_kg is None:
+                return None
+            return weight_kg / 1000.0
+
+        for table_idx, (start_idx, sheet_data) in enumerate(transport_tables, start=1):
+            if table_index_set is not None and table_idx not in table_index_set:
+                continue
+
+            distance_col_idx, distance_col_name = self._find_table_column(sheet_data.columns, "distance transported (km)")
+            _, start_col_name = self._find_table_column(sheet_data.columns, "starting point")
+            _, end_col_name = self._find_table_column(sheet_data.columns, "end point")
+            _, transport_col_name = self._find_table_column(sheet_data.columns, "type of transport")
+            ton_km_col_idx, ton_km_col_name = self._find_table_column(sheet_data.columns, "Ton‧Km")
+            _, weight_col_name = self._find_table_column(sheet_data.columns, "Weight (product+package)（Kg）")
+            if ton_km_col_name is not None:
+                sheet_data[ton_km_col_name] = sheet_data[ton_km_col_name].astype(object)
+            raw_material_col_names = None
+            if is_raw_material:
+                _, manufacturer_alloc_col_name = self._find_table_column(
+                    sheet_data.columns,
+                    "allocated proportion (Manufacturer)",
+                )
+                _, part_source_alloc_col_name = self._find_table_column(
+                    sheet_data.columns,
+                    "allocated proportion (Part source)",
+                )
+                _, weight_parts_col_name = self._find_table_column(sheet_data.columns, "Weight of Parts")
+                _, bom_quantity_col_name = self._find_table_column(sheet_data.columns, "BOM Quantity")
+                next_column_idx = distance_col_idx if distance_col_idx is not None else 0
+                raw_material_col_names = {
+                    "manufacturer_alloc": manufacturer_alloc_col_name
+                    or column_name_at(sheet_data.columns, next_column_idx + 1),
+                    "part_source_alloc": part_source_alloc_col_name
+                    or column_name_at(sheet_data.columns, next_column_idx + 2),
+                    "weight_parts": weight_parts_col_name
+                    or column_name_at(sheet_data.columns, next_column_idx + 3),
+                    "bom_quantity": bom_quantity_col_name
+                    or column_name_at(sheet_data.columns, next_column_idx + 4),
+                }
+
+            required = {
+                "starting point": start_col_name,
+                "end point": end_col_name,
+                "type of transport": transport_col_name,
+                "distance transported (km)": distance_col_name,
+            }
+            missing = [name for name, actual in required.items() if actual is None]
+            if missing:
+                raise ValueError(f"【{sheet_name} 第 {table_idx} 個表格】缺少必要欄位: {missing}")
+
+            for row_offset, row in sheet_data.iterrows():
+                self._check_cancel()
+                excel_row = start_idx + 4 + row_offset
+                existing_distance_km = self._coerce_numeric(row.get(distance_col_name))
+                if existing_distance_km is not None and not math.isclose(existing_distance_km, 0.0, abs_tol=1e-12):
+                    ton_km_factor = calculate_ton_km_factor(row, weight_col_name, raw_material_col_names)
+                    if ton_km_col_name is not None and ton_km_factor is not None:
+                        ton_km_value = ton_km_factor * existing_distance_km
+                        sheet_data.at[row_offset, ton_km_col_name] = ton_km_value
+                        if ton_km_col_idx is not None:
+                            sheet.cell(row=excel_row, column=ton_km_col_idx).value = ton_km_value
+                    skipped_existing_count += 1
+                    continue
+
+                transport_type_raw = row.get(transport_col_name)
+                start_point_raw = row.get(start_col_name)
+                end_point_raw = row.get(end_col_name)
+                if pd.isna(transport_type_raw) or pd.isna(start_point_raw) or pd.isna(end_point_raw):
+                    continue
+                transport_type = str(transport_type_raw or "").strip()
+                start_point = str(start_point_raw or "").strip()
+                end_point = str(end_point_raw or "").strip()
+                if not transport_type or not start_point or not end_point:
+                    continue
+
+                resolved_start = self._resolve_road_transport_endpoint_details(transport_type, start_point)
+                resolved_end = self._resolve_road_transport_endpoint_details(transport_type, end_point)
+                resolved_start_point = resolved_start["query"]
+                resolved_end_point = resolved_end["query"]
+                route_cache_key = (
+                    self._normalize_column_name(transport_type),
+                    self._normalize_transport_lookup_key(resolved_start_point),
+                    self._normalize_transport_lookup_key(resolved_end_point),
+                )
+                job = {
+                    "table_idx": table_idx,
+                    "sheet_data": sheet_data,
+                    "row_offset": row_offset,
+                    "excel_row": excel_row,
+                    "distance_col_idx": distance_col_idx,
+                    "distance_col_name": distance_col_name,
+                    "ton_km_col_idx": ton_km_col_idx,
+                    "ton_km_col_name": ton_km_col_name,
+                    "transport_type": transport_type,
+                    "start_point": start_point,
+                    "end_point": end_point,
+                    "resolved_start": resolved_start,
+                    "resolved_end": resolved_end,
+                    "resolved_start_point": resolved_start_point,
+                    "resolved_end_point": resolved_end_point,
+                    "ton_km_factor": calculate_ton_km_factor(row, weight_col_name, raw_material_col_names),
+                }
+                pending_jobs.append(job)
+                if route_cache_key not in route_jobs:
+                    route_jobs[route_cache_key] = []
+                    route_keys.append(route_cache_key)
+                route_jobs[route_cache_key].append(job)
+
+        if pending_jobs:
+            self._notify_status(
+                f"{sheet_name} 運輸距離待計算 {len(pending_jobs)} 筆，去重後 {len(route_keys)} 條路線。"
+            )
+
+        route_results = {}
+        route_errors = {}
+        for route_idx, route_cache_key in enumerate(route_keys, start=1):
+            self._check_cancel()
+            representative_job = route_jobs[route_cache_key][0]
+            transport_type = representative_job["transport_type"]
+            start_point = representative_job["start_point"]
+            end_point = representative_job["end_point"]
+            resolved_start = representative_job["resolved_start"]
+            resolved_end = representative_job["resolved_end"]
+            resolved_start_point = representative_job["resolved_start_point"]
+            resolved_end_point = representative_job["resolved_end_point"]
+            self._notify_status(
+                f"計算 {sheet_name} 唯一路線... {route_idx}/{len(route_keys)} | "
+                f"{transport_type}: {start_point} -> {end_point}"
+            )
+            try:
+                result = self._transport_route_cache.get(route_cache_key)
+                if result is None:
+                    if resolved_start.get("lat_lon") is not None or resolved_end.get("lat_lon") is not None:
+                        from_place = self._transport_place_from_endpoint_details(resolved_start, transport_type)
+                        to_place = self._transport_place_from_endpoint_details(resolved_end, transport_type)
+                        result = compute_transport_distance(
+                            mode=transport_type_to_mode(transport_type),
+                            from_lat=float(from_place["lat"]),
+                            from_lon=float(from_place["lon"]),
+                            to_lat=float(to_place["lat"]),
+                            to_lon=float(to_place["lon"]),
+                        )
+                        result.metadata.update(
+                            {
+                                "transport_type": transport_type,
+                                "from_query": resolved_start_point,
+                                "to_query": resolved_end_point,
+                                "from_place": from_place,
+                                "to_place": to_place,
+                            }
+                        )
+                    else:
+                        result = compute_transport_distance_from_queries(
+                            transport_type=transport_type,
+                            from_query=resolved_start_point,
+                            to_query=resolved_end_point,
+                            geocode_cache=self._transport_place_cache,
+                        )
+                    self._transport_route_cache[route_cache_key] = result
+                    result.metadata.update(
+                        {
+                            "original_from_query": start_point,
+                            "original_to_query": end_point,
+                            "resolved_from_query": resolved_start_point,
+                            "resolved_to_query": resolved_end_point,
+                        }
+                    )
+                route_results[route_cache_key] = result
+            except Exception as exc:
+                route_errors[route_cache_key] = exc
+
+        for route_cache_key in route_keys:
+            self._check_cancel()
+            result = route_results.get(route_cache_key)
+            if result is None:
+                exc = route_errors.get(route_cache_key)
+                for job in route_jobs[route_cache_key]:
+                    self._warn(
+                        f"{sheet_name} 第 {job['table_idx']} 個表格第 {job['excel_row']} 列距離計算失敗: "
+                        f"{job['transport_type']} | {job['start_point']} -> {job['end_point']} "
+                        f"(resolved: {job['resolved_start_point']} -> {job['resolved_end_point']}) | {exc}"
+                    )
+                continue
+
+            first_job = route_jobs[route_cache_key][0]
+            self._cache_endpoint_place(
+                first_job["start_point"],
+                result.metadata.get("from_place"),
+            )
+            self._cache_endpoint_place(
+                first_job["resolved_start_point"],
+                result.metadata.get("from_place"),
+            )
+            self._cache_endpoint_place(
+                first_job["end_point"],
+                result.metadata.get("to_place"),
+            )
+            self._cache_endpoint_place(
+                first_job["resolved_end_point"],
+                result.metadata.get("to_place"),
+            )
+
+            distance_km = round(result.distance_m / 1000.0, 4)
+            for job in route_jobs[route_cache_key]:
+                sheet_data = job["sheet_data"]
+                row_offset = job["row_offset"]
+                sheet_data.at[row_offset, job["distance_col_name"]] = distance_km
+                sheet.cell(row=job["excel_row"], column=job["distance_col_idx"]).value = distance_km
+
+                ton_km_col_name = job["ton_km_col_name"]
+                ton_km_col_idx = job["ton_km_col_idx"]
+                ton_km_factor = job["ton_km_factor"]
+                if ton_km_col_name is not None and ton_km_factor is not None:
+                    ton_km_value = ton_km_factor * distance_km
+                    sheet_data.at[row_offset, ton_km_col_name] = ton_km_value
+                    if ton_km_col_idx is not None:
+                        sheet.cell(row=job["excel_row"], column=ton_km_col_idx).value = ton_km_value
+
+                updated_count += 1
+
+        self._notify_status(
+            f"{sheet_name} 運輸距離更新完成，共更新 {updated_count} 筆，沿用既有距離 {skipped_existing_count} 筆。"
+        )
+        return transport_tables
+
+    def _normalize_selected_carbon_stages(self, selected_stages=None):
+        valid_stages = [stage for stage, _ in CARBON_STAGE_OPTIONS]
+        if selected_stages is None:
+            return valid_stages
+
+        selected = []
+        for stage in selected_stages:
+            stage_name = str(stage or "").strip()
+            if stage_name in valid_stages and stage_name not in selected:
+                selected.append(stage_name)
+
+        if not selected:
+            raise ValueError("請至少勾選一個要計算碳排的階段。")
+        return selected
+
+    def _process_file_impl(self, file_path=None, selected_stages=None, calculate_distances=True):
         """數據處理"""
-        from win32com.client import DispatchEx
         if file_path is not None:
             self.file_path = file_path
+        selected_stage_list = self._normalize_selected_carbon_stages(selected_stages)
+        selected_stage_set = set(selected_stage_list)
         self.last_error = None
+        self.was_cancelled = False
+        self._check_cancel()
         if not self.file_path:
             err_msg = "請選擇 Excel 文件"
             self.last_error = err_msg
-            messagebox.showerror("錯誤", "請選擇 Excel 文件")
             return {"ok": False, "error": err_msg}
 
-        excel = None
-        com_wb = None
-        com_initialized = False
-
         try:
+            self._check_cancel()
             self.update_progress_smooth(0, 10, step=1, delay=0.5) # 階段1：讀取 Excel 檔案與資料準備，模擬從 0% 到 10%
             # 使用 openpyxl 讀取原始的 Excel 文件，保留原始格式和樣式
             self._notify_status("讀取 Excel 文件...")
             print("讀取 Excel 文件...")
+            self._check_cancel()
             result_workbook = openpyxl.load_workbook(self.file_path, keep_vba=False, keep_links=False)
-            sheet_A_tables = self.read_multiple_tables('Raw Material', self.file_path)      #呼叫 read_multiple_tables(sheet_name, file_path) 
-            sheet_C_tables = self.read_multiple_tables('Manufacturing', self.file_path)     #讀取特定數個工作表（如 Raw Material、Manufacturing 等）
-            sheet_D_tables = self.read_multiple_tables('Distribution', self.file_path)      #將每個工作表中多個獨立的資料表格區段解析為 pandas DataFrame 清單
-            sheet_E_tables = self.read_multiple_tables('Usage', self.file_path)
-            sheet_F_tables = self.read_multiple_tables('Recycling', self.file_path)
+            stage_tables = {}
+            for stage_name in selected_stage_list:
+                stage_tables[stage_name] = self.read_multiple_tables(stage_name, self.file_path)
+
+            if calculate_distances and "Raw Material" in selected_stage_set:
+                self._notify_status("更新 Raw Material 運輸距離...")
+                stage_tables["Raw Material"] = self.calculate_transport_distances(
+                    result_workbook,
+                    stage_tables["Raw Material"],
+                    sheet_name="Raw Material",
+                    table_indexes=[3, 4],
+                )
+            if calculate_distances and "Distribution" in selected_stage_set:
+                self._notify_status("更新 Distribution 運輸距離...")
+                stage_tables["Distribution"] = self.calculate_transport_distances(
+                    result_workbook,
+                    stage_tables["Distribution"],
+                    sheet_name="Distribution",
+                )
             
             self.update_progress_smooth(10, 40, step=1, delay=0.05) # 階段2：讀取工作表B，處理工作表並計算數值，模擬進度從 10% 到 40%
             # 以 pandas 讀入另一張關鍵對照表（sheet_B，如 simapro10.2.0.0）
+            self._check_cancel()
             sheet_B = pd.read_excel(self.file_path, sheet_name='simapro10.2.0.0', usecols=['單位對照', 'fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)', 'unit']).dropna(subset=['單位對照'])
             self._notify_status("處理工作表並獲取總值...")
             print("處理工作表並獲取總值...")
-            total_A = self.process_tables(sheet_A_tables, 'Raw Material', 'W', result_workbook, sheet_B)
-            total_C = self.process_tables(sheet_C_tables, 'Manufacturing', 'W', result_workbook, sheet_B)
-            total_D = self.process_tables(sheet_D_tables, 'Distribution', 'U', result_workbook, sheet_B)
-            total_E = self.process_tables(sheet_E_tables, 'Usage', 'Q', result_workbook, sheet_B)
-            total_F = self.process_tables(sheet_F_tables, 'Recycling', 'Q', result_workbook, sheet_B)
+            stage_calc_columns = {
+                "Raw Material": "W",
+                "Manufacturing": "W",
+                "Distribution": "U",
+                "Usage": "Q",
+                "Recycling": "Q",
+            }
+            stage_totals = {stage_name: (0, 0, 0) for stage_name, _ in CARBON_STAGE_OPTIONS}
+            for stage_name in selected_stage_list:
+                stage_totals[stage_name] = self.process_tables(
+                    stage_tables[stage_name],
+                    stage_name,
+                    stage_calc_columns[stage_name],
+                    result_workbook,
+                    sheet_B,
+                )
 
 
             self.update_progress_smooth(40, 70, step=1, delay=0.02) # 階段3：更新報告模板，模擬進度從 40% 到 70%
             self._notify_status("讀取報告模板並寫入計算的數值...")
             print("讀取報告模板並寫入計算的數值...")
-            base_dir = os.path.dirname(os.path.abspath(__file__))       # Temp檔路徑下
-            report_path = os.path.join(base_dir, 'report_temp.xlsx')    # 將結果寫入報告範本 Excel (report_temp.xlsx) 中預定的儲存格
+            report_path = self._get_required_resource_path(
+                REPORT_WORKBOOK_TEMPLATE_FILENAME,
+                "Excel 報告模板",
+                os.path.join(self.base_dir, REPORT_WORKBOOK_TEMPLATE_FILENAME),
+            )
+            self._check_cancel()
             report_workbook = openpyxl.load_workbook(report_path)
             # 確保選擇報告中的 'general' 工作表
             if 'general' in report_workbook.sheetnames:
@@ -140,14 +1494,15 @@ class ExcelApp:
             self._notify_status("每個工作表的加總值寫入指定的單元格...")
             print("每個工作表的加總值寫入指定的單元格...")
             # 將每個工作表的加總值寫入指定的單元格
-            report_sheet['B2'], report_sheet['B3'], report_sheet['B4'] = total_A
-            report_sheet['C2'], report_sheet['C3'], report_sheet['C4'] = total_C
-            report_sheet['D2'], report_sheet['D3'], report_sheet['D4'] = total_D
-            report_sheet['E2'], report_sheet['E3'], report_sheet['E4'] = total_E
-            report_sheet['F2'], report_sheet['F3'], report_sheet['F4'] = total_F
+            report_sheet['B2'], report_sheet['B3'], report_sheet['B4'] = stage_totals["Raw Material"]
+            report_sheet['C2'], report_sheet['C3'], report_sheet['C4'] = stage_totals["Manufacturing"]
+            report_sheet['D2'], report_sheet['D3'], report_sheet['D4'] = stage_totals["Distribution"]
+            report_sheet['E2'], report_sheet['E3'], report_sheet['E4'] = stage_totals["Usage"]
+            report_sheet['F2'], report_sheet['F3'], report_sheet['F4'] = stage_totals["Recycling"]
             self.update_progress_smooth(70, 95, step=1, delay=0.05) # 階段4：儲存結果，模擬進度從 70% 到 99%
             # 獲取當前的日期和時間，用於生成檔案名稱
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._apply_factory_overview_info(result_workbook)
             product_name_suffix = ""
             if "overview" in result_workbook.sheetnames:
                 product_name_suffix = str(result_workbook["overview"]["C17"].value or "").strip()
@@ -164,72 +1519,74 @@ class ExcelApp:
                 self.report_file = f'report_{product_name_suffix}_{current_time}.xlsx'
             else:
                 self.report_file = f'report_{current_time}.xlsx'
-            self.report_file = os.path.join(self.output_dir, self.report_file)
-            print("路徑位置：",self.output_dir)
+            self.report_file = os.path.join(self.report_dir, self.report_file)
+            print("路徑位置：", self.report_dir)
             report_workbook.save(self.report_file)
+            with suppress(Exception):
+                report_workbook.close()
             
             # 另存為新文件，保留原有的表格樣式，附上日期和時間
             if product_name_suffix:
                 self.result_file = f'result_{product_name_suffix}_{current_time}.xlsx'
             else:
                 self.result_file = f'result_{current_time}.xlsx'
-            self.result_file = os.path.join(self.output_dir, self.result_file)
+            self.result_file = os.path.join(self.result_dir, self.result_file)
+            self._check_cancel()
+            self._sanitize_invalid_external_formulas(result_workbook)
             result_workbook.save(self.result_file)
+            with suppress(Exception):
+                result_workbook.close()
 
-        #    3. 用 Excel COM 自動修復並輸出最終結果
-            pythoncom.CoInitialize()
-            com_initialized = True
+            #    3. 用 Excel COM 自動修復並輸出最終結果
+            self._check_cancel()
             try:
-                excel = DispatchEx("Excel.Application")
-                excel.Visible = False
-                excel.DisplayAlerts = False
-                excel.EnableEvents = False
-
                 path = os.path.abspath(self.result_file)
-                # CorruptLoad=1: 自動嘗試修復任何架構問題；UpdateLinks=0: 不更新外部連結
-                # 小延遲 + 確認檔案存在
-                for _ in range(5):
-                    if os.path.exists(path):
-                        try:
-                            com_wb = excel.Workbooks.Open(
-                                path,
-                                CorruptLoad=1,
-                                UpdateLinks=0,
-                                ReadOnly=False,
-                                IgnoreReadOnlyRecommended=True
-                            )
-                            break
-                        except Exception:
-                            time.sleep(0.3)
-                    time.sleep(0.2)
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"找不到結果檔：{path}")
+                with ExcelComSession(
+                    visible=False,
+                    display_alerts=False,
+                    enable_events=False,
+                    screen_updating=False,
+                    logger=self.logger,
+                ) as session:
+                    com_wb = session.open_workbook(
+                        path,
+                        CorruptLoad=1,
+                        UpdateLinks=0,
+                        ReadOnly=False,
+                        IgnoreReadOnlyRecommended=True,
+                        retry_count=self.runtime_config["open_retry_count"],
+                        retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                        timeout_sec=self.runtime_config["open_timeout_sec"],
+                    )
+                    self._check_cancel()
+                    session.excel.CalculateUntilAsyncQueriesDone()
+                    session.save_with_retry(
+                        com_wb,
+                        retry_count=self.runtime_config["save_retry_count"],
+                        retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                        timeout_sec=self.runtime_config["save_timeout_sec"],
+                    )
 
-                if com_wb is None:
-                    raise RuntimeError(f"Excel 無法開啟結果檔：{path}")
-                excel.CalculateUntilAsyncQueriesDone()
-                com_wb.Save()
-
+            except UserCancelledError:
+                raise
             except Exception as e:
                 print(f"處理文件時出錯：{e}")
                 err_msg = f"{e}\n{traceback.format_exc()}"
                 self.last_error = err_msg
                 return {"ok": False, "error": err_msg}  # 告知呼叫方：失敗
 
-            finally:
-                try:
-                    if com_wb:
-                        com_wb.Close(False)
-                except Exception:
-                    pass
-                try:
-                    if excel:
-                        excel.Quit()
-                except Exception:
-                    pass
-                if com_initialized:
-                    try:
-                        pythoncom.CoUninitialize()
-                    except Exception:
-                        pass
+            return {
+                "ok": True,
+                "result_file": self.result_file,
+                "report_file": self.report_file,
+                "selected_stages": selected_stage_list,
+            }
+        except UserCancelledError as e:
+            self.was_cancelled = True
+            self.last_error = str(e)
+            return {"ok": False, "cancelled": True, "error": str(e)}
 
             return {
                 "ok": True,
@@ -244,6 +1601,42 @@ class ExcelApp:
 
 
 
+
+    def _excel_col_letter(self, col_num):
+        """Return the Excel column letter for a 1-based column index."""
+        result = ""
+        while col_num:
+            col_num, remainder = divmod(col_num - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
+
+    def _normalize_table_columns(self, header):
+        """
+        Make table headers safe for pandas operations.
+
+        Excel templates may intentionally leave spacer columns blank. Pandas reads
+        those blanks as NaN column names, and recent pandas versions reject merges
+        when duplicate NaN columns are present.
+        """
+        normalized = []
+        seen = set()
+
+        for idx, col in enumerate(header, start=1):
+            if pd.isna(col) or str(col).strip() == "":
+                base_name = f"_blank_{self._excel_col_letter(idx)}"
+            else:
+                base_name = str(col).strip()
+
+            candidate = base_name
+            suffix = 1
+            while candidate in seen:
+                candidate = f"{base_name}_{suffix}"
+                suffix += 1
+
+            seen.add(candidate)
+            normalized.append(candidate)
+
+        return normalized
 
     def read_multiple_tables(self, sheet_name, file_path):
         """
@@ -264,7 +1657,7 @@ class ExcelApp:
                     # 保存表格並使用第三行作為欄位名稱
                     header = sheet.iloc[start_idx + 2]
                     table = sheet.iloc[start_idx + 3:idx].reset_index(drop=True)
-                    table.columns = header
+                    table.columns = self._normalize_table_columns(header)
                     tables.append((start_idx, table))
                 # 更新新的表格開始位置
                 start_idx = idx
@@ -272,7 +1665,7 @@ class ExcelApp:
         # 添加最後一個表格，並使用第三行作為欄位名稱
         header = sheet.iloc[start_idx + 2]
         table = sheet.iloc[start_idx + 3:].reset_index(drop=True)
-        table.columns = header
+        table.columns = self._normalize_table_columns(header)
         tables.append((start_idx, table))
 
         # 返回表格數據
@@ -288,6 +1681,7 @@ class ExcelApp:
         total_biogenic = 0
         total_land_transformation = 0
         for i, (start_idx, sheet_data) in enumerate(sheet_tables):
+            self._check_cancel()
             required_cols = ['name of database']
             missing = [c for c in required_cols if c not in sheet_data.columns]
             if missing:
@@ -313,6 +1707,17 @@ class ExcelApp:
                     f"需包含 'total'、'Ton‧Km'、'consumed amount allocated to single product (energy/product unit)' 或 'total amount'。\n"
                     f"實際欄位有: {list(sheet_data.columns)}"
                 )
+
+            quantity_col_idx = list(sheet_data.columns).index(quantity_column) + 1
+            quantity_col_letter = self._excel_col_letter(quantity_col_idx)
+            coefficient_col_idx, _ = self._find_table_column(sheet_data.columns, "Coefficient value")
+            coefficient_col_letter = (
+                self._excel_col_letter(coefficient_col_idx)
+                if coefficient_col_idx is not None
+                else None
+            )
+            if coefficient_col_letter is None:
+                self._warn(f"【{sheet_name} 第 {i+1} 個表格】找不到 Coefficient value 欄位，略過係數公式寫入。")
             
             # 1) 保留原本表格內既有的 result（若有）
             for col in [
@@ -332,6 +1737,7 @@ class ExcelApp:
 
             # 判斷工作表和工作表B的單位是否一致
             for idx, row in merged_df.iterrows():
+                self._check_cancel()
                 if pd.notna(row['Unit']) and pd.notna(row['unit']):
                     if row['Unit'] != row['unit']:
                         if row['Unit'] in ['g', 'kg', 'ton'] and row['unit'] in ['g', 'kg', 'ton']:
@@ -397,13 +1803,18 @@ class ExcelApp:
             # 假設 damage 欄位放在 fossil 欄位之後的下一欄
             num_rows = len(merged_df)
             for i in range(num_rows):
+                self._check_cancel()
                 # Excel 的列號從 1 開始，所以 row_num 需要調整
                 row_num = start_idx + 3 + i + 1  
                 fossil_cell = f"{col_start}{row_num}"
                 biogenic_cell = f"{chr(ord(col_start) + 1)}{row_num}"
                 land_cell = f"{chr(ord(col_start) + 2)}{row_num}"
                 # 將 Damage Assessment 欄位設為公式
-                sheet[f'{chr(ord(col_start) + 3)}{row_num}'] = f"={fossil_cell}+{biogenic_cell}+{land_cell}"
+                damage_cell = f'{chr(ord(col_start) + 3)}{row_num}'
+                sheet[damage_cell] = f"={fossil_cell}+{biogenic_cell}+{land_cell}"
+                if coefficient_col_letter is not None:
+                    quantity_cell = f"{quantity_col_letter}{row_num}"
+                    sheet[f"{coefficient_col_letter}{row_num}"] = f'=IFERROR({damage_cell}/{quantity_cell},"")'
             
             self._notify_status("計算加總值並寫入每個表格的第一行...")
             # 計算加總值並寫入每個表格的第一行，並做小數點後 4 位四捨五入捨去
@@ -631,6 +2042,8 @@ class ExcelApp:
         return fmt
 
 
+
+
     def _get_format(self, fmt_dict, workbook):
         # 將 fmt_dict 轉成 tuple-of-tuples 作為 key（因為 dict 本身不可 hash）
         key = tuple(sorted(fmt_dict.items()))
@@ -652,6 +2065,7 @@ class ExcelApp:
         status_cb = getattr(self, "status_callback", None)
 
         for pos_idx, base_pos in enumerate(base_insert_positions):
+            self._check_cancel()
             start_msg = f"開始處理插入點，pos_idx ={pos_idx}"
             print(start_msg)
             if status_cb:
@@ -671,6 +2085,7 @@ class ExcelApp:
                     fixed_col_count = 27  # A-AA
                     data_rows = []
                     for i in range(num_data_rows):
+                        self._check_cancel()
                         row = list(data.iloc[i])
                         if len(row) < fixed_col_count:
                             row.extend([""] * (fixed_col_count - len(row)))
@@ -702,7 +2117,7 @@ class ExcelApp:
 
         return new_sheet_rows
 
-    def transform_sheet(self):
+    def _transform_sheet_impl(self):
         """
         將自動化Excel表單轉換成盤查表單格式：
         1. 用 openpyxl 讀取模板檔案（PLCI_table_format.xlsx），取得各工作表內容。
@@ -715,21 +2130,23 @@ class ExcelApp:
         5. 利用 xlsxwriter 將調整後的所有內容寫入新檔案中。
         """
         if not self.file_path:
-            messagebox.showerror("錯誤", "請選擇 Excel 文件")
-            return
+            self.last_error = "請選擇 Excel 文件"
+            return False
+
+        self.was_cancelled = False
+        self._check_cancel()
 
         ok = False
         err_msg = None
-        wb_tpl = None
-        wb_new = None
-        excel = None
         try:
+            self._check_cancel()
             self._format_cache.clear()  # 清空格式快取
             self._notify_status("開始執行 Transform Sheet")
             print("開始執行 Transform Sheet")
             self.source_file_path = self.file_path
             input_values = {"product_name": "", "start_date": "", "end_date": ""}
             try:
+                self._check_cancel()
                 wb_input = openpyxl.load_workbook(self.source_file_path, read_only=True, data_only=True)
                 if "overview" in wb_input.sheetnames:
                     ws_overview = wb_input["overview"]
@@ -746,9 +2163,13 @@ class ExcelApp:
                 except Exception:
                     pass
 
-            base_dir = os.path.dirname(os.path.abspath(__file__))   # 取得目前 script 所在的資料夾/Temp檔路徑下
-            target_file_path = os.path.join(base_dir, "PLCI_table_format.xlsx")
+            target_file_path = self._get_required_resource_path(
+                PLCI_TABLE_FORMAT_FILENAME,
+                "PLCI 格式模板",
+                os.path.join(self.base_dir, PLCI_TABLE_FORMAT_FILENAME),
+            )
             # 用 openpyxl 讀取模板
+            self._check_cancel()
             template_wb = openpyxl.load_workbook(target_file_path)
             print("PASS1...")
             self._notify_status("PASS1...")
@@ -803,7 +2224,9 @@ class ExcelApp:
             # 讀取來源資料，各工作表以 DataFrame 儲存
             source_data = {}
             for target_sheet_name, source_sheet_list in self.source_sheets.items():
+                self._check_cancel()
                 for sheet_name in source_sheet_list:
+                    self._check_cancel()
                     try:
                         df = pd.read_excel(self.source_file_path, sheet_name=sheet_name)
                         # 將無限大值替換並填充空值，讓 xlsxwriter 能正確處理
@@ -830,7 +2253,7 @@ class ExcelApp:
                 new_file_name = f'merged_result_{product_name_suffix}_{current_datetime}.xlsx'
             else:
                 new_file_name = f'merged_result_{current_datetime}.xlsx'
-            new_file_path = os.path.join(self.output_dir, new_file_name)
+            new_file_path = os.path.join(self.result_dir, new_file_name)
             workbook = xlsxwriter.Workbook(new_file_path, {'nan_inf_to_errors': True})
             formula_entries = {}    
 
@@ -838,6 +2261,7 @@ class ExcelApp:
                 self.update_progress_smooth(30, 80, step=1, delay=0.05) # 第4階段完成：80%
             # 處理每個目標工作表
             for target_sheet_name, source_sheet_list in self.source_sheets.items():
+                self._check_cancel()
                 print(f"處理目標工作表：{target_sheet_name}")
                 worksheet = workbook.add_worksheet(target_sheet_name)
                 if target_sheet_name in template_wb.sheetnames:
@@ -889,6 +2313,7 @@ class ExcelApp:
                         ws.write(row_idx, col_idx, value, fmt)
 
                 for r, row in enumerate(new_sheet_rows):
+                    self._check_cancel()
                     for c, cell in enumerate(row):
                         # 先取出值與格式 dict
                         if isinstance(cell, dict):
@@ -923,96 +2348,117 @@ class ExcelApp:
 
             if self.update_progress_smooth:
                 self.update_progress_smooth(80, 95, step=1, delay=0.02) # 第5階段完成：95%
+            self._check_cancel()
             workbook.close()
-            time.sleep(0.1)
             print("靜態頁複製")
             self._notify_status("靜態頁複製")
-            pythoncom.CoInitialize()
-            excel = win32.DispatchEx("Excel.Application")
-            excel.Visible = False  # 背後跑就好
-            excel.DisplayAlerts = False    # 關閉任何提示訊息
-            excel.ScreenUpdating = False   # 關閉畫面更新
-            # 打開新檔和範本
+            self._check_cancel()
             if not os.path.exists(target_file_path):
                 raise FileNotFoundError(f"找不到範本：{target_file_path}")
-            wb_tpl = excel.Workbooks.Open(target_file_path,
-                              CorruptLoad=1,
-                              ReadOnly=True,
-                              IgnoreReadOnlyRecommended=True)
-            #(測試)確認新檔案存在
-            print(new_file_path)
-            print("exists:", os.path.exists(new_file_path))
-            if os.path.exists(new_file_path):
-                print("size:", os.path.getsize(new_file_path))
-
-            wb_new = excel.Workbooks.Open(new_file_path, CorruptLoad=1)
-            static_sheets = ['Instruction', 'overview', 'Process flow chart', 'simapro10.2.0.0']
-            for sheet_name in static_sheets:
-                try:
-                    # 把範本的這張 Copy 到新檔，放在第一張動態頁前面
-                    wb_tpl.Sheets(sheet_name).Copy(Before=wb_new.Sheets(1))
-                except Exception as e:
-                    print(f"複製「{sheet_name}」失敗：{e}")
-
-            # 複製完所有靜態頁後，加入以下程式碼
-            # Write back formulas after static sheet copy
-            for sheet_name, formula_list in formula_entries.items():
-                try:
-                    ws_target = wb_new.Sheets(sheet_name)
-                except Exception as e:
-                    print(f"Formula writeback skipped: missing sheet {sheet_name}: {e}")
-                    continue
-                for row_idx, col_idx, formula in formula_list:
+            with ExcelComSession(
+                visible=False,
+                display_alerts=False,
+                enable_events=False,
+                screen_updating=False,
+                logger=self.logger,
+            ) as session:
+                wb_tpl = session.open_workbook(
+                    target_file_path,
+                    CorruptLoad=1,
+                    ReadOnly=True,
+                    IgnoreReadOnlyRecommended=True,
+                    retry_count=self.runtime_config["open_retry_count"],
+                    retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["open_timeout_sec"],
+                )
+                self._check_cancel()
+                wb_new = session.open_workbook(
+                    new_file_path,
+                    CorruptLoad=1,
+                    ReadOnly=False,
+                    IgnoreReadOnlyRecommended=True,
+                    retry_count=self.runtime_config["open_retry_count"],
+                    retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["open_timeout_sec"],
+                )
+                static_sheets = ['Instruction', 'overview', 'Process flow chart', 'simapro10.2.0.0']
+                for sheet_name in static_sheets:
+                    self._check_cancel()
                     try:
-                        ws_target.Cells(row_idx + 1, col_idx + 1).Formula = formula
+                        wb_tpl.Sheets(sheet_name).Copy(Before=wb_new.Sheets(1))
                     except Exception as e:
-                        print(f"Formula writeback failed: {sheet_name} {row_idx + 1},{col_idx + 1} {formula}: {e}")
+                        self._warn(f"複製「{sheet_name}」失敗：{e}")
 
-            try:
-                # 取得 wb_new 的 overview 工作表
+                for sheet_name, formula_list in formula_entries.items():
+                    self._check_cancel()
+                    try:
+                        ws_target = wb_new.Sheets(sheet_name)
+                    except Exception as e:
+                        self._warn(f"Formula writeback skipped: missing sheet {sheet_name}: {e}")
+                        continue
+                    for row_idx, col_idx, formula in formula_list:
+                        self._check_cancel()
+                        try:
+                            ws_target.Cells(row_idx + 1, col_idx + 1).Formula = formula
+                        except Exception as e:
+                            self._warn(
+                                f"Formula writeback failed: {sheet_name} {row_idx + 1},{col_idx + 1} {formula}: {e}"
+                            )
+
                 overview = wb_new.Sheets("overview")
-                # 在 H2 設定你要的公式，例如：合計 AB2 到 AE2
                 overview.Range("H2").Formula = "='Raw Material'!AE2+Manufacturing!AE2+Distribution!AE2+Recycling!AE2+Usage!AE2"
                 overview.Range("V2").Formula = "=Usage!$K$5"
-                overview.Range("C17").Value = input_values["product_name"] #產品F階段名稱
-                overview.Range("C18").Value = input_values["start_date"] #盤查起始時間
-                overview.Range("G18").Value = input_values["end_date"] #盤查結束時間
-                
-                factory_site = self.factory_site.strip() if isinstance(self.factory_site, str) else ""
+                overview.Range("C17").Value = input_values["product_name"]
+                date_epoch = WINDOWS_EPOCH
+                with suppress(Exception):
+                    if wb_new.Date1904:
+                        date_epoch = MAC_EPOCH
+                overview.Range("C18").Value2 = self._to_excel_date_serial(input_values["start_date"], epoch=date_epoch)
+                overview.Range("G18").Value2 = self._to_excel_date_serial(input_values["end_date"], epoch=date_epoch)
+                overview.Range("C18").NumberFormat = "yyyy/m/d"
+                overview.Range("G18").NumberFormat = "yyyy/m/d"
+
+                factory_site = self.normalize_factory_site(self.factory_site)
                 factory_info = FACTORY_OVERVIEW_INFO.get(factory_site)
-                if factory_info:
+                if not factory_site:
+                    overview.Range("C3").Value = ""
+                    overview.Range("C4").Value = ""
+                elif factory_info:
                     overview.Range("C3").Value = factory_info["name"]
                     overview.Range("C4").Value = factory_info["address"]
-                # *新增*填入產品資訊(公司廠址名稱、盤查地址、機種、型號、時間區間、照片)
-                # 如果要寫入本地語系公式，可改用 FormulaLocal
-                # overview.Range("H2").FormulaLocal = "=SUM(AB2:AE2)"
-                print("已在 overview 工作表寫入公式")
-            except Exception as e:
-                err_msg = f"設定 overview 工作表公式失敗：{e}"
-                print(f"設定 overview 工作表公式失敗：{e}")
-                return False
-            
-            
-            try:
-                # 然後再執行 RefreshAll 並存檔
-                wb_tpl.RefreshAll()
-                print("靜態頁複製完成")
-                self._notify_status("靜態頁複製完成")
 
-                # 存檔、關檔、退出
-                wb_new.Save()
-                wb_tpl.Close(False)
-                wb_new.Close(False)
+                self._check_cancel()
+                self._notify_status("重新整理 Excel 公式與查詢...")
+                session.refresh_all_and_wait(
+                    wb_new,
+                    retry_count=self.runtime_config["refresh_retry_count"],
+                    retry_delay_sec=self.runtime_config["refresh_retry_delay_sec"],
+                    settle_sec=self.runtime_config["refresh_settle_sec"],
+                    timeout_sec=self.runtime_config["refresh_timeout_sec"],
+                    poll_sec=self.runtime_config["refresh_poll_sec"],
+                    cancel_callback=self._check_cancel,
+                    progress_callback=self._make_stage_progress_callback(95, 99),
+                )
+                self._notify_status("保存重新整理後的結果...")
+                session.save_with_retry(
+                    wb_new,
+                    retry_count=self.runtime_config["save_retry_count"],
+                    retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["save_timeout_sec"],
+                )
+                session.close_workbook(wb_tpl, save_changes=False)
+                session.close_workbook(wb_new, save_changes=False)
                 if self.update_progress_smooth:
-                    self.update_progress_smooth(95, 100, step=1, delay=0.01) # 第6階段完成：100%
-                # pythoncom.CoUninitialize()    
+                    self.update_progress_smooth(99, 100, step=1, delay=0.01)
                 ok = True
-            except Exception as e:
-                print(f"存檔失敗：{e}")
-                err_msg = f"存檔失敗：{e}"
-                return False
             # 成功的回傳值
+            self.merged_file = new_file_path
             return new_file_path
+        except UserCancelledError as e:
+            self.was_cancelled = True
+            err_msg = str(e)
+            self.last_error = err_msg
+            return False
         except Exception as e:
             # 捕捉其他未預期錯誤
             tb = traceback.format_exc()
@@ -1023,28 +2469,6 @@ class ExcelApp:
             print(f"處理 Transform Sheet 時出錯：{e}\n{tb}")
             return False
         finally:
-            # ── 集中清理（不論成功/失敗/何處 return 都會執行）──
-            try:
-                if wb_tpl is not None:
-                    wb_tpl.Close(SaveChanges=False)
-            except Exception:
-                pass
-            try:
-                if wb_new is not None:
-                    # 如果成功已經存檔，這裡關閉就好
-                    wb_new.Close(SaveChanges=False)
-            except Exception:
-                pass
-            try:
-                if excel is not None:
-                    excel.Quit()
-            except Exception:
-                pass
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-
             # 把錯誤訊息傳回去（可用屬性或 callback）
             if not ok:
                 # 方式 1：設成實例屬性，讓 GUI 執行緒讀取
@@ -1057,24 +2481,147 @@ class ExcelApp:
                         pass
 
 
-    def process_all(self):
+    def _process_all_impl(self):
         """處理全部"""
         if not self.file_path:
-            messagebox.showerror("錯誤", "請選擇 Excel 文件")
-            return
+            self.last_error = "請選擇 Excel 文件"
+            return False
 
         try:
             self._notify_status("開始執行 Transform Sheet")
-            new_file_path = self.transform_sheet()
-            if new_file_path:  # 確認返回值有效
-                self._notify_status("Transform Sheet 完成，開始處理數據")
-                self.process_file(file_path = new_file_path)
-                self._notify_status("處理全部完成")
+            transform_result = self.transform_sheet()
+            if not transform_result.ok:
+                self.last_error = transform_result.message
+                return False
+            merged_path = (
+                transform_result.artifacts.get("path")
+                or transform_result.artifacts.get("merged_file")
+                or None
+            )
+            self._notify_status("Transform Sheet 完成，開始處理數據")
+            process_result = self.process_file(file_path=merged_path)
+            if not process_result.ok:
+                self.last_error = process_result.message
+                return False
+            self._notify_status("處理全部完成")
             return True
         
         except Exception as e:
-            messagebox.showerror("錯誤", f"處理全部過程中出現錯誤：{e}")
+            self.last_error = f"處理全部過程中出現錯誤：{e}"
             return False
+
+    def update_input_sheet(self, file_path, product="", start_date="", end_date="") -> TaskResult:
+        run_id, started_at = self._start_task("update_input_sheet")
+        if not file_path:
+            result = TaskResult(
+                ok=False,
+                error_code="MISSING_INPUT",
+                message="缺少要更新的 Excel 檔案路徑",
+                artifacts={"run_id": run_id},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+            self._finish_task_log(run_id, "update_input_sheet", result)
+            return result
+        try:
+            self._notify_status("開始更新 INPUT 工作表")
+            self._emit_progress(0)
+            with ExcelComSession(
+                visible=False,
+                display_alerts=False,
+                enable_events=False,
+                screen_updating=False,
+                logger=self.logger,
+            ) as session:
+                workbook = session.open_workbook(
+                    file_path,
+                    ReadOnly=False,
+                    retry_count=self.runtime_config["open_retry_count"],
+                    retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["open_timeout_sec"],
+                )
+                self._emit_progress(10)
+                for conn in workbook.Connections:
+                    with suppress(Exception):
+                        if hasattr(conn, "OLEDBConnection") and hasattr(conn.OLEDBConnection, "RefreshOnFileOpen"):
+                            conn.OLEDBConnection.RefreshOnFileOpen = False
+                    with suppress(Exception):
+                        if hasattr(conn, "OLEDBConnection") and hasattr(conn.OLEDBConnection, "EnableRefresh"):
+                            conn.OLEDBConnection.EnableRefresh = False
+
+                ws = workbook.Worksheets("INPUT")
+                input_range = ws.Range("B1:B3")
+                current_values = input_range.Value
+                if not current_values:
+                    current_values = (("",), ("",), ("",))
+
+                updated_values = [list(row) for row in current_values]
+                if str(product).strip():
+                    updated_values[0][0] = product
+                if str(start_date).strip():
+                    updated_values[1][0] = start_date
+                if str(end_date).strip():
+                    updated_values[2][0] = end_date
+
+                input_range.Value = tuple((row[0],) for row in updated_values)
+                self._emit_progress(20)
+
+                self._notify_status("儲存 INPUT 更新內容...")
+                session.save_with_retry(
+                    workbook,
+                    retry_count=self.runtime_config["save_retry_count"],
+                    retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["save_timeout_sec"],
+                )
+                self._emit_progress(30)
+                self._notify_status("重新整理 Excel 連線與公式...")
+                session.refresh_all_and_wait(
+                    workbook,
+                    retry_count=self.runtime_config["refresh_retry_count"],
+                    retry_delay_sec=self.runtime_config["refresh_retry_delay_sec"],
+                    settle_sec=self.runtime_config["refresh_settle_sec"],
+                    timeout_sec=self.runtime_config["refresh_timeout_sec"],
+                    poll_sec=self.runtime_config["refresh_poll_sec"],
+                    cancel_callback=self._check_cancel,
+                    progress_callback=self._make_stage_progress_callback(30, 85),
+                )
+                self._notify_status("保存重新整理後的結果...")
+                session.save_with_retry(
+                    workbook,
+                    retry_count=self.runtime_config["save_retry_count"],
+                    retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["save_timeout_sec"],
+                )
+                self._emit_progress(95)
+                session.close_workbook(workbook, save_changes=False)
+
+            self._emit_progress(100)
+            result = TaskResult(
+                ok=True,
+                message="INPUT 工作表更新完成",
+                artifacts={"file_path": file_path, "run_id": run_id},
+                elapsed_ms=self._elapsed_ms(started_at),
+                warnings=list(self._warnings),
+            )
+        except UserCancelledError as exc:
+            self.was_cancelled = True
+            result = self._result_fail(
+                error_code="USER_CANCELLED",
+                user_message=str(exc),
+                started_at=started_at,
+                exc=exc,
+            )
+            result.artifacts["run_id"] = run_id
+        except Exception as exc:
+            result = self._result_fail(
+                error_code="UPDATE_INPUT_FAILED",
+                user_message="更新 INPUT 工作表失敗",
+                started_at=started_at,
+                exc=exc,
+            )
+            result.artifacts["run_id"] = run_id
+        self._finish_task_log(run_id, "update_input_sheet", result)
+        return result
         
     def update_excel_cache(self, result_file):
         """使用 Excel 更新公式快取值"""
@@ -1084,52 +2631,47 @@ class ExcelApp:
             err_msg = f"找不到檔案：{result_file}"
             return False
 
-        excel = None
-        wb = None
         ok = False
         err_msg = None  
 
         try:
-            pythoncom.CoInitialize()
-            # 建立 Excel 應用程式實例（不顯示）
-            excel = win32.DispatchEx("Excel.Application")
-            excel.DisplayAlerts = False        # 不跳提示框
-            wb = excel.Workbooks.Open(
-                os.path.abspath(self.result_file),
-                CorruptLoad=1,
-                UpdateLinks=0,
-                ReadOnly=False
-            )           
-            # 強制計算所有公式
-            excel.CalculateUntilAsyncQueriesDone()
-            # 儲存並關閉工作簿
-            wb.Save() 
-            wb.Close(SaveChanges=True)
-            pythoncom.CoUninitialize()
+            self._check_cancel()
+            with ExcelComSession(
+                visible=False,
+                display_alerts=False,
+                enable_events=False,
+                screen_updating=False,
+                logger=self.logger,
+            ) as session:
+                wb = session.open_workbook(
+                    os.path.abspath(result_file),
+                    CorruptLoad=1,
+                    UpdateLinks=0,
+                    ReadOnly=False,
+                    retry_count=self.runtime_config["open_retry_count"],
+                    retry_delay_sec=self.runtime_config["open_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["open_timeout_sec"],
+                )
+                self._check_cancel()
+                session.excel.CalculateUntilAsyncQueriesDone()
+                session.save_with_retry(
+                    wb,
+                    retry_count=self.runtime_config["save_retry_count"],
+                    retry_delay_sec=self.runtime_config["save_retry_delay_sec"],
+                    timeout_sec=self.runtime_config["save_timeout_sec"],
+                )
+                session.close_workbook(wb, save_changes=False)
             ok = True
             return True
-        
+        except UserCancelledError as e:
+            self.was_cancelled = True
+            self.last_error = str(e)
+            raise
         except Exception as e:
             err_msg = f"更新 Excel 快取值時發生錯誤：{e}"
             print(f"更新 Excel 快取值時發生錯誤：{e}")
             return False
         finally:
-            # ── 集中清理（不論成功/失敗/何處 return 都會執行）──
-            try:
-                if wb is not None:
-                    wb.Close(SaveChanges=False)
-            except Exception:
-                pass
-            try:
-                if excel is not None:
-                    excel.Quit()
-            except Exception:
-                pass
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-
             # 把錯誤訊息傳回去（可用屬性或 callback）
             if not ok:
                 # 方式 1：設成實例屬性，讓 GUI 執行緒讀取
@@ -1141,11 +2683,35 @@ class ExcelApp:
                     except Exception:
                         pass
 
-    def generate_report(self, template_choice):
+    def _validate_report_source_workbook(self, result_file):
+        required_sheets = [
+            "overview",
+            "Raw Material",
+            "Manufacturing",
+            "Distribution",
+            "Usage",
+            "Recycling",
+        ]
+        workbook = None
+        try:
+            workbook = openpyxl.load_workbook(result_file, read_only=True, data_only=False)
+            missing_sheets = [sheet for sheet in required_sheets if sheet not in workbook.sheetnames]
+        except Exception as exc:
+            raise ValueError(f"無法讀取報告來源檔案：{result_file}\n{exc}") from exc
+        finally:
+            if workbook is not None:
+                with suppress(Exception):
+                    workbook.close()
+
+        if missing_sheets:
+            missing_text = "、".join(missing_sheets)
+            raise ValueError(f"報告來源檔案不是已處理盤查表單，缺少工作表：{missing_text}")
+
+    def _generate_report_impl(self, template_choice, result_file=None):
         """
         數據處理完後產生完整報告書流程：
         1. 根據 template_choice 選擇 Word 模板
-        2. 使用 self.result_file 作為數據來源，依序執行盤查表單各項函式：
+        2. 使用指定的 result_file 或 self.result_file 作為數據來源，依序執行盤查表單各項函式：
             - 統整各工作表數據 (process_all_worksheets)
             - 將數據插入 Word (insert_data_to_word)
             - 生成圖表 (generate_bar_chart)
@@ -1154,49 +2720,60 @@ class ExcelApp:
         3. 最後將完整報告書存檔，檔名格式為 "智邦-產品碳足跡盤查總報告書_{today_date}.docx"
         
         """
+        self.was_cancelled = False
+        self._check_cancel()
         # 檢查是否已有數據處理過的檔案，才能進行
-        if not hasattr(self, 'result_file') or not hasattr(self, 'report_file'):
-            messagebox.showerror("錯誤", "請先處理檔案，再產生報告。")
-            return
+        selected_result_file = result_file or getattr(self, "result_file", "")
+        if not selected_result_file:
+            self.last_error = "請先處理檔案或選擇已處理盤查表單，再產生報告。"
+            return False
         # === 1. 讀取 Excel 盤查表單，並開啟 Word 模板 ===
         # 使用先前數據處理後產生的檔案名稱
-        result_file = os.path.abspath(self.result_file)
+        result_file = os.path.abspath(selected_result_file)
+        if not os.path.exists(result_file):
+            self.last_error = f"找不到已處理盤查表單：{result_file}"
+            return False
+        self.result_file = result_file
         print(result_file)
+
+        try:
+            self._validate_report_source_workbook(result_file)
+        except ValueError as e:
+            self.last_error = str(e)
+            return False
 
         # # test code
         # result_file = r'D:\OneDrive - Accton Technology Corporation\Python\code\Excel_Vlookup_Python\結果\result_20250519_174550.xlsx'
         # template_file= r'D:\OneDrive - Accton Technology Corporation\Python\code\Excel_Vlookup_Python\智邦-產品碳足跡盤查總報告書_竹南_temp.docx'
 
         if result_file:
+            self._check_cancel()
             try:
                 # 在讀取前先更新公式快取值，確保公式計算後的值有被存入檔案中
-                self.update_excel_cache(result_file)
+                cache_ok = self.update_excel_cache(result_file)
+                if cache_ok is False:
+                    return False
             except Exception as e:
                 messagebox.showerror("錯誤", f"{e}")
                 return  False
 
-        base_dir = os.path.dirname(os.path.abspath(__file__))   # 取得目前 script 所在的資料夾
+        self._check_cancel()
         # 依據 template_choice 選擇不同模板
-        if template_choice == "竹南":
-            template_file = os.path.join(base_dir, "智邦-產品碳足跡盤查總報告書_竹南_temp.docx")
-        elif template_choice == "竹北":
-            template_file = os.path.join(base_dir, "智邦-產品碳足跡盤查總報告書_竹北_temp.docx")
-        elif template_choice == "越南":
-            template_file = os.path.join(base_dir, "智邦-產品碳足跡盤查總報告書_越南_temp.docx")
-        else:
+        template_filename = REPORT_TEMPLATE_FILENAMES.get(template_choice)
+        if not template_filename:
             messagebox.showerror("錯誤", "未知的報告模板選項")
             return
+        template_file = self._get_required_resource_path(
+            template_filename,
+            "Word 報告模板",
+            os.path.join(self.base_dir, template_filename),
+        )
         if self.update_progress_smooth:
             self.update_progress_smooth(0, 10, step=1, delay=0.02)  # 第一階段完成：10%
         
         # 開啟選定的 Word 模板
-        if not os.path.exists(template_file):
-            messagebox.showerror(
-                "錯誤",
-                f"找不到 Word 模板檔：{template_file}"
-            )
-            return  False
         try:
+            self._check_cancel()
             doc = Document(template_file)
         except Exception as e:
             print("錯誤", f"開啟 Word template 失敗：{e}")
@@ -1210,6 +2787,7 @@ class ExcelApp:
         transport_sheets = ['Raw Material', 'Manufacturing', 'Distribution']
 
         self._notify_status("讀取數據處理後產生的檔案...")
+        self._check_cancel()
         df = pd.read_excel(result_file, sheet_name="overview") # 讀取盤查表單'overview'所需的欄位數值​
 
         today_date = datetime.today().strftime("%Y-%m-%d_%H%M%S")
@@ -1221,6 +2799,7 @@ class ExcelApp:
         # 建立存放各筆資料的 context 清單
         all_contexts = []
         for _, row in df.iterrows():
+            self._check_cancel()
             if pd.isna(row['start_date']) or pd.isna(row['end_date']):
                 continue
 
@@ -1244,12 +2823,13 @@ class ExcelApp:
 
         if all_contexts:
             try:
+                self._check_cancel()
                 # 建立 DocxTemplate 物件
                 doc = DocxTemplate(template_file)
                 # 模板中可使用 {% for item in all_contexts %} ... {% endfor %} 來逐筆列印資料
                 doc.render(self.context) #使用 docxtpl 模組來套用這些資料到 Word 模板中
                 full_output_name = f"智邦-產品碳足跡盤查總報告書_{today_date}.docx"   #命名output_doc
-                full_output_path = os.path.join(self.output_dir, full_output_name)
+                full_output_path = os.path.join(self.tmp_dir, full_output_name)
                 doc.save(full_output_path)
             except Exception as e:
                 messagebox.showerror("錯誤", f"生成報告時發生錯誤：{e}")
@@ -1263,48 +2843,63 @@ class ExcelApp:
         # === 3. 以盤查表單作為基底，繼續處理其數據與圖表，生成完整報告書 ===
         # 呼叫各個盤查表單統整計算函式，將數據與圖表插入報告中
         self._notify_status("呼叫各個盤查表單統整計算函式，將數據與圖表生成...")
+        self._check_cancel()
         all_results = self.process_all_worksheets(result_file, sheet_names)
+        self._check_cancel()
         self.insert_data_to_word(all_results, sheet_names)
+        self._check_cancel()
         self.generate_bar_chart(doc, all_results, sheet_names)
         if self.update_progress_smooth:
             self.update_progress_smooth(50, 60, step=1, delay=0.02)  # 第六階段完成：60%
         
         # Raw Material 處理與圖表生成
         self._notify_status("Raw Material 處理與圖表生成...")
+        self._check_cancel()
         resulall_data_1, Raw_data = self.process_worksheet(result_file, 'Raw Material')
+        self._check_cancel()
         self.process_insert_raw_data(result_file)
+        self._check_cancel()
         self.generate_insert_raw_charts(doc, Raw_data)
         if self.update_progress_smooth:
             self.update_progress_smooth(60, 70, step=1, delay=0.02)  # 第七階段完成：70%
         
         # Manufacturing 處理與圖表生成
         print("Manufacturing 處理與圖表生成...")
+        self._check_cancel()
         resulall_data_2, Manu_data = self.process_worksheet(result_file, 'Manufacturing')
+        self._check_cancel()
         self.process_insert_manufacturing_data(result_file)
+        self._check_cancel()
         self.generate_insert_manufacturing_charts(doc, Manu_data)
+        self._check_cancel()
         self.generate_and_insert_electric_chart(doc, resulall_data_2)
         if self.update_progress_smooth:
             self.update_progress_smooth(70, 80, step=1, delay=0.02)  # 第八階段完成：80%
         
         # 前十大統整處理
         self._notify_status("前十大統整處理與圖表生成...")
+        self._check_cancel()
         self.process_top10_data(sheet_names, result_file, doc)
         if self.update_progress_smooth:
             self.update_progress_smooth(80, 95, step=1, delay=0.02)  # 第十階段處理完畢前：95%
         
         # 運輸相關數據處理
         self._notify_status("運輸相關數據處理與圖表生成...")
+        self._check_cancel()
         Air_all_data = self.process_transport_data(result_file, transport_sheets)
+        self._check_cancel()
         self.analyze_and_chart_generate(Air_all_data, doc)
 
         # 將儲存在 self.context  的數據 & 圖表匯入
         self._notify_status("所有數據與圖表匯入報告書...")
+        self._check_cancel()
         doc.render(self.context)    
 
         # === 4. 存檔完整報告書 ===
         self._notify_status("保存文件...")
+        self._check_cancel()
         full_report_file = os.path.join(
-            self.output_dir, f"智邦-產品碳足跡盤查總報告書_{today_date}.docx")
+            self.report_dir, f"智邦-產品碳足跡盤查總報告書_{today_date}.docx")
         doc.save(full_report_file)
         if self.update_progress_smooth:
             self.update_progress_smooth(95, 100, step=1, delay=0.02)  # 完全完成：100%
@@ -1314,6 +2909,7 @@ class ExcelApp:
 
     def process_worksheet(self, file_name, sheet_name):
         """處理單個表單的數據，返回結果字典和整合數據框。"""
+        self._check_cancel()
         df = pd.read_excel(file_name, sheet_name=sheet_name)  
         group_starts = df.index[df.iloc[:, 1].str.contains('^◎', na=False)].tolist()
         # 初始化一个空的字典，用于存储每个数据组的结果
@@ -1321,6 +2917,7 @@ class ExcelApp:
         all_data = pd.DataFrame()    
         # 循环处理每个数据群组
         for j in range(len(group_starts)):
+            self._check_cancel()
             start_idx = group_starts[j]
             end_idx = group_starts[j + 1] if j < len(group_starts) - 1 else df.shape[0]
 
@@ -1328,9 +2925,9 @@ class ExcelApp:
             group_data = df.iloc[start_idx:end_idx, :]
 
             # 删除第一列和第二列的无效数据，并将第三列作为列标题
-            group_data = group_data.iloc[2:, 1:]
+            group_data = group_data.iloc[2:, 1:].copy()
             group_data.columns = group_data.iloc[0, :]
-            group_data = group_data.iloc[1:, :]
+            group_data = group_data.iloc[1:, :].copy()
 
             num_cols = [
             'fossil(kg CO2-eq)',
@@ -1340,7 +2937,8 @@ class ExcelApp:
             ]
             # 1) 型別轉換與空值補 0
             for c in num_cols:
-                group_data[c] = group_data[c].astype(float).fillna(0)
+                self._check_cancel()
+                group_data[c] = pd.to_numeric(group_data[c], errors='coerce').fillna(0)
             # 2) 過濾：只保留「至少一個數值欄位非 0」的列
             mask = group_data[num_cols].sum(axis=1) != 0
             group_data = group_data.loc[mask]
@@ -1376,8 +2974,10 @@ class ExcelApp:
 
     def process_all_worksheets(self, file_name, sheet_names):
         """處理多個表單的數據，返回所有結果。"""
+        self._check_cancel()
         all_results = {}
         for sheet in sheet_names:
+            self._check_cancel()
             resulall_data, all_data = self.process_worksheet(file_name, sheet)
             all_results[sheet] = {'resulall_data': resulall_data, 'all_data': all_data}
             # print(all_results)
@@ -1391,6 +2991,7 @@ class ExcelApp:
         - doc: Document，Word 文件對象。
         - data_mapping: dict，標籤與數據的對應字典，例如 {'[TAG_1]': 'value1', '[TAG_2]': 'value2'}。
         """
+        self._check_cancel()
         print("【Process_2】開始將數據匯入 Word 文件")
         # 遍歷文檔中的所有段落，尋找標籤
         total_damage_assessment = 0
@@ -1398,6 +2999,7 @@ class ExcelApp:
         sum_biogenic = 0
         sum_land = 0
         for sheet in all_results.keys():
+            self._check_cancel()
             total_damage_assessment += all_results[sheet]['all_data']['Damage Assessment'].sum()
             sum_fossil += all_results[sheet]['all_data']['fossil(kg CO2-eq)'].sum()
             sum_biogenic += all_results[sheet]['all_data']['biogenic(kg CO2-eq)'].sum()
@@ -1405,6 +3007,7 @@ class ExcelApp:
          # 將碳排五階段統整的數值儲存至self.context
         sum_list = [] 
         for sheet in sheet_names:
+            self._check_cancel()
             sheet_key = re.sub(r'\W+', '_', sheet).strip('_')
             df = all_results[sheet]['all_data']
             fossil      = df['fossil(kg CO2-eq)'].sum()
@@ -1430,6 +3033,7 @@ class ExcelApp:
         sorted_sums = sorted(sum_list, key=lambda x: x[1], reverse=True)[:5]
 
         for idx, (sheet_key, val, names) in enumerate(sorted_sums, start=1):
+            self._check_cancel()
             pct = val / total_damage_assessment * 100
             # 存到 self.context
             self.context[f'Carbon_percentage_{idx}'] = f"{pct:.2f}%"
@@ -1446,6 +3050,7 @@ class ExcelApp:
         total_percentage_df = pd.DataFrame(columns=['Sheet', 'Total_Percentage'])
         # 假設 all_results 已經被填充了數據
         for sheet in sheet_names:
+            self._check_cancel()
             # 假設你已經有了每個工作表的 total_damage_assessment 值
             total_percentage = all_results[sheet]['all_data']['Damage Assessment'].sum() / total_damage_assessment * 100
             # 將數據添加到DataFrame中
@@ -1455,6 +3060,7 @@ class ExcelApp:
         print("total_percentage_df:", total_percentage_df)
 
         for j, row in total_percentage_df.iterrows():
+            self._check_cancel()
             self.context[f'Sheet_name_{j+1}']       = row['Sheet']
             self.context[f'Total_percentage_{j+1}'] = f"{round(row['Total_Percentage'],2)}%"
 
@@ -1478,6 +3084,7 @@ class ExcelApp:
         - sheet_names: list
             記錄各個工作表名稱的清單，如 ['Raw Material', 'Manufacturing', 'Distribution', ...]
         """
+        self._check_cancel()
         print("【Process_3】開始生成長條圖")
         # ------------------- 1. 計算各 Sheet 的 Damage Assessment 百分比長條圖 (bar_chart_1) -------------------
         # 先計算 total_damage_assessment
@@ -1491,6 +3098,7 @@ class ExcelApp:
         percentages = []
         sheet_labels = []
         for sheet in all_results:
+            self._check_cancel()
             sheet_sum = all_results[sheet]['all_data']['Damage Assessment'].sum()
             percentage = (sheet_sum / total_damage_assessment) * 100
             percentages.append(percentage)
@@ -1504,6 +3112,7 @@ class ExcelApp:
         plt.title('Percentage of Damage Assessment by Sheet')
         # 在每個 bar 上方添加數值標籤
         for i, bar in enumerate(bars):
+            self._check_cancel()
             bar.set_label(sheet_names[i])  # 如果您想在 legend 中顯示 sheet_names[i]
             yval = bar.get_height()
             plt.text(
@@ -1517,7 +3126,8 @@ class ExcelApp:
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(sheet_names), loc='upper right')
         plt.tight_layout()  # 確保標籤、標題不重疊
-        plt.savefig('bar_chart_1.png', bbox_inches='tight')
+        bar_chart_1_path = self._chart_path("bar_chart_1.png")
+        plt.savefig(bar_chart_1_path, bbox_inches='tight')
         # plt.show()
         # ------------------- 2. 產生各 Sheet 在 fossil/biogenic/land transformation 三項佔比 (bar_chart_2) -------------------
         categories = ['fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)']
@@ -1526,7 +3136,9 @@ class ExcelApp:
 
         # 計算 percentage
         for category in categories:
+            self._check_cancel()
             for sheet in sheet_labels:
+                self._check_cancel()
                 category_value = all_results[sheet]['all_data'][category].sum()
                 percentage = (category_value / total_damage_assessment) * 100 if total_damage_assessment > 0 else 0
                 category_data[category].append(percentage)
@@ -1539,6 +3151,7 @@ class ExcelApp:
         bars_all = []  # 用於存放所有條形的物件引用
 
         for i, sheet in enumerate(sheet_labels):
+            self._check_cancel()
             bar_positions = index + i * bar_width
             bar = plt.bar(
                 bar_positions,
@@ -1551,7 +3164,9 @@ class ExcelApp:
 
         # 為每個 bar 添加數值標籤
         for bar_group in bars_all:
+            self._check_cancel()
             for bar in bar_group:
+                self._check_cancel()
                 height = bar.get_height()
                 plt.text(
                     bar.get_x() + bar.get_width() / 2,
@@ -1568,16 +3183,17 @@ class ExcelApp:
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(title='Sheet Name')
         plt.tight_layout()
-        plt.savefig('bar_chart_2.png', bbox_inches='tight')
+        bar_chart_2_path = self._chart_path("bar_chart_2.png")
+        plt.savefig(bar_chart_2_path, bbox_inches='tight')
         # plt.show()
 
         # ------------------- 3. 將繪製好的圖儲存至self.context -------------------
         chart_1 = InlineImage(doc,
-                        'bar_chart_1.png',
+                        bar_chart_1_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
         chart_2 = InlineImage(doc,
-                        'bar_chart_2.png',
+                        bar_chart_2_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 
@@ -1600,6 +3216,7 @@ class ExcelApp:
         Raw_data : pandas.DataFrame
             統整後的 Raw Material 資料表。(即 all_data)
         """
+        self._check_cancel()
         print("【Process_4】開始處理原材料數據")
         # (A) 改用通用的 process_worksheet
         # resulall_data_1 可以保留在需要的話使用，但主要我們只需要 all_data
@@ -1610,6 +3227,7 @@ class ExcelApp:
         self.context['Raw_total'] = round(raw_sum, 4)
 
         for idx, row in Raw_data.head(10).reset_index(drop=True).iterrows():
+            self._check_cancel()
             i = idx + 1  # 1-based index
             self.context[f'Raw_Name_{i}']              = row['Name']
             self.context[f'Raw_name_of_database_{i}']  = row['name of database']
@@ -1620,6 +3238,7 @@ class ExcelApp:
 
         # （如果少於十筆，也可選擇把沒有資料的 key 先設成空字串）
         for i in range(len(Raw_data)+1, 11):
+            self._check_cancel()
             self.context[f'Raw_Name_{i}']              = ""
             self.context[f'Raw_name_of_database_{i}']  = ""
             self.context[f'Raw_Damage_Assessment_{i}'] = ""
@@ -1655,6 +3274,7 @@ class ExcelApp:
         None
             直接在函式內完成繪圖、儲存圖片與插入 Word 不返回任何值。
         """
+        self._check_cancel()
         print("【Process_5】開始生成並插入原材料圖表")
         # ------------------ 1. 準備繪圖資料 ------------------
         name_values = Raw_data['Name'].head(10).fillna(0)
@@ -1683,6 +3303,7 @@ class ExcelApp:
 
         # 在每個 bar 上方顯示對應數值
         for i, bar in enumerate(bars):
+            self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), 
@@ -1693,7 +3314,8 @@ class ExcelApp:
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(name_values) + [remaining_name], loc='upper right')
         plt.tight_layout()
-        plt.savefig('bar_chart_3.png', bbox_inches='tight')
+        bar_chart_3_path = self._chart_path("bar_chart_3.png")
+        plt.savefig(bar_chart_3_path, bbox_inches='tight')
         # plt.show()
 
         # ------------------ 3. 繪製圓餅圖 (pie_chart_4.png) ------------------
@@ -1755,6 +3377,7 @@ class ExcelApp:
         # 在每個 wedge 上加百分比標籤（帶箭頭）
         if not only_no_data:
             for i, wedge in enumerate(wedges):
+                self._check_cancel()
                 ang = (wedge.theta2 - wedge.theta1) / 2 + wedge.theta1
                 x = wedge.r * 0.85 * np.cos(np.deg2rad(ang))
                 y = wedge.r * 0.85 * np.sin(np.deg2rad(ang))
@@ -1783,18 +3406,19 @@ class ExcelApp:
             plt.title('No Data Available')  # 設定標題，避免 `tight_layout()` 崩潰
         else:
             plt.tight_layout()
-        plt.savefig('pie_chart_4.png', bbox_inches='tight')
+        pie_chart_4_path = self._chart_path("pie_chart_4.png")
+        plt.savefig(pie_chart_4_path, bbox_inches='tight')
         # plt.show()
 
 
         # ------------------ 4. 將繪製好的圖儲存至self.context ------------------
 
         chart_3 = InlineImage(doc,
-                        'bar_chart_3.png',
+                        bar_chart_3_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
         chart_4 = InlineImage(doc,
-                        'pie_chart_4.png',
+                        pie_chart_4_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 
@@ -1822,6 +3446,7 @@ class ExcelApp:
         Manu_data : pandas.DataFrame
             綜合所有群組的彙整資料 (Damage Assessment 降冪排序)。
         """
+        self._check_cancel()
         print("【Process_6】開始處理製造數據")
         # 1. 呼叫通用函式 process_worksheet
         resulall_data_2, Manu_data = self.process_worksheet(file_name, 'Manufacturing')
@@ -1832,6 +3457,7 @@ class ExcelApp:
         self.context['Manufacturing_total'] = round(Manu_sum, 3)
 
         for idx, row in Manu_data.head(10).reset_index(drop=True).iterrows():
+            self._check_cancel()
             i = idx + 1  # 1-based index
             self.context[f'Manufacturing_Name_{i}']              = row['Name']
             self.context[f'Manufacturing_name_of_database_{i}']  = row['name of database']
@@ -1842,6 +3468,7 @@ class ExcelApp:
 
         # （如果少於十筆，也可選擇把沒有資料的 key 先設成空字串）
         for i in range(len(Manu_data)+1, 11):
+            self._check_cancel()
             self.context[f'Manufacturing_Name_{i}']              = ""
             self.context[f'Manufacturing_name_of_database_{i}']  = ""
             self.context[f'Manufacturing_Damage_Assessment_{i}'] = ""
@@ -1865,6 +3492,7 @@ class ExcelApp:
 
     def generate_insert_manufacturing_charts(self, doc, Manu_data):
         """將Manufacturing的Manu_data數據繪製長條圖並匯入至Word"""
+        self._check_cancel()
         print("【Process_7】開始生成並插入製造圖表")
         # 取得要繪製的資料，若缺值就以預設值替代
         name_values = Manu_data['Name'].head(10).fillna(0)
@@ -1888,6 +3516,7 @@ class ExcelApp:
         plt.ylabel('Damage Assessment')  # y轴标签
         plt.title('Damage Assessment by Name')  # 图表标题
         for i, bar in enumerate(bars):
+            self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width()/2, yval, round(yval, 4), ha='center', va='bottom')
@@ -1895,14 +3524,15 @@ class ExcelApp:
         plt.xticks(rotation=90)
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(name_values) + ['Remaining processes'], loc='upper right')
-        # 显示图表
-        plt.tight_layout()# 调整布局，确保标签和标题不重叠
-        plt.savefig('bar_chart_5.png', bbox_inches='tight')
+        # 顯示圖表
+        plt.tight_layout()# 調整佈局，確保標籤和標題不重疊
+        bar_chart_5_path = self._chart_path("bar_chart_5.png")
+        plt.savefig(bar_chart_5_path, bbox_inches='tight')
         # plt.show()
 
 
 
-        # 创建一个圓餅图
+        # 繪製一個餅圖
         if len(name_values) < 10:
             labels = list(name_values)
             sizes = list(damage_values)
@@ -1961,17 +3591,18 @@ class ExcelApp:
         if not only_no_data:
         # 為每個區塊添加注釋（包裝在 try/except 中以防個別失敗）
             for i, wedge in enumerate(wedges):
+                self._check_cancel()
                 ang = (wedge.theta2 - wedge.theta1) / 2 + wedge.theta1
                 x = wedge.r * 0.85 * np.cos(np.deg2rad(ang))
                 y = wedge.r * 0.85 * np.sin(np.deg2rad(ang))
                 percentage = f"{100 * sizes[i] / sum(sizes):1.1f}%"
-                connectionstyle = f"angle,angleA=0,angleB={ang}"# 设置指针样式
+                connectionstyle = f"angle,angleA=0,angleB={ang}"# 設定指針樣式
                 kw = dict(
                     arrowprops=dict(arrowstyle="->", connectionstyle=connectionstyle),
                     zorder=0, va="center"
                 )
                 
-                # 添加注释
+                # 新增註釋
                 plt.annotate(
                     percentage,
                     xy=(x, y),
@@ -1981,27 +3612,28 @@ class ExcelApp:
                     **kw
                 )
 
-        plt.axis('equal')  # 使得圆饼图是正圆的
+        plt.axis('equal')  # 使得圓餅圖是正圓的
         plt.subplots_adjust(left=0.3, right=0.7)
-        plt.title('Damage Assessment by Name (Pie Chart)')# 添加标题
-        legend = plt.legend(labels, loc='upper right', bbox_to_anchor=(1.5, 1))# 添加图例
+        plt.title('Damage Assessment by Name (Pie Chart)')# 新增標題
+        legend = plt.legend(labels, loc='upper right', bbox_to_anchor=(1.5, 1))# 新增圖例
 
-        # 显示图表
+        # 顯示圖表
         if labels == ['No Data']:
             plt.title('No Data Available')  # 設定標題，避免 `tight_layout()` 崩潰
         else:
             plt.tight_layout()
-        plt.savefig('pie_chart_6.png') 
+        pie_chart_6_path = self._chart_path("pie_chart_6.png")
+        plt.savefig(pie_chart_6_path) 
         # plt.show()
         print("【Process_7】已完成製造圖表生成與插入")  
         #--------------------------6. 將繪製好的圖儲存至self.context---------------------------
 
         chart_5 = InlineImage(doc,
-                        'bar_chart_5.png',
+                        bar_chart_5_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
         chart_6 = InlineImage(doc,
-                        'pie_chart_6.png',
+                        pie_chart_6_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 
@@ -2027,6 +3659,7 @@ class ExcelApp:
         None
             直接在函式內完成繪圖並插入圖片，不回傳任何值。
         """
+        self._check_cancel()
         print("【Process_8】開始生成並插入電力圖表")
         # 1. 取得電力資料 (G3 群組)
         if 'G3' not in resulall_data_2:
@@ -2058,6 +3691,7 @@ class ExcelApp:
 
         # 在每個長條顯示數值
         for i, bar in enumerate(bars):
+            self._check_cancel()
             val = bar.get_width()  # bar.get_width() 對應 x 軸長度(因為是 barh)
             plt.text(val, bar.get_y() + bar.get_height() / 2,
                     f"{val:.2f}",
@@ -2067,12 +3701,13 @@ class ExcelApp:
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(name_values), loc='upper right')
         plt.tight_layout()
-        plt.savefig('bar_chart_8.png', bbox_inches='tight')
+        bar_chart_8_path = self._chart_path("bar_chart_8.png")
+        plt.savefig(bar_chart_8_path, bbox_inches='tight')
         # plt.show()
 
         
         chart_8 = InlineImage(doc,
-            'bar_chart_8.png',
+            bar_chart_8_path,
             width=Inches(5.83),
             height=Inches(3.81))
 
@@ -2092,17 +3727,20 @@ class ExcelApp:
         Returns:
         - combined_all_data: DataFrame, 統整的前十大數值數據。
         """
+        self._check_cancel()
         print("【Process_9】開始生成前十大數據長條圖")
         combined_all_data = pd.DataFrame()
         all_results = {}
 
         # 處理每個工作表數據
         for sheet in sheet_names:
+            self._check_cancel()
             resulall_data, all_data = self.process_worksheet(input_file, sheet)
             all_results[sheet] = {'resulall_data': resulall_data, 'all_data': all_data}
 
         # 合併所有工作表的數據
         for sheet, data in all_results.items():
+            self._check_cancel()
             combined_all_data = pd.concat([combined_all_data, data['all_data']], axis=0)
 
         # 按照 'Damage Assessment' 列進行排序
@@ -2126,10 +3764,12 @@ class ExcelApp:
         - combined_all_data: DataFrame, 統整的前十大數據。
         - all_results: dict, 全階段的處理數據。
         """
+        self._check_cancel()
         print("【Process_10】開始將前十大數據匯入 Word 文件")
         
         # 1. 前十大 Name, name_of_database, Damage_Assessment 與 percentage
         for j in range(1, 11):
+            self._check_cancel()
             idx = j - 1
             row = combined_all_data.iloc[idx]
             # 名稱
@@ -2159,6 +3799,7 @@ class ExcelApp:
         - combined_all_data: DataFrame, 統整的前十大數據。
         - doc: Document, Word 文件對象。
         """
+        self._check_cancel()
         print("【Process_11】開始生成前十大數據長條圖")
         name_values = combined_all_data['Name'].head(10)
         damage_values = combined_all_data['Damage Assessment'].head(10)
@@ -2176,6 +3817,7 @@ class ExcelApp:
         plt.ylabel('Damage Assessment')
         plt.title('Damage Assessment by Name')
         for i, bar in enumerate(bars):
+            self._check_cancel()
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), ha='center', va='bottom')
 
@@ -2184,12 +3826,12 @@ class ExcelApp:
         plt.legend(labels=list(name_values) + ['Remaining processes'], loc='upper right')
         plt.tight_layout()
 
-        bar_chart_path = 'bar_chart_7.png'
+        bar_chart_path = self._chart_path("bar_chart_7.png")
         plt.savefig(bar_chart_path, bbox_inches='tight')
         plt.close()
         # 將繪製好的圖儲存至self.context
         chart_7 = InlineImage(doc,
-                        'bar_chart_7.png',
+                        bar_chart_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 
@@ -2209,16 +3851,19 @@ class ExcelApp:
             dict: 每個工作表的分組結果。
             DataFrame: 合併後的所有數據。
         """
+        self._check_cancel()
         print("【Process_12】開始處理運輸數據")
         # transport_all_results = {}
         Air_all_data = pd.DataFrame()
 
         for sheet_name in transport_sheets:
+            self._check_cancel()
             sheet_df = pd.read_excel(file_name, sheet_name=sheet_name)
             group_starts = sheet_df.index[sheet_df.iloc[:, 1].str.contains('^◎', na=False)].tolist()
             # resulall_data_3 = {}
 
             for j in range(len(group_starts)):
+                self._check_cancel()
                 start_idx = group_starts[j]
                 end_idx = group_starts[j + 1] if j < len(group_starts) - 1 else sheet_df.shape[0]
                 sub_df = sheet_df.iloc[start_idx:end_idx, :]
@@ -2252,11 +3897,13 @@ class ExcelApp:
 
         # ---- 新增：清空以前的 Air_* keys（若有的話） ----
         for k in list(self.context):
+            self._check_cancel()
             if k.startswith('Air_'):
                 del self.context[k]
         # ---- 新增：把 merged 的每一列放到 self.context  ----
         total = Air_all_data['Damage Assessment'].sum()
         for idx, row in enumerate(Air_all_data.itertuples(index=False), start=1):
+            self._check_cancel()
             # row.Name, row._3 (對應 name of database), row._2（Damage Assessment）依實際欄位順序與屬性名稱調整
             self.context[f'Air_Name_{idx}']              = row.Name
             self.context[f'Air_name_of_database_{idx}']  = row._3
@@ -2293,6 +3940,7 @@ class ExcelApp:
         Returns:
             None
         """
+        self._check_cancel()
         print("【Process_13】開始生成運輸相關圖表並插入 Word 文件")
         # 分析運輸數據
         name_values = Air_all_data['Name'].head(10)
@@ -2316,39 +3964,41 @@ class ExcelApp:
         if pd.isna(remaining_value):
             remaining_value = 0
 
-        # 创建一个颜色列表，包含前十项的颜色和一个总和项的颜色
+        # 建立一個顏色列表，包含前十項的顏色和一個總和項的顏色
         colors = [
             '#e0e462', '#d9ed92', '#b5e48c', '#99d98c', '#76c893', 
             '#52b69a', '#34a0a4', '#168aad', '#1a759f', '#184e77', 'grey'
         ]
 
-        # 创建一个条形图
-        plt.figure(figsize=(10, 6))  # 设置图表的大小
-        bars = plt.bar(name_values, damage_values, color=colors)  # 创建条形图
-        plt.bar(remaining_name, remaining_value, color='grey')  # 创建条形图
+        # 建立一個長條圖
+        plt.figure(figsize=(10, 6))  # 設定圖表的大小
+        bars = plt.bar(name_values, damage_values, color=colors)  # 建立長條圖
+        plt.bar(remaining_name, remaining_value, color='grey')  # 建立長條圖
 
-        # 添加标签和标题
-        plt.xlabel('Name')  # x轴标签
-        plt.ylabel('Damage Assessment')  # y轴标签
-        plt.title('運輸碳排')  # 图表标题
+        # 添加標籤和標題
+        plt.xlabel('Name')  # x軸標籤
+        plt.ylabel('Damage Assessment')  # y軸標籤
+        plt.title('運輸碳排')  # 圖表標題
 
         for i, bar in enumerate(bars):
+            self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
             plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), ha='center', va='bottom')
 
-        # 旋转x轴标签，以避免重叠
+        # 旋轉x軸標籤，以避免重叠
         plt.xticks(rotation=45)
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.legend(labels=list(name_values) + ['Remaining processes'], loc='upper right')
 
-        # 显示图表
-        plt.tight_layout()  # 调整布局，确保标签和标题不重叠
-        plt.savefig('bar_chart_9.png', bbox_inches='tight')
+        # 顯示圖表
+        plt.tight_layout()  # 調整佈局，確保標籤和標題不重疊
+        bar_chart_9_path = self._chart_path("bar_chart_9.png")
+        plt.savefig(bar_chart_9_path, bbox_inches='tight')
         # plt.show()
         # 將繪製好的圖儲存至self.context
         chart_9 = InlineImage(doc,
-                        'bar_chart_9.png',
+                        bar_chart_9_path,
                         width=Inches(5.83),
                         height=Inches(3.81))
 
@@ -2361,9 +4011,26 @@ class ExcelApp:
         從 start 到 end 平滑更新進度，
         每次增加 step，延遲 delay 秒（單位秒）。
         """
+        self._check_cancel()
         if self.progress_callback:
             # 確保整數更新
             for value in range(start, end + 1, step):
+                self._check_cancel()
                 self.progress_callback(value)
                 time.sleep(delay)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
