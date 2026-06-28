@@ -8,6 +8,7 @@ import pythoncom
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -736,7 +737,8 @@ class GUI:
         return jobs
 
     def _create_refresh_temp_copy(self, file_path, product_name=""):
-        tmp_dir = getattr(self.excel, "tmp_dir", os.path.join(os.getcwd(), "tmp"))
+        tmp_root = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        tmp_dir = os.path.join(tmp_root, "Excel_Vlookup_Python", "refresh_tmp")
         os.makedirs(tmp_dir, exist_ok=True)
         base_name = os.path.splitext(os.path.basename(file_path))[0]
         safe_product = self._sanitize_filename_component(product_name) or "default"
@@ -1731,7 +1733,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = GUI(root)
     root.mainloop()
-
 
 
 
