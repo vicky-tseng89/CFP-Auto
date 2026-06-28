@@ -26,6 +26,7 @@ import tkinter as tk
 import win32com.client as win32
 import xlsxwriter
 from openpyxl.styles.colors import Color
+from openpyxl.utils import column_index_from_string
 from openpyxl.utils.datetime import MAC_EPOCH, WINDOWS_EPOCH, to_excel
 import traceback
 import unicodedata
@@ -55,6 +56,8 @@ COM_REFRESH_TIMEOUT_SEC = 120.0
 COM_REFRESH_POLL_SEC = 1.0
 COM_REFRESH_RETRY_COUNT = 2
 COM_REFRESH_RETRY_DELAY_SEC = 1.0
+XL_CONNECTION_TYPE_OLEDB = 1
+XL_CONNECTION_TYPE_ODBC = 2
 INVALID_EXTERNAL_FORMULA_RE = re.compile(r"\[\d+\]Sheet!", re.IGNORECASE)
 TRANSPORT_LOCATION_MAPPING_FILENAME = "airport_port_land_location_mapping.xlsx"
 RESOURCES_DIRNAME = "resources"
@@ -71,6 +74,40 @@ CARBON_STAGE_OPTIONS = (
     ("Distribution", "配送"),
     ("Usage", "使用"),
     ("Recycling", "廢棄回收"),
+)
+UNSPECIFIED_EMISSION_COLUMN = "unspecified(kg CO2-eq)"
+EMISSION_RESULT_COLUMNS = (
+    UNSPECIFIED_EMISSION_COLUMN,
+    "fossil(kg CO2-eq)",
+    "biogenic(kg CO2-eq)",
+    "land transformation (kg CO2-eq)",
+)
+EMISSION_CONTEXT_SUFFIXES = {
+    UNSPECIFIED_EMISSION_COLUMN: "unspecified",
+    "fossil(kg CO2-eq)": "fossil",
+    "biogenic(kg CO2-eq)": "biogenic",
+    "land transformation (kg CO2-eq)": "land",
+}
+REPORT_GENERAL_STAGE_COLUMNS = {
+    "Raw Material": "B",
+    "Manufacturing": "C",
+    "Distribution": "D",
+    "Usage": "E",
+    "Recycling": "F",
+}
+AIR_STAGE_CONTEXT_KEYS = {
+    "Raw Material": "Raw_Material_Air",
+    "Manufacturing": "Manufacturing_Air",
+    "Distribution": "Distribution_Air",
+    "Usage": "Usage_Air",
+    "Recycling": "Recycling_Air",
+}
+AIR_TRANSPORT_TYPES = {"air", "空運"}
+REPORT_GENERAL_ROW_LABELS = (
+    "GWP100 - unspecified",
+    "GWP100 - fossil",
+    "GWP100 - biogenic",
+    "GWP100 - land transformation",
 )
 ROAD_TRANSPORT_TYPES = {
     "road",
@@ -228,13 +265,23 @@ class ExcelComSession:
         while attempt < max(1, retry_count) and (time.time() - start) < max(0.1, timeout_sec):
             attempt += 1
             try:
-                workbook.Save()
+                save_member = getattr(workbook, "Save", None)
+                if callable(save_member):
+                    save_member()
+                else:
+                    dispid = workbook._oleobj_.GetIDsOfNames("Save")
+                    workbook._oleobj_.Invoke(dispid, 0, pythoncom.DISPATCH_METHOD, True)
                 return True
             except Exception as exc:
                 if isinstance(exc, AttributeError):
-                    raise AttributeError(
-                        f"{exc} | workbook_proxy={self._describe_dispatch(workbook)}"
-                    ) from exc
+                    try:
+                        dispid = workbook._oleobj_.GetIDsOfNames("Save")
+                        workbook._oleobj_.Invoke(dispid, 0, pythoncom.DISPATCH_METHOD, True)
+                        return True
+                    except Exception as fallback_exc:
+                        exc = AttributeError(
+                            f"{exc} | direct_save={fallback_exc} | workbook_proxy={self._describe_dispatch(workbook)}"
+                        )
                 if hasattr(exc, "args") and exc.args and exc.args[0] == -2147418111:
                     time.sleep(retry_delay_sec)
                     continue
@@ -469,6 +516,35 @@ class ExcelApp:
         self._warnings.append(message)
         self.logger.warning("[run_id=%s] %s", self.current_run_id or "-", message)
 
+    def _disable_refresh_on_file_open(self, workbook):
+        connection_attr_by_type = {
+            XL_CONNECTION_TYPE_OLEDB: "OLEDBConnection",
+            XL_CONNECTION_TYPE_ODBC: "ODBCConnection",
+        }
+        try:
+            connections = workbook.Connections
+        except Exception as exc:
+            self._warn(f"Workbook connection inspection skipped: {exc}")
+            return
+
+        for conn in connections:
+            conn_name = ""
+            with suppress(Exception):
+                conn_name = str(conn.Name)
+            try:
+                conn_type = int(conn.Type)
+            except Exception as exc:
+                self._warn(f"Connection refresh-on-open skipped: {conn_name or '<unknown>'}: {exc}")
+                continue
+            connection_attr = connection_attr_by_type.get(conn_type)
+            if not connection_attr:
+                continue
+            try:
+                connection_obj = getattr(conn, connection_attr)
+                connection_obj.RefreshOnFileOpen = False
+            except Exception as exc:
+                self._warn(f"Connection refresh-on-open skipped: {conn_name or '<unknown>'}: {exc}")
+
     def _result_ok(self, message: str, artifacts: Dict[str, Any], started_at: float) -> TaskResult:
         return TaskResult(
             ok=True,
@@ -609,6 +685,21 @@ class ExcelApp:
             callback = self._no_op_status_callback
             self._has_status_callback = False
         callback(message)
+
+    @staticmethod
+    def _format_report_number(value) -> str:
+        """Format generated report numbers with exactly four decimals."""
+        if value is None or value == "":
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return str(value)
 
     def _sanitize_invalid_external_formulas(self, workbook) -> int:
         """
@@ -1454,7 +1545,11 @@ class ExcelApp:
             self.update_progress_smooth(10, 40, step=1, delay=0.05) # 階段2：讀取工作表B，處理工作表並計算數值，模擬進度從 10% 到 40%
             # 以 pandas 讀入另一張關鍵對照表（sheet_B，如 simapro10.2.0.0）
             self._check_cancel()
-            sheet_B = pd.read_excel(self.file_path, sheet_name='simapro10.2.0.0', usecols=['單位對照', 'fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)', 'unit']).dropna(subset=['單位對照'])
+            sheet_B = pd.read_excel(
+                self.file_path,
+                sheet_name='simapro10.2.0.0',
+                usecols=['單位對照', *EMISSION_RESULT_COLUMNS, 'unit'],
+            ).dropna(subset=['單位對照'])
             self._notify_status("處理工作表並獲取總值...")
             print("處理工作表並獲取總值...")
             stage_calc_columns = {
@@ -1464,7 +1559,10 @@ class ExcelApp:
                 "Usage": "Q",
                 "Recycling": "Q",
             }
-            stage_totals = {stage_name: (0, 0, 0) for stage_name, _ in CARBON_STAGE_OPTIONS}
+            stage_totals = {
+                stage_name: tuple(0 for _ in EMISSION_RESULT_COLUMNS)
+                for stage_name, _ in CARBON_STAGE_OPTIONS
+            }
             for stage_name in selected_stage_list:
                 stage_totals[stage_name] = self.process_tables(
                     stage_tables[stage_name],
@@ -1494,11 +1592,7 @@ class ExcelApp:
             self._notify_status("每個工作表的加總值寫入指定的單元格...")
             print("每個工作表的加總值寫入指定的單元格...")
             # 將每個工作表的加總值寫入指定的單元格
-            report_sheet['B2'], report_sheet['B3'], report_sheet['B4'] = stage_totals["Raw Material"]
-            report_sheet['C2'], report_sheet['C3'], report_sheet['C4'] = stage_totals["Manufacturing"]
-            report_sheet['D2'], report_sheet['D3'], report_sheet['D4'] = stage_totals["Distribution"]
-            report_sheet['E2'], report_sheet['E3'], report_sheet['E4'] = stage_totals["Usage"]
-            report_sheet['F2'], report_sheet['F3'], report_sheet['F4'] = stage_totals["Recycling"]
+            self._write_report_stage_totals(report_sheet, stage_totals)
             self.update_progress_smooth(70, 95, step=1, delay=0.05) # 階段4：儲存結果，模擬進度從 70% 到 99%
             # 獲取當前的日期和時間，用於生成檔案名稱
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1610,6 +1704,22 @@ class ExcelApp:
             result = chr(65 + remainder) + result
         return result
 
+    def _write_report_stage_totals(self, report_sheet, stage_totals):
+        """Write four GWP split totals into report_temp.xlsx/general."""
+        for row_offset, label in enumerate(REPORT_GENERAL_ROW_LABELS, start=2):
+            report_sheet[f"A{row_offset}"] = label
+
+        for stage_name, col_letter in REPORT_GENERAL_STAGE_COLUMNS.items():
+            totals = stage_totals.get(
+                stage_name,
+                tuple(0 for _ in EMISSION_RESULT_COLUMNS),
+            )
+            for row_offset, value in enumerate(totals, start=2):
+                cell = report_sheet[f"{col_letter}{row_offset}"]
+                cell.value = value
+                cell.number_format = "0.0000"
+            report_sheet[f"{col_letter}6"] = f"=SUM({col_letter}2:{col_letter}5)"
+
     def _normalize_table_columns(self, header):
         """
         Make table headers safe for pandas operations.
@@ -1677,9 +1787,9 @@ class ExcelApp:
         根據不同表格使用不同的欄位進行計算
         並將數據進行單位換算
         """
-        total_fossil = 0
-        total_biogenic = 0
-        total_land_transformation = 0
+        total_by_column = {col: 0 for col in EMISSION_RESULT_COLUMNS}
+        start_col_idx = column_index_from_string(col_start)
+        damage_col_letter = self._excel_col_letter(start_col_idx + len(EMISSION_RESULT_COLUMNS))
         for i, (start_idx, sheet_data) in enumerate(sheet_tables):
             self._check_cancel()
             required_cols = ['name of database']
@@ -1720,20 +1830,25 @@ class ExcelApp:
                 self._warn(f"【{sheet_name} 第 {i+1} 個表格】找不到 Coefficient value 欄位，略過係數公式寫入。")
             
             # 1) 保留原本表格內既有的 result（若有）
-            for col in [
-                'fossil(kg CO2-eq)_result',
-                'biogenic(kg CO2-eq)_result',
-                'land transformation (kg CO2-eq)_result'
-            ]:
-                if col in merged_df.columns:
-                    merged_df[col + "_manual"] = pd.to_numeric(merged_df[col], errors="coerce")
+            for emission_col in EMISSION_RESULT_COLUMNS:
+                result_col = f"{emission_col}_result"
+                if result_col in merged_df.columns:
+                    merged_df[result_col + "_manual"] = pd.to_numeric(
+                        merged_df[result_col],
+                        errors="coerce",
+                    )
+                elif emission_col in merged_df.columns:
+                    merged_df[result_col + "_manual"] = pd.to_numeric(
+                        merged_df[emission_col],
+                        errors="coerce",
+                    )
                 else:
-                    merged_df[col + "_manual"] = pd.NA
+                    merged_df[result_col + "_manual"] = pd.NA
 
             # 2) 初始化計算欄位（先用手動值當預設）
-            merged_df['fossil(kg CO2-eq)_result'] = merged_df['fossil(kg CO2-eq)_result_manual']
-            merged_df['biogenic(kg CO2-eq)_result'] = merged_df['biogenic(kg CO2-eq)_result_manual']
-            merged_df['land transformation (kg CO2-eq)_result'] = merged_df['land transformation (kg CO2-eq)_result_manual']
+            for emission_col in EMISSION_RESULT_COLUMNS:
+                result_col = f"{emission_col}_result"
+                merged_df[result_col] = merged_df[result_col + "_manual"]
 
             # 判斷工作表和工作表B的單位是否一致
             for idx, row in merged_df.iterrows():
@@ -1769,78 +1884,75 @@ class ExcelApp:
                     continue
 
                 # 係數若缺值，就不要覆蓋手動值（維持上面初始化的 manual）
-                try:
-                    fossil_value = float(row['fossil(kg CO2-eq)_y'])
-                    biogenic_value = float(row['biogenic(kg CO2-eq)_y'])
-                    land_transformation_value = float(row['land transformation (kg CO2-eq)_y'])
-                except (ValueError, TypeError):
-                    continue
-
-                # 若係數是 NaN，也不要覆蓋手動值
-                if any(pd.isna(v) for v in [fossil_value, biogenic_value, land_transformation_value]):
-                    continue
-
-                merged_df.at[idx, 'fossil(kg CO2-eq)_result'] = quantity * fossil_value * conversion_factor
-                merged_df.at[idx, 'biogenic(kg CO2-eq)_result'] = quantity * biogenic_value * conversion_factor
-                merged_df.at[idx, 'land transformation (kg CO2-eq)_result'] = quantity * land_transformation_value * conversion_factor
+                for emission_col in EMISSION_RESULT_COLUMNS:
+                    coefficient_value = pd.to_numeric(
+                        row.get(f"{emission_col}_y"),
+                        errors="coerce",
+                    )
+                    if pd.isna(coefficient_value):
+                        continue
+                    merged_df.at[idx, f"{emission_col}_result"] = (
+                        quantity * float(coefficient_value) * conversion_factor
+                    )
 
             
             # 更新原始的工作表中的相關欄位，並小數點後 10 位無條件捨去
             sheet = workbook[sheet_name]
-            for idx, value in enumerate(merged_df['fossil(kg CO2-eq)_result'], start=start_idx + 3):
-                if pd.notna(value):
-                    truncated = math.trunc(value * 10**10) / 10**10
-                    sheet[f'{col_start}{idx + 1}'] = truncated
-            for idx, value in enumerate(merged_df['biogenic(kg CO2-eq)_result'], start=start_idx + 3):
-                if pd.notna(value):
-                    truncated = math.trunc(value * 10**10) / 10**10
-                    sheet[f'{chr(ord(col_start) + 1)}{idx + 1}'] = truncated
-            for idx, value in enumerate(merged_df['land transformation (kg CO2-eq)_result'], start=start_idx + 3):
-                if pd.notna(value):
-                    truncated = math.trunc(value * 10**10) / 10**10
-                    sheet[f'{chr(ord(col_start) + 2)}{idx + 1}'] = truncated
+            for offset, emission_col in enumerate(EMISSION_RESULT_COLUMNS):
+                result_letter = self._excel_col_letter(start_col_idx + offset)
+                result_col = f"{emission_col}_result"
+                for idx, value in enumerate(merged_df[result_col], start=start_idx + 3):
+                    if pd.notna(value):
+                        truncated = math.trunc(value * 10**10) / 10**10
+                        sheet[f'{result_letter}{idx + 1}'] = truncated
 
-            # 假設 damage 欄位放在 fossil 欄位之後的下一欄
+            # 假設 damage 欄位放在四個 GWP 欄位之後的下一欄
             num_rows = len(merged_df)
             for i in range(num_rows):
                 self._check_cancel()
                 # Excel 的列號從 1 開始，所以 row_num 需要調整
                 row_num = start_idx + 3 + i + 1  
-                fossil_cell = f"{col_start}{row_num}"
-                biogenic_cell = f"{chr(ord(col_start) + 1)}{row_num}"
-                land_cell = f"{chr(ord(col_start) + 2)}{row_num}"
+                first_emission_cell = f"{col_start}{row_num}"
+                last_emission_cell = f"{self._excel_col_letter(start_col_idx + len(EMISSION_RESULT_COLUMNS) - 1)}{row_num}"
                 # 將 Damage Assessment 欄位設為公式
-                damage_cell = f'{chr(ord(col_start) + 3)}{row_num}'
-                sheet[damage_cell] = f"={fossil_cell}+{biogenic_cell}+{land_cell}"
+                damage_cell = f'{damage_col_letter}{row_num}'
+                sheet[damage_cell] = f"=SUM({first_emission_cell}:{last_emission_cell})"
                 if coefficient_col_letter is not None:
                     quantity_cell = f"{quantity_col_letter}{row_num}"
                     sheet[f"{coefficient_col_letter}{row_num}"] = f'=IFERROR({damage_cell}/{quantity_cell},"")'
             
             self._notify_status("計算加總值並寫入每個表格的第一行...")
             # 計算加總值並寫入每個表格的第一行，並做小數點後 4 位四捨五入捨去
-            fossil_total = round(merged_df['fossil(kg CO2-eq)_result'].sum(), 10)
-            biogenic_total = round(merged_df['biogenic(kg CO2-eq)_result'].sum(), 10)
-            land_transformation_total = round(merged_df['land transformation (kg CO2-eq)_result'].sum(), 10)
+            table_totals = {
+                emission_col: round(merged_df[f"{emission_col}_result"].sum(), 10)
+                for emission_col in EMISSION_RESULT_COLUMNS
+            }
 
             # 計算加總值並寫入每階段的第一行
-            total_fossil += fossil_total
-            total_biogenic += biogenic_total
-            total_land_transformation += land_transformation_total
+            for emission_col, value in table_totals.items():
+                total_by_column[emission_col] += value
 
             first_row_idx = start_idx + 1
-            sheet[f'{col_start}{first_row_idx}'] = fossil_total
-            sheet[f'{chr(ord(col_start) + 1)}{first_row_idx}'] = biogenic_total
-            sheet[f'{chr(ord(col_start) + 2)}{first_row_idx}'] = land_transformation_total
+            for offset, emission_col in enumerate(EMISSION_RESULT_COLUMNS):
+                result_letter = self._excel_col_letter(start_col_idx + offset)
+                sheet[f'{result_letter}{first_row_idx}'] = table_totals[emission_col]
+            sheet[f'{damage_col_letter}{first_row_idx}'] = round(sum(table_totals.values()), 10)
         self._notify_status("寫入所有表格的加總值...")
-        # 在每個工作表的 AB/AC/AD 欄位中寫入所有表格的加總值
-        sheet[f'AB2'] = round(total_fossil, 3)
-        sheet[f'AC2'] = round(total_biogenic, 3)
-        sheet[f'AD2'] = round(total_land_transformation, 3)
-        # 在每個工作表的 AE 欄位中寫入 AB/AC/AD 欄位的加總值
-        sheet[f'AE2'] = round(total_fossil + total_biogenic + total_land_transformation, 3)
+        # 在每個工作表的 AC/AD/AE/AF/AG 欄位中寫入所有表格的加總值
+        total_cells = {
+            "AC2": round(total_by_column[UNSPECIFIED_EMISSION_COLUMN], 4),
+            "AD2": round(total_by_column["fossil(kg CO2-eq)"], 4),
+            "AE2": round(total_by_column["biogenic(kg CO2-eq)"], 4),
+            "AF2": round(total_by_column["land transformation (kg CO2-eq)"], 4),
+            "AG2": round(sum(total_by_column.values()), 4),
+        }
+        for cell_ref, value in total_cells.items():
+            sheet[cell_ref] = value
+            sheet[cell_ref].number_format = '0.0000'
+        # 在每個工作表的 AG 欄位中寫入 AC/AD/AE/AF 欄位的加總值
 
         # 返回每個工作表的加總值
-        return total_fossil, total_biogenic, total_land_transformation
+        return tuple(total_by_column[col] for col in EMISSION_RESULT_COLUMNS)
     
     def find_insert_positions(self, worksheet):
         """
@@ -2038,6 +2150,9 @@ class ExcelApp:
                 fmt['right'] = _sty(side_styles['right']) or 1
                 if side_colors['right']:
                     fmt['right_color'] = side_colors['right']
+
+        if cell.number_format and cell.number_format != "General":
+            fmt["num_format"] = cell.number_format
 
         return fmt
 
@@ -2406,7 +2521,7 @@ class ExcelApp:
                             )
 
                 overview = wb_new.Sheets("overview")
-                overview.Range("H2").Formula = "='Raw Material'!AE2+Manufacturing!AE2+Distribution!AE2+Recycling!AE2+Usage!AE2"
+                overview.Range("H2").Formula = "='Raw Material'!AG2+Manufacturing!AG2+Distribution!AG2+Recycling!AG2+Usage!AG2"
                 overview.Range("V2").Formula = "=Usage!$K$5"
                 overview.Range("C17").Value = input_values["product_name"]
                 date_epoch = WINDOWS_EPOCH
@@ -2541,13 +2656,7 @@ class ExcelApp:
                     timeout_sec=self.runtime_config["open_timeout_sec"],
                 )
                 self._emit_progress(10)
-                for conn in workbook.Connections:
-                    with suppress(Exception):
-                        if hasattr(conn, "OLEDBConnection") and hasattr(conn.OLEDBConnection, "RefreshOnFileOpen"):
-                            conn.OLEDBConnection.RefreshOnFileOpen = False
-                    with suppress(Exception):
-                        if hasattr(conn, "OLEDBConnection") and hasattr(conn.OLEDBConnection, "EnableRefresh"):
-                            conn.OLEDBConnection.EnableRefresh = False
+                self._disable_refresh_on_file_open(workbook)
 
                 ws = workbook.Worksheets("INPUT")
                 input_range = ws.Range("B1:B3")
@@ -2754,15 +2863,15 @@ class ExcelApp:
                 if cache_ok is False:
                     return False
             except Exception as e:
-                messagebox.showerror("錯誤", f"{e}")
+                self.last_error = f"更新報告來源公式快取失敗：{e}"
                 return  False
 
         self._check_cancel()
         # 依據 template_choice 選擇不同模板
         template_filename = REPORT_TEMPLATE_FILENAMES.get(template_choice)
         if not template_filename:
-            messagebox.showerror("錯誤", "未知的報告模板選項")
-            return
+            self.last_error = "未知的報告模板選項"
+            return False
         template_file = self._get_required_resource_path(
             template_filename,
             "Word 報告模板",
@@ -2784,7 +2893,7 @@ class ExcelApp:
 
         # === 2. 定義工作表名稱，讀取盤查表單存放資料至 context 清單 ===
         sheet_names = ['Raw Material', 'Manufacturing', 'Distribution', 'Usage', 'Recycling']
-        transport_sheets = ['Raw Material', 'Manufacturing', 'Distribution']
+        transport_sheets = sheet_names
 
         self._notify_status("讀取數據處理後產生的檔案...")
         self._check_cancel()
@@ -2807,9 +2916,9 @@ class ExcelApp:
                 'product_name': row['product_name'],
                 'product_module': row['product_module'],
                 'product_size': row['product_size'],
-                'Gross_weight': row['product_weight'],
-                'Net_weight': row['product_net_weight'],
-                'Power': row['product_on_mode_Power'],
+                'Gross_weight': self._format_report_number(row['product_weight']),
+                'Net_weight': self._format_report_number(row['product_net_weight']),
+                'Power': self._format_report_number(row['product_on_mode_Power']),
                 'start_date': row['start_date'].strftime('%Y年%m月%d日'),
                 'end_date': row['end_date'].strftime('%Y年%m月%d日'),
                 # 'warranty': row['warranty'],
@@ -2832,10 +2941,10 @@ class ExcelApp:
                 full_output_path = os.path.join(self.tmp_dir, full_output_name)
                 doc.save(full_output_path)
             except Exception as e:
-                messagebox.showerror("錯誤", f"生成報告時發生錯誤：{e}")
-                return
+                self.last_error = f"生成報告時發生錯誤：{e}"
+                return False
         else:
-            messagebox.showwarning("警告", "匯入為空值，未生成 Word 文件")
+            self.last_error = "匯入為空值，未生成 Word 文件"
             return False
         if self.update_progress_smooth:
             self.update_progress_smooth(40, 50, step=1, delay=0.02)  # 第五階段完成：50%
@@ -2929,15 +3038,12 @@ class ExcelApp:
             group_data.columns = group_data.iloc[0, :]
             group_data = group_data.iloc[1:, :].copy()
 
-            num_cols = [
-            'fossil(kg CO2-eq)',
-            'biogenic(kg CO2-eq)',
-            'land transformation (kg CO2-eq)',
-            'Damage Assessment'
-            ]
+            num_cols = [*EMISSION_RESULT_COLUMNS, 'Damage Assessment']
             # 1) 型別轉換與空值補 0
             for c in num_cols:
                 self._check_cancel()
+                if c not in group_data.columns:
+                    group_data[c] = 0
                 group_data[c] = pd.to_numeric(group_data[c], errors='coerce').fillna(0)
             # 2) 過濾：只保留「至少一個數值欄位非 0」的列
             mask = group_data[num_cols].sum(axis=1) != 0
@@ -2948,17 +3054,27 @@ class ExcelApp:
             # 處理 name of database 欄位，将不同的值合并为一个字符串，使用分号分隔
             grouped_c = group_data.groupby('Name')['name of database'].apply(
                 lambda x: ';'.join(sorted(set(x.dropna())))).reset_index()
-            # 處理 fossil(kg CO2-eq) 欄位，将它们加总
-            fossil_values = group_data.groupby('Name')['fossil(kg CO2-eq)'].sum().reset_index()
-            # 處理 biogenic(kg CO2-eq) 欄位，将它们加总
-            biogenic_values = group_data.groupby('Name')['biogenic(kg CO2-eq)'].sum().reset_index()
-            # 處理 land transformation (kg CO2-eq) 欄位，将它们加总
-            land_values = group_data.groupby('Name')['land transformation (kg CO2-eq)'].sum().reset_index()
+            emission_values = [
+                group_data.groupby('Name')[emission_col].sum().reset_index()
+                for emission_col in EMISSION_RESULT_COLUMNS
+            ]
             # 處理 Damage Assessment 欄位，将它们加总
             summed_values = group_data.groupby('Name')['Damage Assessment'].sum().reset_index()
             
-            # 合并 grouped_c, fossil_values, biogenic_values, land_values, summed_values，以 'Name' 为键
-            data_frames = [grouped_c, fossil_values, biogenic_values, land_values, summed_values]
+            # 合并 grouped_c, GWP 分項, summed_values，以 'Name' 为键
+            data_frames = [grouped_c, *emission_values, summed_values]
+            if 'Coefficient value' in group_data.columns:
+                coefficient_values = group_data.groupby('Name')['Coefficient value'].apply(
+                    lambda x: next(
+                        (
+                            value
+                            for value in x
+                            if pd.notna(value) and str(value).strip() != ""
+                        ),
+                        "",
+                    )
+                ).reset_index()
+                data_frames.append(coefficient_values)
             print(sheet_name, data_frames)
             merged_data = reduce(lambda left,right: pd.merge(left, right, on='Name', how='outer'), data_frames)
             merged_data = merged_data.sort_values(by='Damage Assessment', ascending=False)
@@ -2995,26 +3111,37 @@ class ExcelApp:
         print("【Process_2】開始將數據匯入 Word 文件")
         # 遍歷文檔中的所有段落，尋找標籤
         total_damage_assessment = 0
-        sum_fossil = 0
-        sum_biogenic = 0
-        sum_land = 0
+        emission_totals = {col: 0 for col in EMISSION_RESULT_COLUMNS}
         for sheet in all_results.keys():
             self._check_cancel()
-            total_damage_assessment += all_results[sheet]['all_data']['Damage Assessment'].sum()
-            sum_fossil += all_results[sheet]['all_data']['fossil(kg CO2-eq)'].sum()
-            sum_biogenic += all_results[sheet]['all_data']['biogenic(kg CO2-eq)'].sum()
-            sum_land += all_results[sheet]['all_data']['land transformation (kg CO2-eq)'].sum()
+            df = all_results[sheet]['all_data']
+            total_damage_assessment += pd.to_numeric(
+                df.get('Damage Assessment', pd.Series(dtype=float)),
+                errors='coerce',
+            ).fillna(0).sum()
+            for emission_col in EMISSION_RESULT_COLUMNS:
+                emission_totals[emission_col] += pd.to_numeric(
+                    df.get(emission_col, pd.Series(dtype=float)),
+                    errors='coerce',
+                ).fillna(0).sum()
          # 將碳排五階段統整的數值儲存至self.context
         sum_list = [] 
         for sheet in sheet_names:
             self._check_cancel()
             sheet_key = re.sub(r'\W+', '_', sheet).strip('_')
             df = all_results[sheet]['all_data']
-            fossil      = df['fossil(kg CO2-eq)'].sum()
-            biogenic    = df['biogenic(kg CO2-eq)'].sum()
-            land        = df['land transformation (kg CO2-eq)'].sum()
-            sum    = df['Damage Assessment'].sum()
-            percentage  = sum / total_damage_assessment * 100
+            stage_emission_totals = {
+                emission_col: pd.to_numeric(
+                    df.get(emission_col, pd.Series(dtype=float)),
+                    errors='coerce',
+                ).fillna(0).sum()
+                for emission_col in EMISSION_RESULT_COLUMNS
+            }
+            sum    = pd.to_numeric(
+                df.get('Damage Assessment', pd.Series(dtype=float)),
+                errors='coerce',
+            ).fillna(0).sum()
+            percentage  = sum / total_damage_assessment * 100 if total_damage_assessment else 0
             names = (
                 df['name of database']
                   .dropna()
@@ -3024,25 +3151,39 @@ class ExcelApp:
             )
             sum_list.append((sheet_key, sum, names))
 
-            self.context[f'{sheet_key}_fossil']           = round(fossil, 4)
-            self.context[f'{sheet_key}_biogenic']         = round(biogenic, 4)
-            self.context[f'{sheet_key}_land']             = round(land, 4)
-            self.context[f'{sheet_key}_sum']              = round(sum, 4)
+            for emission_col, suffix in EMISSION_CONTEXT_SUFFIXES.items():
+                self.context[f'{sheet_key}_{suffix}'] = self._format_report_number(
+                    stage_emission_totals[emission_col]
+                )
+            self.context[f'{sheet_key}_sum']              = self._format_report_number(sum)
             self.context[f'{sheet_key}_Total_percentage'] = f"{round(percentage, 2)}%"
 
         sorted_sums = sorted(sum_list, key=lambda x: x[1], reverse=True)[:5]
 
         for idx, (sheet_key, val, names) in enumerate(sorted_sums, start=1):
             self._check_cancel()
-            pct = val / total_damage_assessment * 100
+            pct = val / total_damage_assessment * 100 if total_damage_assessment else 0
             # 存到 self.context
             self.context[f'Carbon_percentage_{idx}'] = f"{pct:.2f}%"
             self.context[f'Carbon_stage_{idx}'] = f"{sheet_key}階段"
             self.context[f'Carbon_name_{idx}'] = ";".join(names)
-        self.context['sum_percentage_1'] = f"{round(sum_fossil    / total_damage_assessment * 100, 2)}%"
-        self.context['sum_percentage_2'] = f"{round(sum_biogenic  / total_damage_assessment * 100, 2)}%"
-        self.context['sum_percentage_3'] = f"{round(sum_land      / total_damage_assessment * 100, 2)}%"
-        self.context['Total'] = f"{round(total_damage_assessment,4)} kg CO2e"
+        self.context['sum_percentage_unspecified'] = (
+            f"{round(emission_totals[UNSPECIFIED_EMISSION_COLUMN] / total_damage_assessment * 100, 2)}%"
+            if total_damage_assessment else "0%"
+        )
+        self.context['sum_percentage_1'] = (
+            f"{round(emission_totals['fossil(kg CO2-eq)'] / total_damage_assessment * 100, 2)}%"
+            if total_damage_assessment else "0%"
+        )
+        self.context['sum_percentage_2'] = (
+            f"{round(emission_totals['biogenic(kg CO2-eq)'] / total_damage_assessment * 100, 2)}%"
+            if total_damage_assessment else "0%"
+        )
+        self.context['sum_percentage_3'] = (
+            f"{round(emission_totals['land transformation (kg CO2-eq)'] / total_damage_assessment * 100, 2)}%"
+            if total_damage_assessment else "0%"
+        )
+        self.context['Total'] = f"{self._format_report_number(total_damage_assessment)} kg CO2e"
 
         print("【Process_2】已匯入全階段統計表格數值") 
 
@@ -3052,7 +3193,10 @@ class ExcelApp:
         for sheet in sheet_names:
             self._check_cancel()
             # 假設你已經有了每個工作表的 total_damage_assessment 值
-            total_percentage = all_results[sheet]['all_data']['Damage Assessment'].sum() / total_damage_assessment * 100
+            total_percentage = (
+                all_results[sheet]['all_data']['Damage Assessment'].sum() / total_damage_assessment * 100
+                if total_damage_assessment else 0
+            )
             # 將數據添加到DataFrame中
             total_percentage_df = pd.concat([total_percentage_df, pd.DataFrame({'Sheet': [sheet], 'Total_Percentage': [total_percentage]})], ignore_index=True)
         # 根據 Total_Percentage 降序排序
@@ -3129,8 +3273,8 @@ class ExcelApp:
         bar_chart_1_path = self._chart_path("bar_chart_1.png")
         plt.savefig(bar_chart_1_path, bbox_inches='tight')
         # plt.show()
-        # ------------------- 2. 產生各 Sheet 在 fossil/biogenic/land transformation 三項佔比 (bar_chart_2) -------------------
-        categories = ['fossil(kg CO2-eq)', 'biogenic(kg CO2-eq)', 'land transformation (kg CO2-eq)']
+        # ------------------- 2. 產生各 Sheet 在四個 GWP 分項的佔比 (bar_chart_2) -------------------
+        categories = list(EMISSION_RESULT_COLUMNS)
         category_data = {category: [] for category in categories}
         sheet_labels = list(all_results.keys())  # 重新整理 labels
 
@@ -3139,7 +3283,10 @@ class ExcelApp:
             self._check_cancel()
             for sheet in sheet_labels:
                 self._check_cancel()
-                category_value = all_results[sheet]['all_data'][category].sum()
+                category_value = pd.to_numeric(
+                    all_results[sheet]['all_data'].get(category, pd.Series(dtype=float)),
+                    errors='coerce',
+                ).fillna(0).sum()
                 percentage = (category_value / total_damage_assessment) * 100 if total_damage_assessment > 0 else 0
                 category_data[category].append(percentage)
 
@@ -3224,14 +3371,14 @@ class ExcelApp:
 
         # (B) 開始將 Raw_data 插入 Word
         raw_sum = Raw_data['Damage Assessment'].sum()
-        self.context['Raw_total'] = round(raw_sum, 4)
+        self.context['Raw_total'] = self._format_report_number(raw_sum)
 
         for idx, row in Raw_data.head(10).reset_index(drop=True).iterrows():
             self._check_cancel()
             i = idx + 1  # 1-based index
             self.context[f'Raw_Name_{i}']              = row['Name']
             self.context[f'Raw_name_of_database_{i}']  = row['name of database']
-            self.context[f'Raw_Damage_Assessment_{i}'] = round(row['Damage Assessment'], 4)
+            self.context[f'Raw_Damage_Assessment_{i}'] = self._format_report_number(row['Damage Assessment'])
             # 百分比
             pct = row['Damage Assessment'] / raw_sum * 100
             self.context[f'Raw_percentage_{i}']        = f"{round(pct, 2)}%"
@@ -3246,7 +3393,7 @@ class ExcelApp:
 
         # 將統整好的前十大Raw Material數值儲存至self.context
         remaining_val = Raw_data['Damage Assessment'][10:].sum()
-        self.context['Remaining_processes_1'] = f"{remaining_val:.4f}"
+        self.context['Remaining_processes_1'] = self._format_report_number(remaining_val)
         total_dmg = Raw_data['Damage Assessment'].sum()
         if total_dmg > 0:
             pct = remaining_val / total_dmg * 100
@@ -3306,7 +3453,7 @@ class ExcelApp:
             self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), 
+            plt.text(bar.get_x() + bar.get_width() / 2, yval, self._format_report_number(yval),
                     ha='center', va='bottom')
 
         # 美化與保存
@@ -3454,14 +3601,14 @@ class ExcelApp:
         # 2. 用 Manu_data 插入 Word (表格標籤)
 
         Manu_sum = Manu_data['Damage Assessment'].sum()
-        self.context['Manufacturing_total'] = round(Manu_sum, 3)
+        self.context['Manufacturing_total'] = self._format_report_number(Manu_sum)
 
         for idx, row in Manu_data.head(10).reset_index(drop=True).iterrows():
             self._check_cancel()
             i = idx + 1  # 1-based index
             self.context[f'Manufacturing_Name_{i}']              = row['Name']
             self.context[f'Manufacturing_name_of_database_{i}']  = row['name of database']
-            self.context[f'Manufacturing_Damage_Assessment_{i}'] = round(row['Damage Assessment'], 3)
+            self.context[f'Manufacturing_Damage_Assessment_{i}'] = self._format_report_number(row['Damage Assessment'])
             # 百分比
             pct = row['Damage Assessment'] / Manu_sum * 100
             self.context[f'Manufacturing_percentage_{i}']        = f"{round(pct, 2)}%"
@@ -3475,8 +3622,8 @@ class ExcelApp:
             self.context[f'Manufacturing_percentage_{i}']        = ""
 
 
-        remaining_val = round(Manu_data['Damage Assessment'][10:].sum(), 3)
-        self.context['Remaining_processes_2'] = remaining_val
+        remaining_val = Manu_data['Damage Assessment'][10:].sum()
+        self.context['Remaining_processes_2'] = self._format_report_number(remaining_val)
         total_dmg = Manu_data['Damage Assessment'].sum()
         if total_dmg > 0:
             pct = remaining_val / total_dmg * 100
@@ -3519,7 +3666,7 @@ class ExcelApp:
             self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2, yval, round(yval, 4), ha='center', va='bottom')
+            plt.text(bar.get_x() + bar.get_width()/2, yval, self._format_report_number(yval), ha='center', va='bottom')
         # 旋转x轴标签，以避免重叠
         plt.xticks(rotation=90)
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
@@ -3666,7 +3813,12 @@ class ExcelApp:
             raise KeyError("resulall_data_2 中沒有 'G3' 群組，無法繪製電力數據圖表。")
 
         elec_data = resulall_data_2['G3'].copy()
+        elec_data["Damage Assessment"] = pd.to_numeric(
+            elec_data["Damage Assessment"],
+            errors="coerce",
+        ).fillna(0)
         elec_data = elec_data.sort_values(by='Damage Assessment', ascending=False)
+        self.insert_electric_data_to_word(elec_data)
 
         # 若需要檢查 grouped_d，可視需求加上
         grouped_d = elec_data.groupby('name of database')['Name'].apply(' ; '.join).reset_index()
@@ -3694,7 +3846,7 @@ class ExcelApp:
             self._check_cancel()
             val = bar.get_width()  # bar.get_width() 對應 x 軸長度(因為是 barh)
             plt.text(val, bar.get_y() + bar.get_height() / 2,
-                    f"{val:.2f}",
+                    self._format_report_number(val),
                     va='center')
 
         plt.xticks(rotation=90)
@@ -3714,6 +3866,77 @@ class ExcelApp:
         self.context['Chart_8'] = chart_8
 
         print("【Process_8】已完成電力圖表生成與插入")
+
+    def insert_electric_data_to_word(self, elec_data):
+        """
+        將電力單筆數值匯入 Word 文檔中的表格欄位。
+
+        Parameters
+        ----------
+        elec_data : pandas.DataFrame
+            Manufacturing(Electricity) 統整後的電力資料。
+        """
+        self._check_cancel()
+        print("【Process_8】開始將電力數據匯入 Word 文件")
+
+        elec_data = elec_data.copy()
+        if "Damage Assessment" not in elec_data.columns:
+            elec_data["Damage Assessment"] = 0
+        if "Coefficient value" not in elec_data.columns:
+            elec_data["Coefficient value"] = ""
+        elec_data["Damage Assessment"] = pd.to_numeric(
+            elec_data["Damage Assessment"],
+            errors="coerce",
+        ).fillna(0)
+        elec_data = elec_data.sort_values(by="Damage Assessment", ascending=False)
+
+        # 清空以前的 Electric_* keys（若有的話），避免同一個物件重複產報告時殘留舊值。
+        for k in list(self.context):
+            self._check_cancel()
+            if k.startswith("Electric_"):
+                del self.context[k]
+
+        self.context["Electric_Name"] = ""
+        self.context["Electric_name_of_database"] = ""
+        self.context["Electric_Damage_Assessment"] = ""
+        self.context["Electric_Coefficient_value"] = ""
+        self.context["Electric_Coefficient value"] = ""
+        self.context["Electric_percentage"] = ""
+        self.context["Electric_Name_1"] = ""
+        self.context["Electric_name_of_database_1"] = ""
+        self.context["Electric_Damage_Assessment_1"] = ""
+        self.context["Electric_percentage_1"] = ""
+
+        total = elec_data["Damage Assessment"].sum()
+        if not elec_data.empty:
+            self._check_cancel()
+            row = elec_data.iloc[0]
+            damage_value = row.get("Damage Assessment", 0)
+            coefficient_value = row.get("Coefficient value", "")
+            pct = (damage_value / total * 100) if total else 0
+            self.context["Electric_Name"] = row.get("Name", "")
+            self.context["Electric_name_of_database"] = row.get("name of database", "")
+            self.context["Electric_Damage_Assessment"] = self._format_report_number(damage_value)
+            self.context["Electric_Coefficient_value"] = self._format_report_number(coefficient_value)
+            self.context["Electric_Coefficient value"] = self.context["Electric_Coefficient_value"]
+            self.context["Electric_percentage"] = f"{pct:.2f}%"
+
+            # Keep the first-index placeholders working for older templates.
+            self.context["Electric_Name_1"] = self.context["Electric_Name"]
+            self.context["Electric_name_of_database_1"] = self.context["Electric_name_of_database"]
+            self.context["Electric_Damage_Assessment_1"] = self.context["Electric_Damage_Assessment"]
+            self.context["Electric_percentage_1"] = self.context["Electric_percentage"]
+
+        remaining_sum = elec_data["Damage Assessment"].iloc[1:].sum()
+        remaining_pct = remaining_sum / total * 100 if total else 0
+        self.context["Remaining_processes_5"] = self._format_report_number(remaining_sum)
+        self.context["Remaining_percentage_5"] = f"{remaining_pct:.2f}%"
+
+        print("【Process_8】已匯入電力統計表格數值")
+
+    def insert_electric_top10_to_word(self, elec_data):
+        """Backward compatible wrapper for older callers."""
+        return self.insert_electric_data_to_word(elec_data)
 
     def process_top10_data(self, sheet_names, input_file, doc):
         """
@@ -3767,27 +3990,42 @@ class ExcelApp:
         self._check_cancel()
         print("【Process_10】開始將前十大數據匯入 Word 文件")
         
+        top_rows = combined_all_data.head(10).reset_index(drop=True)
+        total_damage = pd.to_numeric(
+            combined_all_data.get("Damage Assessment", pd.Series(dtype=float)),
+            errors="coerce",
+        ).fillna(0).sum()
+
         # 1. 前十大 Name, name_of_database, Damage_Assessment 與 percentage
         for j in range(1, 11):
             self._check_cancel()
             idx = j - 1
-            row = combined_all_data.iloc[idx]
-            # 名稱
-            self.context[f"Top10_Name_{j}"] = row["Name"]
-            # 對應的 database 字串
-            self.context[f"Top10_name_of_database_{j}"] = row["name of database"]
-            # Damage Assessment 四位小數
-            self.context[f"Top10_Damage_Assessment_{j}"] = f"{row['Damage Assessment']:.4f}"
-            # 百分比：該筆 / 總和 *100，保留兩位小數
-            pct = row["Damage Assessment"] / combined_all_data["Damage Assessment"].sum() * 100
-            self.context[f"Top10_percentage_{j}"] = f"{pct:.2f}%"
+            if idx >= len(top_rows):
+                self.context[f"Top10_Name_{j}"] = ""
+                self.context[f"Top10_name_of_database_{j}"] = ""
+                self.context[f"Top10_Damage_Assessment_{j}"] = ""
+                self.context[f"Top10_percentage_{j}"] = ""
+                continue
+
+            row = top_rows.iloc[idx]
+            damage_value = pd.to_numeric(row.get("Damage Assessment"), errors="coerce")
+            if pd.isna(damage_value):
+                damage_value = 0
+            self.context[f"Top10_Name_{j}"] = row.get("Name", "")
+            self.context[f"Top10_name_of_database_{j}"] = row.get("name of database", "")
+            self.context[f"Top10_Damage_Assessment_{j}"] = self._format_report_number(damage_value)
+            pct = damage_value / total_damage * 100 if total_damage else 0
+            self.context[f"Top10_percentage_{j}"] = f"{pct:.2f}%" if total_damage else ""
 
 
         # 2. 剩餘製程合計與百分比（從第 11 筆開始到最後）
-        remaining_sum = combined_all_data["Damage Assessment"].iloc[10:].sum()
-        remaining_pct = remaining_sum / combined_all_data["Damage Assessment"].sum() * 100
-        self.context["Remaining_processes_3"]   = f"{remaining_sum:.4f}"
-        self.context["Remaining_percentage_3"] = f"{remaining_pct:.2f}%"
+        remaining_sum = pd.to_numeric(
+            combined_all_data.get("Damage Assessment", pd.Series(dtype=float)).iloc[10:],
+            errors="coerce",
+        ).fillna(0).sum()
+        remaining_pct = remaining_sum / total_damage * 100 if total_damage else 0
+        self.context["Remaining_processes_3"]   = self._format_report_number(remaining_sum)
+        self.context["Remaining_percentage_3"] = f"{remaining_pct:.2f}%" if total_damage else ""
 
         print("【Process_10】已匯入前十大統計表格數值")
 
@@ -3819,7 +4057,7 @@ class ExcelApp:
         for i, bar in enumerate(bars):
             self._check_cancel()
             yval = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), ha='center', va='bottom')
+            plt.text(bar.get_x() + bar.get_width() / 2, yval, self._format_report_number(yval), ha='center', va='bottom')
 
         plt.xticks(rotation=90)
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
@@ -3854,7 +4092,12 @@ class ExcelApp:
         self._check_cancel()
         print("【Process_12】開始處理運輸數據")
         # transport_all_results = {}
-        Air_all_data = pd.DataFrame()
+        if not hasattr(self, "context") or self.context is None:
+            self.context = {}
+        stage_air_totals = {stage_name: 0.0 for stage_name in AIR_STAGE_CONTEXT_KEYS}
+        Air_all_data = pd.DataFrame(
+            columns=["type of transport", "Name", "Damage Assessment", "name of database"]
+        )
 
         for sheet_name in transport_sheets:
             self._check_cancel()
@@ -3873,11 +4116,24 @@ class ExcelApp:
                 sub_df.columns = sub_df.iloc[0, :]
                 sub_df = sub_df.iloc[1:, :]
                 
-                if 'type of transport' not in sub_df.columns:
+                required_columns = {'type of transport', 'Name', 'Damage Assessment'}
+                if not required_columns.issubset(set(sub_df.columns)):
                     continue
-                df_air = sub_df[sub_df['type of transport'].isin(['Air','AIR'])]
+                if 'name of database' not in sub_df.columns:
+                    sub_df['name of database'] = ""
+                transport_type = sub_df['type of transport'].astype(str).str.strip().str.casefold()
+                df_air = sub_df[transport_type.isin(AIR_TRANSPORT_TYPES)].copy()
                 if df_air.empty:
                     continue    
+                df_air['type of transport'] = 'Air'
+                df_air['Name'] = df_air['Name'].fillna('空白群組')
+                df_air['name of database'] = df_air['name of database'].fillna("")
+                df_air['Damage Assessment'] = pd.to_numeric(
+                    df_air['Damage Assessment'],
+                    errors='coerce',
+                ).fillna(0)
+                if sheet_name in stage_air_totals:
+                    stage_air_totals[sheet_name] += df_air['Damage Assessment'].sum()
 
                 # 分組和統計
                 transport_grouped = df_air.groupby(['type of transport', 'Name'])
@@ -3893,23 +4149,36 @@ class ExcelApp:
                 # resulall_data_3[f'G{j + 1}'] = merged
                 Air_all_data = pd.concat([Air_all_data, merged], axis=0)
 
+        Air_all_data["Damage Assessment"] = pd.to_numeric(
+            Air_all_data["Damage Assessment"],
+            errors="coerce",
+        ).fillna(0)
         Air_all_data = Air_all_data.sort_values(by='Damage Assessment', ascending=False)
+
+        for stage_name, context_key in AIR_STAGE_CONTEXT_KEYS.items():
+            self.context[context_key] = self._format_report_number(stage_air_totals[stage_name])
 
         # ---- 新增：清空以前的 Air_* keys（若有的話） ----
         for k in list(self.context):
             self._check_cancel()
             if k.startswith('Air_'):
                 del self.context[k]
+        for idx in range(1, 11):
+            self.context[f'Air_Name_{idx}'] = ""
+            self.context[f'Air_name_of_database_{idx}'] = ""
+            self.context[f'Air_Damage_Assessment_{idx}'] = ""
+            self.context[f'Air_percentage_{idx}'] = ""
         # ---- 新增：把 merged 的每一列放到 self.context  ----
         total = Air_all_data['Damage Assessment'].sum()
-        for idx, row in enumerate(Air_all_data.itertuples(index=False), start=1):
+        for idx, (_, row) in enumerate(Air_all_data.head(10).iterrows(), start=1):
             self._check_cancel()
-            # row.Name, row._3 (對應 name of database), row._2（Damage Assessment）依實際欄位順序與屬性名稱調整
-            self.context[f'Air_Name_{idx}']              = row.Name
-            self.context[f'Air_name_of_database_{idx}']  = row._3
-            self.context[f'Air_Damage_Assessment_{idx}'] = round(row._2, 4)
+            damage_value = pd.to_numeric(row.get('Damage Assessment', 0), errors='coerce')
+            damage_value = 0 if pd.isna(damage_value) else damage_value
+            self.context[f'Air_Name_{idx}']              = row.get('Name', "")
+            self.context[f'Air_name_of_database_{idx}']  = row.get('name of database', "")
+            self.context[f'Air_Damage_Assessment_{idx}'] = self._format_report_number(damage_value)
             # 百分比四捨五入到小數點 2 位
-            pct = (row._2 / total * 100) if total else 0
+            pct = (damage_value / total * 100) if total else 0
             self.context[f'Air_percentage_{idx}']        = f"{pct:.2f}%"
 
         # 2. 剩餘製程合計與百分比（從第 11 筆開始到最後）
@@ -3921,7 +4190,7 @@ class ExcelApp:
         else:
             remaining_pct = remaining_sum / total * 100
 
-        self.context["Remaining_processes_4"]   = f"{remaining_sum:.4f}"
+        self.context["Remaining_processes_4"]   = self._format_report_number(remaining_sum)
         self.context["Remaining_percentage_4"] = f"{remaining_pct:.2f}%"
 
         print("【Process_12】已完成運輸數據處理")
@@ -3942,16 +4211,17 @@ class ExcelApp:
         """
         self._check_cancel()
         print("【Process_13】開始生成運輸相關圖表並插入 Word 文件")
+        if Air_all_data.empty or "Damage Assessment" not in Air_all_data.columns:
+            print("No air transport data available.")
+            self.context['Chart_9'] = ""
+            return
+
         # 分析運輸數據
         name_values = Air_all_data['Name'].head(10)
         damage_values = Air_all_data['Damage Assessment'].head(10)
 
         remaining_name = 'Remaining processes'
         remaining_value = Air_all_data['Damage Assessment'][10:].sum()
-
-        if Air_all_data.empty:
-            print("No air transport data available.")
-            return
 
         # 生成長條圖
         name_values = Air_all_data['Name'].head(10).fillna(0)
@@ -3984,7 +4254,7 @@ class ExcelApp:
             self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), ha='center', va='bottom')
+            plt.text(bar.get_x() + bar.get_width() / 2, yval, self._format_report_number(yval), ha='center', va='bottom')
 
         # 旋轉x軸標籤，以避免重叠
         plt.xticks(rotation=45)
