@@ -147,6 +147,22 @@ python GUI_test.py
 
 若來源資料缺少 `starting point`、`end point`、`type of transport` 或 `distance transported (km)` 等必要欄位，該階段可能會失敗。
 
+### 距離計算模組
+
+`transport_distance.py` 提供運輸距離計算核心，可供 GUI 流程、Excel 處理流程或命令列測試共用：
+
+- Road、Driving、Walking、Cycling 會透過 OSRM route service 取得路線距離與幾何線段。
+- Air 會以大圓航線估算航空距離，並依設定的分段上限產生路徑節點。
+- Sea 會用內建航運 waypoint 網路估算可航行路線，避免只用直線距離低估海運路徑。
+- 地點文字查詢會依序嘗試 Nominatim、Photon、ArcGIS 等 geocoding 服務；若直接提供座標，Air 與 Sea 可離線估算。
+- 回傳結果包含距離、時間、GeoJSON LineString、分段資訊、查詢 URL 與 metadata，方便寫回 Excel 或除錯。
+
+命令列範例：
+
+```bash
+python transport_distance.py --mode driving --from-lat 24.8138 --from-lon 120.9675 --to-lat 25.0330 --to-lon 121.5654
+```
+
 ## 版本資訊
 
 GUI 顯示的版本依下列優先順序取得：
