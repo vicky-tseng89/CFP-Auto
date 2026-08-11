@@ -1,36 +1,42 @@
-# Python 常見忽略
+# Python bytecode and caches
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Jupyter Notebook 檔案（可視需求決定是否忽略）
+# Local virtual environments
+.venv/
+.venv*/
+
+# Local temporary work areas
+.tmp_*/
+codex_tmp/
+.mplconfig/
+
+# Generated outputs and logs
+output/
+CFP-Auto/output/
+logs/
+*.log
+*.inspect.ndjson
+
+# Jupyter checkpoints
 .ipynb_checkpoints/
 *.ipynb
 
-# Excel 或暫存檔
-*.xlsm
-*.xlsb
-*.xls
-*.csv
-
-# 圖片檔
-*.ico
-*.gif
-*.jpg
-
-# Windows 常見暫存
-Thumbs.db
-~$*
-
-# PyInstaller 打包生成的 exe/暫存目錄
-dist/
+# Build and packaging output
 build/
+dist/
 *.spec
 
-# IDE 或編輯器的設定
+# Office temporary files
+~$*
+
+# OS and IDE metadata
+Thumbs.db
+.DS_Store
 .vscode/
 .idea/
-
-# 作業系統暫存
-.DS_Store
