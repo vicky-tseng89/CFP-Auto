@@ -219,6 +219,8 @@ class GUI:
         self.process_progress_window = None
         self.enable_refresh = tk.BooleanVar(value=False)  # 新增變數控制是否執行重新整理
         self.enable_distance_calculation = tk.BooleanVar(value=True)
+        self.enable_transport_cache = tk.BooleanVar(value=True)
+        self.force_distance_recalculation = tk.BooleanVar(value=False)
         self.is_running = False
         self.run_buttons = []
         self.product_f_text_widgets = []
@@ -228,6 +230,12 @@ class GUI:
             stage_name: tk.BooleanVar(value=True)
             for stage_name, _ in excel_processing.CARBON_STAGE_OPTIONS
         }
+        self.carbon_boundary_var = tk.StringVar(
+            value=excel_processing.CARBON_BOUNDARY_LABELS[
+                excel_processing.DEFAULT_CARBON_BOUNDARY
+            ]
+        )
+        self.selected_carbon_boundary = excel_processing.DEFAULT_CARBON_BOUNDARY
         self.selected_process_stages = [
             stage_name for stage_name, _ in excel_processing.CARBON_STAGE_OPTIONS
         ]
@@ -272,7 +280,7 @@ class GUI:
         # 新增三個欄位
 
 
-        ttk.Label(frame, text="盤查廠區").grid(row=1, column=0, sticky="w", padx=10, pady=10)
+        ttk.Label(frame, text="盤查廠區：").grid(row=1, column=0, sticky="w", padx=10, pady=10)
         self.factory_site_combo = ttk.Combobox(
             frame,
             values=FACTORY_SITE_OPTIONS,
@@ -314,7 +322,7 @@ class GUI:
                         text="啟用重新整理功能",
                         variable=self.enable_refresh,
                         command=self.toggle_refresh_fields
-                        ).grid(row=5, column=0, columnspan=2, padx=5, pady=5)
+                        ).grid(row=5, column=0, columnspan=1, padx=5, pady=5)
         
         self.transform_button = ttk.Button(frame, text="開始轉換", command=self.transform_sheet)
         self.transform_button.grid(row=5, column=1, pady=10)
@@ -333,7 +341,7 @@ class GUI:
         
         ttk.Button(frame, text="瀏覽", command=self.browse_file).grid(row=0, column=2, padx=10, pady=10)
 
-        ttk.Label(frame, text="盤查廠區").grid(row=1, column=0, sticky="w", padx=10, pady=10)
+        ttk.Label(frame, text="盤查廠區：").grid(row=1, column=0, sticky="w", padx=10, pady=10)
         self.process_factory_site_combo = ttk.Combobox(
             frame,
             values=FACTORY_SITE_OPTIONS,
@@ -343,26 +351,37 @@ class GUI:
         )
         self.process_factory_site_combo.grid(row=1, column=1, sticky='w', padx=10, pady=10)
 
-        stage_frame = ttk.LabelFrame(frame, text="選擇要計算碳排的階段")
-        stage_frame.grid(row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 10))
-        for idx, (stage_name, label) in enumerate(excel_processing.CARBON_STAGE_OPTIONS):
-            ttk.Checkbutton(
-                stage_frame,
-                text=f"{label} ({stage_name})",
-                variable=self.process_stage_vars[stage_name],
-            ).grid(row=idx // 3, column=idx % 3, sticky="w", padx=(8, 10), pady=8)
+        ttk.Label(frame, text="產品碳足跡邊界：").grid(row=2, column=0, sticky="w", padx=10, pady=10)
+        self.process_boundary_combo = ttk.Combobox(
+            frame,
+            values=list(excel_processing.CARBON_BOUNDARY_LABELS.values()),
+            textvariable=self.carbon_boundary_var,
+            state="readonly",
+            width=20,
+        )
+        self.process_boundary_combo.grid(row=2, column=1, sticky="w", padx=10, pady=10)
 
         ttk.Checkbutton(
             frame,
             text="執行距離計算",
             variable=self.enable_distance_calculation,
         ).grid(row=3, column=0, sticky="w", padx=10, pady=(0, 10))
+        ttk.Checkbutton(
+            frame,
+            text="使用快取 / 本地對照表優先",
+            variable=self.enable_transport_cache,
+        ).grid(row=4, column=0, sticky="w", padx=10, pady=(0, 10))
+        ttk.Checkbutton(
+            frame,
+            text="重新計算所有距離",
+            variable=self.force_distance_recalculation,
+        ).grid(row=5, column=0, sticky="w", padx=10, pady=(0, 10))
         
         self.process_button = ttk.Button(frame, text="開始處理", command=self.process_file)
-        self.process_button.grid(row=3, column=1, pady=10)
+        self.process_button.grid(row=6, column=1, pady=10)
         self.run_buttons.append(self.process_button)
-        self.add_status_label(frame, row=4)
-        ttk.Button(frame, text="Excel ✕", command=self.confirm_close_all_excel).grid(row=3, column=2, padx=10, pady=10)
+        self.add_status_label(frame, row=7)
+        ttk.Button(frame, text="Excel ✕", command=self.confirm_close_all_excel).grid(row=6, column=2, padx=10, pady=10)
 
     def create_all_tab(self):
         frame = self.tab_all
@@ -419,16 +438,36 @@ class GUI:
                         command=self.toggle_refresh_fields
                         ).grid(row=5, column=0, columnspan=2, padx=5, pady=5)
 
+        ttk.Label(frame, text="產品碳足跡邊界：").grid(row=6, column=0, sticky="w", padx=10, pady=10)
+        self.process_all_boundary_combo = ttk.Combobox(
+            frame,
+            values=list(excel_processing.CARBON_BOUNDARY_LABELS.values()),
+            textvariable=self.carbon_boundary_var,
+            state="readonly",
+            width=20,
+        )
+        self.process_all_boundary_combo.grid(row=6, column=1, sticky="w", padx=10, pady=10)
+
         ttk.Checkbutton(
             frame,
             text="執行距離計算",
             variable=self.enable_distance_calculation,
-        ).grid(row=6, column=0, sticky="w", padx=10, pady=(0, 10))
+        ).grid(row=7, column=0, sticky="w", padx=10, pady=(0, 10))
+        ttk.Checkbutton(
+            frame,
+            text="使用快取 / 本地對照表優先",
+            variable=self.enable_transport_cache,
+        ).grid(row=8, column=0, sticky="w", padx=10, pady=(0, 10))
+        ttk.Checkbutton(
+            frame,
+            text="重新計算所有距離",
+            variable=self.force_distance_recalculation,
+        ).grid(row=9, column=0, sticky="w", padx=10, pady=(0, 10))
 
         self.process_all_button = ttk.Button(frame, text="處理全部", command=self.process_all)
         self.process_all_button.grid(row=5, column=1, pady=10)
         self.run_buttons.append(self.process_all_button)
-        self.add_status_label(frame, row=7)
+        self.add_status_label(frame, row=10)
         ttk.Button(frame, text="Excel ✕", command=self.confirm_close_all_excel).grid(row=5, column=2, padx=10, pady=10)
 
         self.toggle_refresh_fields()
@@ -663,12 +702,13 @@ class GUI:
                 f"{details}"
             )
 
+    def _get_selected_carbon_boundary(self):
+        return ExcelApp.normalize_carbon_boundary(self.carbon_boundary_var.get())
+
     def _get_selected_process_stages(self):
-        selected = [
-            stage_name
-            for stage_name, _ in excel_processing.CARBON_STAGE_OPTIONS
-            if self.process_stage_vars[stage_name].get()
-        ]
+        selected = ExcelApp.stages_for_carbon_boundary(
+            self._get_selected_carbon_boundary()
+        )
         if not selected:
             raise ValueError("請至少勾選一個要計算碳排的階段。")
         return selected
@@ -748,6 +788,50 @@ class GUI:
         shutil.copy2(file_path, temp_path)
         return temp_path
 
+    def _build_refreshed_input_export_path(self, source_file, product_name="", timestamp=None):
+        output_dir = getattr(self.excel, "result_dir", os.getcwd())
+        os.makedirs(output_dir, exist_ok=True)
+        source_name = self._sanitize_filename_component(
+            os.path.splitext(os.path.basename(source_file))[0]
+        ) or "input"
+        safe_product = self._sanitize_filename_component(product_name)
+        timestamp = timestamp or time.strftime("%Y%m%d_%H%M%S")
+        name_parts = ["refreshed_input", source_name]
+        if safe_product:
+            name_parts.append(safe_product)
+        name_parts.append(timestamp)
+        base_path = os.path.join(output_dir, "_".join(name_parts) + ".xlsx")
+        candidate = base_path
+        suffix = 1
+        while os.path.exists(candidate):
+            stem, ext = os.path.splitext(base_path)
+            candidate = f"{stem}_{suffix}{ext}"
+            suffix += 1
+        return candidate
+
+    def _export_refreshed_input_file(self, refreshed_file_path, source_file, product_name=""):
+        export_path = self._build_refreshed_input_export_path(source_file, product_name)
+        shutil.copy2(refreshed_file_path, export_path)
+        return export_path
+
+    def _build_refresh_export_failed_record(self, task_name, source_file, work_file, product_name, exc):
+        return {
+            "task": task_name,
+            "input_file": source_file,
+            "work_file": work_file,
+            "product_name": product_name,
+            "refreshed_input_file": "",
+            "status": "failed",
+            "ok": False,
+            "error_code": "EXPORT_REFRESHED_INPUT_FAILED",
+            "message": f"重新整理後原始表單另存失敗：{exc}",
+            "merged_file": "",
+            "result_file": "",
+            "report_file": "",
+            "run_id": getattr(self.excel, "last_run_id", ""),
+            "technical_summary": getattr(self.excel, "last_technical_summary", ""),
+        }
+
     @staticmethod
     def _sanitize_filename_component(value):
         value = str(value or "").strip()
@@ -796,6 +880,7 @@ class GUI:
             return
         self.reset_cancel_state()
         try:
+            self.selected_carbon_boundary = self._get_selected_carbon_boundary()
             self.selected_process_stages = self._get_selected_process_stages()
             self.open_progress_window()
             self.root.update()
@@ -819,6 +904,8 @@ class GUI:
             return
         self.reset_cancel_state()
         try:
+            self.selected_carbon_boundary = self._get_selected_carbon_boundary()
+            self.selected_process_stages = self._get_selected_process_stages()
             self._build_execution_jobs()
             self.open_progress_window()
             self.root.update()
@@ -1213,6 +1300,8 @@ class GUI:
             "input_file": file_path,
             "work_file": work_file or file_path,
             "product_name": product_name,
+            "carbon_boundary": artifacts.get("carbon_boundary_label") or artifacts.get("carbon_boundary") or "",
+            "refreshed_input_file": artifacts.get("refreshed_input_file") or "",
             "status": status,
             "ok": ok,
             "error_code": error_code,
@@ -1243,6 +1332,7 @@ class GUI:
                     "input_file": input_file,
                     "work_file": work_file,
                     "product_name": product_name,
+                    "refreshed_input_file": "",
                     "status": "skipped",
                     "ok": False,
                     "error_code": "SKIPPED_AFTER_CANCEL",
@@ -1269,6 +1359,8 @@ class GUI:
             "input_file",
             "work_file",
             "product_name",
+            "carbon_boundary",
+            "refreshed_input_file",
             "status",
             "ok",
             "error_code",
@@ -1286,6 +1378,69 @@ class GUI:
                 writer.writerow({col: row.get(col, "") for col in columns})
         return summary_path
 
+    def _build_success_output_lines(self, records, summary_path=""):
+        output_fields = [
+            ("refreshed_input_file", "刷新後原始表單"),
+            ("merged_file", "轉換檔案"),
+            ("result_file", "處理結果"),
+            ("report_file", "報告表單"),
+        ]
+        successful_outputs = []
+        for item in records:
+            if item.get("status") != "success":
+                continue
+            paths = [(label, item.get(field, "")) for field, label in output_fields if item.get(field)]
+            if paths:
+                successful_outputs.append((item, paths))
+        if not successful_outputs:
+            return []
+
+        display_limit = 10 if summary_path else len(successful_outputs)
+        output_lines = ["", "成功輸出檔案："]
+        for shown, (item, paths) in enumerate(successful_outputs, start=1):
+            if shown > display_limit:
+                remaining = len(successful_outputs) - display_limit
+                output_lines.append(f"...另有 {remaining} 筆，請查看 Summary CSV。")
+                break
+            short_name = os.path.basename(item.get("input_file", "")) or "(unknown file)"
+            product_label = self._build_job_label(item.get("product_name", ""))
+            output_lines.append(f"- {short_name} | {product_label}")
+            for label, path in paths:
+                output_lines.append(f"  {label}: {path}")
+        return output_lines
+
+    def _build_batch_failure_guidance_lines(self, records):
+        locked_records = [
+            item
+            for item in records
+            if item.get("status") == "failed"
+            and item.get("error_code") == excel_processing.FILE_PERMISSION_DENIED_ERROR_CODE
+        ]
+        if not locked_records:
+            return []
+
+        lines = [
+            "",
+            "錯誤摘要：",
+            f"- 有 {len(locked_records)} 筆 Excel 檔案無法讀取，通常是檔案正在 Excel、OneDrive 或其他程式中開啟或鎖定。",
+            "- 請關閉受影響檔案、確認 OneDrive 同步完成後再重新執行。",
+            "- 若仍失敗，請關閉所有 Excel 視窗，必要時從工作管理員結束殘留的 Excel 程序。",
+        ]
+        if any(not str(item.get("product_name") or "").strip() for item in locked_records):
+            lines.append("- 「未指定機種」只是批次標籤，不代表機種設定錯誤。")
+
+        lines.append("受影響檔案：")
+        display_limit = 10
+        for shown, item in enumerate(locked_records, start=1):
+            if shown > display_limit:
+                remaining = len(locked_records) - display_limit
+                lines.append(f"- ...另有 {remaining} 筆，請查看 Summary CSV。")
+                break
+            target_path = item.get("work_file") or item.get("input_file") or ""
+            short_name = os.path.basename(target_path) or os.path.basename(item.get("input_file", "")) or "(unknown file)"
+            lines.append(f"- {short_name}")
+        return lines
+
     def _show_batch_summary(self, task_label, records, summary_path):
         total = len(records)
         success = sum(1 for item in records if item.get("status") == "success")
@@ -1294,14 +1449,18 @@ class GUI:
         skipped = sum(1 for item in records if item.get("status") == "skipped")
         message_lines = [
             f"{task_label} batch complete.",
+        ]
+        message_lines.extend(self._build_batch_failure_guidance_lines(records))
+        message_lines.extend([
             f"Total: {total}",
             f"Success: {success}",
             f"Failed: {failed}",
             f"Cancelled: {cancelled}",
             f"Skipped: {skipped}",
-        ]
+        ])
         if summary_path:
             message_lines.append(f"Summary CSV: {summary_path}")
+        message_lines.extend(self._build_success_output_lines(records, summary_path))
         if failed > 0:
             message_lines.append("")
             message_lines.append("Failed items:")
@@ -1339,6 +1498,7 @@ class GUI:
                 product_name = job.get("product_name", "")
                 work_file = source_file
                 temp_file = ""
+                refreshed_input_file = ""
                 if self.enable_refresh.get():
                     temp_file = self._create_refresh_temp_copy(source_file, product_name)
                     work_file = temp_file
@@ -1364,6 +1524,7 @@ class GUI:
                                     "input_file": source_file,
                                     "work_file": work_file,
                                     "product_name": product_name,
+                                    "refreshed_input_file": "",
                                     "status": "cancelled",
                                     "ok": False,
                                     "error_code": "USER_CANCELLED",
@@ -1384,6 +1545,7 @@ class GUI:
                                 "input_file": source_file,
                                 "work_file": work_file,
                                 "product_name": product_name,
+                                "refreshed_input_file": "",
                                 "status": "failed",
                                 "ok": False,
                                 "error_code": "UPDATE_INPUT_FAILED",
@@ -1394,6 +1556,25 @@ class GUI:
                                 "run_id": getattr(self.excel, "last_run_id", ""),
                                 "technical_summary": getattr(self.excel, "last_technical_summary", ""),
                             }
+                        )
+                        self._cleanup_temp_file(temp_file)
+                        continue
+                    try:
+                        refreshed_input_file = self._export_refreshed_input_file(
+                            work_file,
+                            source_file,
+                            product_name,
+                        )
+                        job["refreshed_input_file"] = refreshed_input_file
+                    except Exception as e:
+                        records.append(
+                            self._build_refresh_export_failed_record(
+                                "transform",
+                                source_file,
+                                work_file,
+                                product_name,
+                                e,
+                            )
                         )
                         self._cleanup_temp_file(temp_file)
                         continue
@@ -1424,6 +1605,8 @@ class GUI:
                     product_name=product_name,
                     work_file=work_file,
                 )
+                if refreshed_input_file:
+                    record["refreshed_input_file"] = refreshed_input_file
                 records.append(record)
                 self.update_progress(int(round(((idx + 1) / max(1, total)) * 100)))
                 if record["status"] == "cancelled":
@@ -1464,6 +1647,9 @@ class GUI:
                     file_path=file_path,
                     selected_stages=self.selected_process_stages,
                     calculate_distances=self.enable_distance_calculation.get(),
+                    carbon_boundary=self.selected_carbon_boundary,
+                    use_transport_cache=self.enable_transport_cache.get(),
+                    force_recalculate_distances=self.force_distance_recalculation.get(),
                 )
                 record = self._task_result_to_record("process", file_path, result)
                 records.append(record)
@@ -1502,6 +1688,7 @@ class GUI:
                 product_name = job.get("product_name", "")
                 work_file = source_file
                 temp_file = ""
+                refreshed_input_file = ""
                 if self.enable_refresh.get():
                     temp_file = self._create_refresh_temp_copy(source_file, product_name)
                     work_file = temp_file
@@ -1527,6 +1714,7 @@ class GUI:
                                     "input_file": source_file,
                                     "work_file": work_file,
                                     "product_name": product_name,
+                                    "refreshed_input_file": "",
                                     "status": "cancelled",
                                     "ok": False,
                                     "error_code": "USER_CANCELLED",
@@ -1547,6 +1735,7 @@ class GUI:
                                 "input_file": source_file,
                                 "work_file": work_file,
                                 "product_name": product_name,
+                                "refreshed_input_file": "",
                                 "status": "failed",
                                 "ok": False,
                                 "error_code": "UPDATE_INPUT_FAILED",
@@ -1557,6 +1746,25 @@ class GUI:
                                 "run_id": getattr(self.excel, "last_run_id", ""),
                                 "technical_summary": getattr(self.excel, "last_technical_summary", ""),
                             }
+                        )
+                        self._cleanup_temp_file(temp_file)
+                        continue
+                    try:
+                        refreshed_input_file = self._export_refreshed_input_file(
+                            work_file,
+                            source_file,
+                            product_name,
+                        )
+                        job["refreshed_input_file"] = refreshed_input_file
+                    except Exception as e:
+                        records.append(
+                            self._build_refresh_export_failed_record(
+                                "process_all",
+                                source_file,
+                                work_file,
+                                product_name,
+                                e,
+                            )
                         )
                         self._cleanup_temp_file(temp_file)
                         continue
@@ -1587,6 +1795,8 @@ class GUI:
                     product_name=product_name,
                     work_file=work_file,
                 )
+                if refreshed_input_file:
+                    transform_record["refreshed_input_file"] = refreshed_input_file
                 if transform_record["status"] != "success":
                     records.append(transform_record)
                     if transform_record["status"] == "cancelled":
@@ -1604,6 +1814,7 @@ class GUI:
                             "input_file": source_file,
                             "work_file": work_file,
                             "product_name": product_name,
+                            "refreshed_input_file": refreshed_input_file,
                             "status": "failed",
                             "ok": False,
                             "error_code": "MISSING_TRANSFORM_OUTPUT",
@@ -1633,7 +1844,11 @@ class GUI:
                 )
                 process_result = self.excel.process_file(
                     file_path=merged_file,
+                    selected_stages=self.selected_process_stages,
                     calculate_distances=self.enable_distance_calculation.get(),
+                    carbon_boundary=self.selected_carbon_boundary,
+                    use_transport_cache=self.enable_transport_cache.get(),
+                    force_recalculate_distances=self.force_distance_recalculation.get(),
                 )
                 process_record = self._task_result_to_record(
                     "process_all",
@@ -1643,6 +1858,8 @@ class GUI:
                     work_file=work_file,
                 )
                 process_record["merged_file"] = merged_file
+                if refreshed_input_file:
+                    process_record["refreshed_input_file"] = refreshed_input_file
                 records.append(process_record)
                 if process_record["status"] == "success" and process_record["result_file"]:
                     self._set_report_source_file(process_record["result_file"])
@@ -1733,17 +1950,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = GUI(root)
     root.mainloop()
-
-
-
-
-
-
-
-
-
-
-
-
-
-

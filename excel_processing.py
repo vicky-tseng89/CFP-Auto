@@ -1,5 +1,6 @@
 ﻿from transport_distance import compute_transport_distance
 from datetime import date, datetime
+from transport_distance import RouteResult
 from transport_distance import compute_transport_distance_from_queries
 from transport_distance import geocode_place, transport_type_to_mode
 from contextlib import suppress
@@ -10,6 +11,7 @@ from docxtpl import DocxTemplate, InlineImage
 from functools import reduce
 from tkinter import filedialog, messagebox
 import logging
+import json
 import math
 # import matplotlib
 # matplotlib.use('Agg')  # 強制使用不會開視窗的 Agg 後端
@@ -58,8 +60,23 @@ COM_REFRESH_RETRY_COUNT = 2
 COM_REFRESH_RETRY_DELAY_SEC = 1.0
 XL_CONNECTION_TYPE_OLEDB = 1
 XL_CONNECTION_TYPE_ODBC = 2
-INVALID_EXTERNAL_FORMULA_RE = re.compile(r"\[\d+\]Sheet!", re.IGNORECASE)
+INVALID_EXTERNAL_FORMULA_RE = re.compile(r"\[\d+\][^!]*!", re.IGNORECASE)
+INVALID_ERROR_FORMULA_VALUES = {
+    "=#NULL!": "#NULL!",
+    "=#DIV/0!": "#DIV/0!",
+    "=#VALUE!": "#VALUE!",
+    "=#REF!": "#REF!",
+    "=#NAME?": "#NAME?",
+    "=#NUM!": "#NUM!",
+    "=#N/A": "#N/A",
+}
 TRANSPORT_LOCATION_MAPPING_FILENAME = "airport_port_land_location_mapping.xlsx"
+TRANSPORT_DISTANCE_CACHE_FILENAME = "transport_distance_cache.json"
+TRANSPORT_NEGATIVE_CACHE_TTL_SEC = 24 * 60 * 60
+TRANSPORT_GEOCODE_TIMEOUT_SEC = 3.0
+TRANSPORT_ROUTE_TIMEOUT_SEC = 5.0
+TRANSPORT_ROUTE_RETRY_COUNT = 1
+TRANSPORT_ROUTE_RETRY_DELAY_SEC = 0.2
 RESOURCES_DIRNAME = "resources"
 REPORT_WORKBOOK_TEMPLATE_FILENAME = "report_temp.xlsx"
 PLCI_TABLE_FORMAT_FILENAME = "PLCI_table_format.xlsx"
@@ -108,6 +125,23 @@ REPORT_GENERAL_ROW_LABELS = (
     "GWP100 - fossil",
     "GWP100 - biogenic",
     "GWP100 - land transformation",
+)
+CARBON_BOUNDARY_STAGE_MAP = {
+    "cradle_to_gate": ("Raw Material", "Manufacturing"),
+    "cradle_to_grave": tuple(stage for stage, _ in CARBON_STAGE_OPTIONS),
+}
+CARBON_BOUNDARY_LABELS = {
+    "cradle_to_gate": "搖籃到大門",
+    "cradle_to_grave": "搖籃到墳墓",
+}
+CARBON_BOUNDARY_KEYS_BY_LABEL = {
+    label: key for key, label in CARBON_BOUNDARY_LABELS.items()
+}
+DEFAULT_CARBON_BOUNDARY = "cradle_to_grave"
+FILE_PERMISSION_DENIED_ERROR_CODE = "FILE_PERMISSION_DENIED"
+FILE_PERMISSION_DENIED_USER_MESSAGE = (
+    "無法讀取匯入的 Excel 檔案，可能是檔案正在 Excel、OneDrive 或其他程式中開啟或鎖定。"
+    "請關閉該檔案、確認 OneDrive 同步完成後再重新執行。"
 )
 ROAD_TRANSPORT_TYPES = {
     "road",
@@ -392,6 +426,7 @@ class ExcelApp:
         self.tmp_dir = os.path.join(self.output_root, "tmp")
         self.spreadsheet_dir = os.path.join(self.output_root, "spreadsheet")
         self.logs_dir = os.path.join(self.base_dir, "logs")
+        self.cache_dir = os.path.join(self.logs_dir, "cache")
         for folder in (
             self.resources_dir,
             self.output_root,
@@ -401,6 +436,7 @@ class ExcelApp:
             self.tmp_dir,
             self.spreadsheet_dir,
             self.logs_dir,
+            self.cache_dir,
         ):
             os.makedirs(folder, exist_ok=True)
 
@@ -419,15 +455,26 @@ class ExcelApp:
             "refresh_settle_sec": COM_REFRESH_SETTLE_SEC,
             "refresh_timeout_sec": COM_REFRESH_TIMEOUT_SEC,
             "refresh_poll_sec": COM_REFRESH_POLL_SEC,
+            "transport_geocode_timeout_sec": TRANSPORT_GEOCODE_TIMEOUT_SEC,
+            "transport_route_timeout_sec": TRANSPORT_ROUTE_TIMEOUT_SEC,
+            "transport_route_retry_count": TRANSPORT_ROUTE_RETRY_COUNT,
+            "transport_route_retry_delay_sec": TRANSPORT_ROUTE_RETRY_DELAY_SEC,
         }
         self.logger = self._build_logger()
         self._warnings = []
         self.current_run_id = ""
+        self.transport_distance_cache_path = os.path.join(self.cache_dir, TRANSPORT_DISTANCE_CACHE_FILENAME)
+        self._transport_distance_cache = None
+        self._transport_distance_cache_dirty = False
+        self._transport_distance_cache_save_warned = False
         self._transport_place_cache = {}
         self._transport_route_cache = {}
         self._transport_endpoint_place_cache = {}
         self._transport_location_mapping = None
         self._transport_mapping_missing_warned = False
+        self.carbon_boundary = DEFAULT_CARBON_BOUNDARY
+        self._calculation_audit_rows = []
+        self._validation_findings = []
 
     def _build_logger(self):
         logger = logging.getLogger("excel_processing")
@@ -479,6 +526,16 @@ class ExcelApp:
     def _elapsed_ms(self, started_at: float) -> int:
         return int((time.time() - started_at) * 1000)
 
+    @staticmethod
+    def _is_permission_denied_error(exc: Exception) -> bool:
+        return isinstance(exc, PermissionError) or getattr(exc, "errno", None) == 13
+
+    def _file_permission_denied_message(self, file_path=None) -> str:
+        target_path = file_path or self.file_path
+        if target_path:
+            return f"{FILE_PERMISSION_DENIED_USER_MESSAGE}\n檔案：{os.path.abspath(target_path)}"
+        return FILE_PERMISSION_DENIED_USER_MESSAGE
+
     def _emit_progress(self, value):
         if not callable(self.progress_callback):
             return
@@ -515,35 +572,6 @@ class ExcelApp:
     def _warn(self, message: str):
         self._warnings.append(message)
         self.logger.warning("[run_id=%s] %s", self.current_run_id or "-", message)
-
-    def _disable_refresh_on_file_open(self, workbook):
-        connection_attr_by_type = {
-            XL_CONNECTION_TYPE_OLEDB: "OLEDBConnection",
-            XL_CONNECTION_TYPE_ODBC: "ODBCConnection",
-        }
-        try:
-            connections = workbook.Connections
-        except Exception as exc:
-            self._warn(f"Workbook connection inspection skipped: {exc}")
-            return
-
-        for conn in connections:
-            conn_name = ""
-            with suppress(Exception):
-                conn_name = str(conn.Name)
-            try:
-                conn_type = int(conn.Type)
-            except Exception as exc:
-                self._warn(f"Connection refresh-on-open skipped: {conn_name or '<unknown>'}: {exc}")
-                continue
-            connection_attr = connection_attr_by_type.get(conn_type)
-            if not connection_attr:
-                continue
-            try:
-                connection_obj = getattr(conn, connection_attr)
-                connection_obj.RefreshOnFileOpen = False
-            except Exception as exc:
-                self._warn(f"Connection refresh-on-open skipped: {conn_name or '<unknown>'}: {exc}")
 
     def _result_ok(self, message: str, artifacts: Dict[str, Any], started_at: float) -> TaskResult:
         return TaskResult(
@@ -612,13 +640,13 @@ class ExcelApp:
                 artifacts = dict(value)
                 return self._result_ok(success_message, artifacts=artifacts, started_at=started_at)
             cancelled = bool(value.get("cancelled"))
-            code = "USER_CANCELLED" if cancelled else "TASK_FAILED"
-            msg = str(value.get("error") or value.get("message") or f"{task_name} 失敗")
+            code = str(value.get("error_code") or ("USER_CANCELLED" if cancelled else "TASK_FAILED"))
+            msg = str(value.get("message") or value.get("error") or f"{task_name} 失敗")
             return TaskResult(
                 ok=False,
                 error_code=code,
                 message=msg,
-                artifacts={"legacy_result": value},
+                artifacts=dict(value),
                 elapsed_ms=self._elapsed_ms(started_at),
                 warnings=list(self._warnings),
             )
@@ -686,27 +714,17 @@ class ExcelApp:
             self._has_status_callback = False
         callback(message)
 
-    @staticmethod
-    def _format_report_number(value) -> str:
-        """Format generated report numbers with exactly four decimals."""
-        if value is None or value == "":
-            return ""
-        try:
-            if pd.isna(value):
-                return ""
-        except (TypeError, ValueError):
-            pass
-        try:
-            return f"{float(value):.4f}"
-        except (TypeError, ValueError):
-            return str(value)
-
     def _sanitize_invalid_external_formulas(self, workbook) -> int:
         """
-        Remove legacy formulas like [1]Sheet! that Excel repairs/removes on open.
-        openpyxl can preserve them, but Excel COM rejects the workbook before repair.
+        Remove workbook artifacts that Excel COM rejects before it can repair them.
+
+        openpyxl can preserve legacy formulas like [1]Raw Material!A1 and
+        formula-like error literals such as =#N/A. Excel may refuse to open
+        those files through COM before the normal repair dialog is available.
         """
         removed_cells = []
+        fixed_error_cells = []
+        blank_formula_cells = []
         for sheet in workbook.worksheets:
             for row in sheet.iter_rows():
                 for cell in row:
@@ -718,6 +736,20 @@ class ExcelApp:
                     ):
                         removed_cells.append(f"{sheet.title}!{cell.coordinate}")
                         cell.value = None
+                    elif isinstance(value, str) and value.strip() == "=":
+                        blank_formula_cells.append(f"{sheet.title}!{cell.coordinate}")
+                        cell.value = None
+                        self._add_validation_finding(
+                            "WARNING",
+                            "BLANK_FORMULA_REMOVED",
+                            "已移除空白公式，避免公式鏈不可追溯。",
+                            sheet=sheet.title,
+                            row=cell.coordinate,
+                            recommendation="確認模板延伸列是否應留空，或應填入完整公式。",
+                        )
+                    elif isinstance(value, str) and value in INVALID_ERROR_FORMULA_VALUES:
+                        fixed_error_cells.append(f"{sheet.title}!{cell.coordinate}")
+                        cell.value = INVALID_ERROR_FORMULA_VALUES[value]
 
         if removed_cells:
             sample = ", ".join(removed_cells[:8])
@@ -727,7 +759,53 @@ class ExcelApp:
                 f"已移除 {len(removed_cells)} 個 Excel 無效外部參照公式，避免結果檔開啟時修復失敗。"
                 f" 位置: {sample}"
             )
-        return len(removed_cells)
+        if fixed_error_cells:
+            sample = ", ".join(fixed_error_cells[:8])
+            if len(fixed_error_cells) > 8:
+                sample += ", ..."
+            self._warn(
+                f"已修正 {len(fixed_error_cells)} 個被誤存為公式的 Excel 錯誤值。"
+                f" 位置: {sample}"
+            )
+        if blank_formula_cells:
+            sample = ", ".join(blank_formula_cells[:8])
+            if len(blank_formula_cells) > 8:
+                sample += ", ..."
+            self._warn(
+                f"已移除 {len(blank_formula_cells)} 個空白公式，避免公式鏈不可追溯。"
+                f" 位置: {sample}"
+            )
+
+        rebuilt_sheet = self._rebuild_sheet_without_styles(workbook, "simapro10.2.0.0")
+        if rebuilt_sheet:
+            self._warn(
+                "已重建 simapro10.2.0.0 工作表並保留儲存格內容，"
+                "移除會造成 Excel COM 開啟失敗的樣式殘留。"
+            )
+
+        return len(removed_cells) + len(fixed_error_cells) + len(blank_formula_cells) + int(rebuilt_sheet)
+
+    def _rebuild_sheet_without_styles(self, workbook, sheet_name: str) -> bool:
+        if sheet_name not in workbook.sheetnames:
+            return False
+
+        source_sheet = workbook[sheet_name]
+        sheet_index = workbook.worksheets.index(source_sheet)
+        sheet_state = source_sheet.sheet_state
+        temp_title = f"__{sheet_name[:20]}_clean"
+        suffix = 1
+        while temp_title in workbook.sheetnames:
+            temp_title = f"__{sheet_name[:18]}_{suffix}_clean"
+            suffix += 1
+
+        clean_sheet = workbook.create_sheet(temp_title, sheet_index)
+        clean_sheet.sheet_state = sheet_state
+        for row in source_sheet.iter_rows(values_only=False):
+            clean_sheet.append([cell.value for cell in row])
+
+        workbook.remove(source_sheet)
+        clean_sheet.title = sheet_name
+        return True
 
     def set_cancel_event(self, cancel_event):
         self.cancel_event = cancel_event
@@ -799,13 +877,24 @@ class ExcelApp:
         self._finish_task_log(run_id, "transform_sheet", result)
         return result
 
-    def process_file(self, file_path=None, selected_stages=None, calculate_distances=True) -> TaskResult:
+    def process_file(
+        self,
+        file_path=None,
+        selected_stages=None,
+        calculate_distances=True,
+        carbon_boundary=None,
+        use_transport_cache=True,
+        force_recalculate_distances=False,
+    ) -> TaskResult:
         run_id, started_at = self._start_task("process_file")
         try:
             raw = self._process_file_impl(
                 file_path=file_path,
                 selected_stages=selected_stages,
                 calculate_distances=calculate_distances,
+                carbon_boundary=carbon_boundary,
+                use_transport_cache=use_transport_cache,
+                force_recalculate_distances=force_recalculate_distances,
             )
             result = self._coerce_task_result(
                 task_name="process_file",
@@ -833,12 +922,20 @@ class ExcelApp:
                 exc=exc,
             )
         except Exception as exc:
-            result = self._result_fail(
-                error_code="PROCESS_EXCEPTION",
-                user_message="資料處理發生未預期錯誤",
-                started_at=started_at,
-                exc=exc,
-            )
+            if self._is_permission_denied_error(exc):
+                result = self._result_fail(
+                    error_code=FILE_PERMISSION_DENIED_ERROR_CODE,
+                    user_message=self._file_permission_denied_message(file_path),
+                    started_at=started_at,
+                    exc=exc,
+                )
+            else:
+                result = self._result_fail(
+                    error_code="PROCESS_EXCEPTION",
+                    user_message="資料處理發生未預期錯誤",
+                    started_at=started_at,
+                    exc=exc,
+                )
         result.artifacts.setdefault("run_id", run_id)
         self._finish_task_log(run_id, "process_file", result)
         return result
@@ -877,7 +974,13 @@ class ExcelApp:
         self._finish_task_log(run_id, "generate_report", result)
         return result
 
-    def process_all(self) -> TaskResult:
+    def process_all(
+        self,
+        carbon_boundary=None,
+        calculate_distances=True,
+        use_transport_cache=True,
+        force_recalculate_distances=False,
+    ) -> TaskResult:
         run_id, started_at = self._start_task("process_all")
         if not self.file_path:
             result = TaskResult(
@@ -902,7 +1005,13 @@ class ExcelApp:
             or transform_result.artifacts.get("merged_file")
             or transform_result.message
         )
-        process_result = self.process_file(file_path=merged_path if isinstance(merged_path, str) else None)
+        process_result = self.process_file(
+            file_path=merged_path if isinstance(merged_path, str) else None,
+            carbon_boundary=carbon_boundary or self.carbon_boundary,
+            calculate_distances=calculate_distances,
+            use_transport_cache=use_transport_cache,
+            force_recalculate_distances=force_recalculate_distances,
+        )
         process_result.elapsed_ms = self._elapsed_ms(started_at)
         process_result.artifacts["run_id"] = run_id
         if process_result.ok:
@@ -967,34 +1076,84 @@ class ExcelApp:
         text = re.sub(r"\s+", " ", text)
         return text.casefold()
 
-    def _get_cached_endpoint_place(self, endpoint_text):
-        return self._transport_endpoint_place_cache.get(
-            self._normalize_transport_lookup_key(endpoint_text)
-        )
+    def _transport_lookup_key_candidates(self, value):
+        text = unicodedata.normalize("NFKC", str(value or "").strip())
+        if not text:
+            return []
 
-    def _cache_endpoint_place(self, endpoint_text, place):
+        candidates = [text]
+        match = re.match(r"^([A-Za-z]{2,5}[A-Za-z0-9]{0,2})(?=\s*[-－–—/])", text)
+        if match:
+            candidates.append(match.group(1))
+
+        normalized = []
+        seen = set()
+        for candidate in candidates:
+            key = self._normalize_transport_lookup_key(candidate)
+            if key and key not in seen:
+                seen.add(key)
+                normalized.append(key)
+        return normalized
+
+    def _get_cached_endpoint_place(self, endpoint_text, use_persistent_cache=True):
         key = self._normalize_transport_lookup_key(endpoint_text)
-        if not key or not isinstance(place, dict):
+        if not key:
             return
-        try:
-            lat = float(place.get("lat"))
-            lon = float(place.get("lon"))
-        except (TypeError, ValueError):
+        if not use_persistent_cache:
             return
-        if not (math.isfinite(lat) and math.isfinite(lon)):
+        cached = self._transport_endpoint_place_cache.get(key)
+        if cached is not None:
+            return dict(cached)
+        cache = self._load_transport_distance_cache()
+        clean_place = self._sanitize_cached_place(cache.get("places", {}).get(key))
+        if clean_place:
+            self._transport_endpoint_place_cache[key] = clean_place
+            return dict(clean_place)
+        return None
+
+    def _cache_endpoint_place(self, endpoint_text, place, persist=True, save_immediately=True):
+        key = self._normalize_transport_lookup_key(endpoint_text)
+        if not key:
             return
-        self._transport_endpoint_place_cache[key] = {
-            "query": str(place.get("query") or endpoint_text or "").strip(),
-            "lat": lat,
-            "lon": lon,
-            "label": str(place.get("label") or endpoint_text or "").strip(),
-            "provider": str(place.get("provider") or "previous_segment"),
-        }
+        clean_place = self._sanitize_cached_place(place)
+        if not clean_place:
+            return
+        if not clean_place["query"]:
+            clean_place["query"] = str(endpoint_text or "").strip()
+        self._transport_endpoint_place_cache[key] = clean_place
+        if persist:
+            cache = self._load_transport_distance_cache()
+            cache.setdefault("places", {})[key] = clean_place
+            self._transport_distance_cache_dirty = True
+            if save_immediately:
+                self._save_transport_distance_cache()
 
     def _is_road_transport_type(self, transport_type):
         normalized = self._normalize_column_name(transport_type)
         normalized = re.sub(r"[\s\-_/,;:]+", " ", normalized).strip()
         return normalized in ROAD_TRANSPORT_TYPES
+
+    def _transport_database_alignment_warning(self, transport_type, database_name):
+        transport_text = self._normalize_column_name(transport_type)
+        database_text = self._normalize_column_name(database_name)
+        if not transport_text or not database_text:
+            return ""
+
+        if "air" in transport_text or "aircraft" in transport_text:
+            if "aircraft" not in database_text and "air" not in database_text:
+                return "Air transport row does not appear to use an aircraft/air database."
+        elif "sea" in transport_text or "ship" in transport_text or "ocean" in transport_text:
+            sea_terms = ("sea", "ship", "bulk carrier", "ocean", "vessel")
+            if not any(term in database_text for term in sea_terms):
+                return "Sea transport row does not appear to use a sea/shipping database."
+        elif self._is_road_transport_type(transport_type):
+            blocked_terms = ("aircraft", "sea", "bulk carrier", "ship", "ocean", "vessel")
+            if any(term in database_text for term in blocked_terms):
+                return "Road transport row appears to use an air/sea database."
+            road_terms = ("lorry", "truck", "road", "freight")
+            if not any(term in database_text for term in road_terms):
+                return "Road transport row database does not clearly identify road freight."
+        return ""
 
     def _resource_candidates(self, filename, *legacy_paths):
         candidates = [os.path.join(self.resources_dir, filename), *legacy_paths]
@@ -1041,7 +1200,7 @@ class ExcelApp:
         if not mapping_path:
             if not self._transport_mapping_missing_warned:
                 self._warn(
-                    f"找不到運輸端點對照表 {TRANSPORT_LOCATION_MAPPING_FILENAME}，Road 端點將直接使用原始文字查詢。"
+                    f"找不到運輸端點對照表 {TRANSPORT_LOCATION_MAPPING_FILENAME}，運輸端點將直接使用原始文字查詢。"
                 )
                 self._transport_mapping_missing_warned = True
             self._transport_location_mapping = {}
@@ -1121,7 +1280,7 @@ class ExcelApp:
                     os.remove(copied_mapping_path)
         except Exception as exc:
             self._warn(
-                f"讀取運輸端點對照表失敗，Road 端點將直接使用原始文字查詢: {mapping_path} | {exc}"
+                f"讀取運輸端點對照表失敗，運輸端點將直接使用原始文字查詢: {mapping_path} | {exc}"
             )
             mapping = {}
             if copied_mapping_path:
@@ -1152,6 +1311,209 @@ class ExcelApp:
             overview["C3"] = factory_info["name"]
             overview["C4"] = factory_info["address"]
 
+    def _disable_refresh_on_file_open(self, workbook):
+        connection_attr_by_type = {
+            XL_CONNECTION_TYPE_OLEDB: "OLEDBConnection",
+            XL_CONNECTION_TYPE_ODBC: "ODBCConnection",
+        }
+        try:
+            connections = workbook.Connections
+        except Exception as exc:
+            self._warn(f"Workbook connection inspection skipped: {exc}")
+            return
+
+        for conn in connections:
+            conn_name = ""
+            with suppress(Exception):
+                conn_name = str(conn.Name)
+            try:
+                conn_type = int(conn.Type)
+            except Exception as exc:
+                self._warn(f"Connection refresh-on-open skipped: {conn_name or '<unknown>'}: {exc}")
+                continue
+            connection_attr = connection_attr_by_type.get(conn_type)
+            if not connection_attr:
+                continue
+            try:
+                connection_obj = getattr(conn, connection_attr)
+                connection_obj.RefreshOnFileOpen = False
+            except Exception as exc:
+                self._warn(f"Connection refresh-on-open skipped: {conn_name or '<unknown>'}: {exc}")
+
+    @staticmethod
+    def _format_report_number(value) -> str:
+        """Format generated report numbers with exactly four decimals."""
+        if value is None or value == "":
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    @staticmethod
+    def _new_transport_distance_cache():
+        return {"version": 1, "places": {}, "routes": {}, "route_errors": {}}
+
+    @staticmethod
+    def _json_safe(value):
+        try:
+            return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        except Exception:
+            return {}
+
+    def _sanitize_cached_place(self, place):
+        if not isinstance(place, dict):
+            return None
+        try:
+            lat = float(place.get("lat"))
+            lon = float(place.get("lon"))
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return None
+        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            return None
+        return {
+            "query": str(place.get("query") or "").strip(),
+            "lat": lat,
+            "lon": lon,
+            "label": str(place.get("label") or place.get("query") or "").strip(),
+            "provider": str(place.get("provider") or "cache").strip(),
+        }
+
+    def _load_transport_distance_cache(self):
+        if self._transport_distance_cache is not None:
+            return self._transport_distance_cache
+
+        cache = self._new_transport_distance_cache()
+        path = self.transport_distance_cache_path
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    for section in ("places", "routes", "route_errors"):
+                        if isinstance(loaded.get(section), dict):
+                            cache[section] = loaded[section]
+            except Exception as exc:
+                self._warn(f"讀取運輸距離快取失敗，將使用空白快取: {path} | {exc}")
+
+        self._transport_distance_cache = cache
+        places = cache.get("places", {})
+        if isinstance(places, dict):
+            for key, place in places.items():
+                clean_place = self._sanitize_cached_place(place)
+                if clean_place:
+                    self._transport_endpoint_place_cache[str(key)] = clean_place
+        return self._transport_distance_cache
+
+    def _save_transport_distance_cache(self):
+        cache = self._transport_distance_cache
+        if not isinstance(cache, dict):
+            return
+        try:
+            os.makedirs(os.path.dirname(self.transport_distance_cache_path), exist_ok=True)
+            tmp_path = f"{self.transport_distance_cache_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(cache, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.transport_distance_cache_path)
+            self._transport_distance_cache_dirty = False
+        except Exception as exc:
+            if not self._transport_distance_cache_save_warned:
+                self._warn(f"寫入運輸距離快取失敗，這次結果仍會繼續處理: {exc}")
+                self._transport_distance_cache_save_warned = True
+
+    def _route_cache_key_to_string(self, route_cache_key):
+        parts = [str(part or "") for part in route_cache_key]
+        return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+
+    def _route_result_to_cache_payload(self, result):
+        return {
+            "mode": str(result.mode or "cached"),
+            "code": str(result.code or "Cached"),
+            "distance_m": float(result.distance_m),
+            "duration_s": float(result.duration_s or 0.0),
+            "metadata": self._json_safe(result.metadata if isinstance(result.metadata, dict) else {}),
+            "cached_at": time.time(),
+        }
+
+    def _cached_payload_to_route_result(self, payload):
+        if not isinstance(payload, dict):
+            return None
+        try:
+            distance_m = float(payload.get("distance_m", payload.get("distance")))
+            duration_s = float(payload.get("duration_s", payload.get("duration") or 0.0))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(distance_m) or distance_m < 0:
+            return None
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return RouteResult(
+            mode=str(payload.get("mode") or "cached"),
+            code=str(payload.get("code") or "Cached"),
+            distance_m=distance_m,
+            duration_s=duration_s,
+            geometry=[],
+            segments=[],
+            metadata=dict(metadata),
+        )
+
+    def _get_persistent_route_result(self, route_cache_key):
+        cache = self._load_transport_distance_cache()
+        routes = cache.setdefault("routes", {})
+        cache_key = self._route_cache_key_to_string(route_cache_key)
+        result = self._cached_payload_to_route_result(routes.get(cache_key))
+        if result is None and cache_key in routes:
+            routes.pop(cache_key, None)
+            self._transport_distance_cache_dirty = True
+        return result
+
+    def _store_persistent_route_result(self, route_cache_key, result):
+        if result is None:
+            return
+        cache = self._load_transport_distance_cache()
+        cache_key = self._route_cache_key_to_string(route_cache_key)
+        cache.setdefault("routes", {})[cache_key] = self._route_result_to_cache_payload(result)
+        cache.setdefault("route_errors", {}).pop(cache_key, None)
+        self._transport_distance_cache_dirty = True
+        self._save_transport_distance_cache()
+
+    def _get_recent_persistent_route_error(self, route_cache_key):
+        cache = self._load_transport_distance_cache()
+        route_errors = cache.setdefault("route_errors", {})
+        cache_key = self._route_cache_key_to_string(route_cache_key)
+        payload = route_errors.get(cache_key)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            cached_at = float(payload.get("cached_at") or 0.0)
+        except (TypeError, ValueError):
+            cached_at = 0.0
+        if time.time() - cached_at <= TRANSPORT_NEGATIVE_CACHE_TTL_SEC:
+            return str(payload.get("message") or "cached route lookup failure")
+        route_errors.pop(cache_key, None)
+        self._transport_distance_cache_dirty = True
+        self._save_transport_distance_cache()
+        return None
+
+    def _store_persistent_route_error(self, route_cache_key, exc):
+        cache = self._load_transport_distance_cache()
+        cache_key = self._route_cache_key_to_string(route_cache_key)
+        cache.setdefault("route_errors", {})[cache_key] = {
+            "message": str(exc),
+            "cached_at": time.time(),
+            "ttl_sec": TRANSPORT_NEGATIVE_CACHE_TTL_SEC,
+        }
+        self._transport_distance_cache_dirty = True
+        self._save_transport_distance_cache()
+
     def _resolve_road_transport_endpoint(self, transport_type, endpoint):
         return self._resolve_road_transport_endpoint_details(transport_type, endpoint)["query"]
 
@@ -1170,22 +1532,39 @@ class ExcelApp:
             return None
         return lat, lon
 
-    def _resolve_road_transport_endpoint_details(self, transport_type, endpoint):
+    def _resolve_road_transport_endpoint_details(
+        self,
+        transport_type,
+        endpoint,
+        prefer_local_mapping=True,
+        use_endpoint_cache=True,
+    ):
         endpoint_text = str(endpoint or "").strip()
-        if not endpoint_text or not self._is_road_transport_type(transport_type):
+        if not endpoint_text:
             return {"query": endpoint_text, "record": None, "lat_lon": None, "place": None}
 
-        mapping = self._load_transport_location_mapping()
-        record = mapping.get(self._normalize_transport_lookup_key(endpoint_text))
-        if record:
-            return {
-                "query": str(record.get("road_location_for_geocode") or endpoint_text).strip(),
-                "record": record,
-                "lat_lon": self._record_lat_lon(record),
-                "place": None,
-            }
+        if prefer_local_mapping:
+            mapping = self._load_transport_location_mapping()
+            record = next(
+                (
+                    mapping.get(candidate_key)
+                    for candidate_key in self._transport_lookup_key_candidates(endpoint_text)
+                    if mapping.get(candidate_key)
+                ),
+                None,
+            )
+            if record:
+                return {
+                    "query": str(record.get("road_location_for_geocode") or endpoint_text).strip(),
+                    "record": record,
+                    "lat_lon": self._record_lat_lon(record),
+                    "place": None,
+                }
 
-        cached_place = self._get_cached_endpoint_place(endpoint_text)
+        cached_place = self._get_cached_endpoint_place(
+            endpoint_text,
+            use_persistent_cache=use_endpoint_cache,
+        )
         if cached_place is not None:
             return {
                 "query": endpoint_text,
@@ -1196,7 +1575,7 @@ class ExcelApp:
 
         return {"query": endpoint_text, "record": None, "lat_lon": None, "place": None}
 
-    def _transport_place_from_endpoint_details(self, endpoint_details, transport_type):
+    def _transport_place_from_endpoint_details(self, endpoint_details, transport_type, use_cache=True):
         cached_place = endpoint_details.get("place")
         if isinstance(cached_place, dict):
             return dict(cached_place)
@@ -1212,24 +1591,44 @@ class ExcelApp:
                 "label": str(record.get("name_en") or record.get("lookup_key") or query),
                 "provider": str(record.get("mapping_sheet") or "mapping"),
             }
-        return geocode_place(
+        place = geocode_place(
             query,
             transport_type=transport_type,
-            cache=self._transport_place_cache,
+            timeout_sec=self.runtime_config["transport_geocode_timeout_sec"],
+            cache=self._transport_place_cache if use_cache else None,
         )
+        self._cache_endpoint_place(query, place, persist=use_cache)
+        return place
 
-    def calculate_transport_distances(self, workbook, transport_tables, sheet_name="Distribution", table_indexes=None):
+    def calculate_transport_distances(
+        self,
+        workbook,
+        transport_tables,
+        sheet_name="Distribution",
+        table_indexes=None,
+        use_transport_cache=True,
+        force_recalculate_distances=False,
+    ):
         if sheet_name not in workbook.sheetnames:
             self._warn(f"找不到 {sheet_name} 工作表，略過距離計算。")
             return transport_tables
 
         sheet = workbook[sheet_name]
         is_raw_material = self._normalize_column_name(sheet_name) == "raw material"
+        is_distribution = self._normalize_column_name(sheet_name) == "distribution"
         pending_jobs = []
         route_jobs = {}
         route_keys = []
         updated_count = 0
         skipped_existing_count = 0
+        stats = {
+            "cache_hits": 0,
+            "external_queries": 0,
+            "failed": 0,
+            "local_mapping_routes": 0,
+            "local_calculations": 0,
+            "negative_cache_hits": 0,
+        }
         table_index_set = set(table_indexes) if table_indexes is not None else None
 
         def column_name_at(columns, column_idx):
@@ -1245,7 +1644,12 @@ class ExcelApp:
                 return 0.0
             return self._coerce_numeric(value)
 
-        def calculate_ton_km_factor(row, weight_col_name, raw_material_col_names=None):
+        def calculate_ton_km_factor(
+            row,
+            weight_col_name,
+            raw_material_col_names=None,
+            allocated_proportion_col_name=None,
+        ):
             if is_raw_material:
                 if raw_material_col_names is None:
                     return None
@@ -1262,6 +1666,11 @@ class ExcelApp:
             weight_kg = self._coerce_numeric(row.get(weight_col_name))
             if weight_kg is None:
                 return None
+            if is_distribution:
+                allocated_proportion = raw_numeric_factor(row, allocated_proportion_col_name)
+                if allocated_proportion is None:
+                    return None
+                return weight_kg / 1000.0 * allocated_proportion
             return weight_kg / 1000.0
 
         for table_idx, (start_idx, sheet_data) in enumerate(transport_tables, start=1):
@@ -1272,8 +1681,12 @@ class ExcelApp:
             _, start_col_name = self._find_table_column(sheet_data.columns, "starting point")
             _, end_col_name = self._find_table_column(sheet_data.columns, "end point")
             _, transport_col_name = self._find_table_column(sheet_data.columns, "type of transport")
+            _, database_col_name = self._find_table_column(sheet_data.columns, "name of database")
             ton_km_col_idx, ton_km_col_name = self._find_table_column(sheet_data.columns, "Ton‧Km")
             _, weight_col_name = self._find_table_column(sheet_data.columns, "Weight (product+package)（Kg）")
+            _, allocated_proportion_col_name = self._find_table_column(sheet_data.columns, "allocated proportion")
+            if distance_col_name is not None:
+                sheet_data[distance_col_name] = sheet_data[distance_col_name].astype(object)
             if ton_km_col_name is not None:
                 sheet_data[ton_km_col_name] = sheet_data[ton_km_col_name].astype(object)
             raw_material_col_names = None
@@ -1313,9 +1726,35 @@ class ExcelApp:
             for row_offset, row in sheet_data.iterrows():
                 self._check_cancel()
                 excel_row = start_idx + 4 + row_offset
+                transport_type_raw = row.get(transport_col_name)
+                database_name_raw = row.get(database_col_name) if database_col_name else ""
+                if not pd.isna(transport_type_raw):
+                    warning = self._transport_database_alignment_warning(
+                        transport_type_raw,
+                        database_name_raw,
+                    )
+                    if warning:
+                        self._add_validation_finding(
+                            "WARNING",
+                            "TRANSPORT_DATABASE_TYPE_MISMATCH",
+                            warning,
+                            stage=sheet_name,
+                            sheet=sheet_name,
+                            row=str(excel_row),
+                            recommendation="確認 type of transport 與 name of database 是否對應；若為多段運輸，請拆分或修正係數。",
+                        )
                 existing_distance_km = self._coerce_numeric(row.get(distance_col_name))
-                if existing_distance_km is not None and not math.isclose(existing_distance_km, 0.0, abs_tol=1e-12):
-                    ton_km_factor = calculate_ton_km_factor(row, weight_col_name, raw_material_col_names)
+                if (
+                    not force_recalculate_distances
+                    and existing_distance_km is not None
+                    and not math.isclose(existing_distance_km, 0.0, abs_tol=1e-12)
+                ):
+                    ton_km_factor = calculate_ton_km_factor(
+                        row,
+                        weight_col_name,
+                        raw_material_col_names,
+                        allocated_proportion_col_name,
+                    )
                     if ton_km_col_name is not None and ton_km_factor is not None:
                         ton_km_value = ton_km_factor * existing_distance_km
                         sheet_data.at[row_offset, ton_km_col_name] = ton_km_value
@@ -1324,7 +1763,6 @@ class ExcelApp:
                     skipped_existing_count += 1
                     continue
 
-                transport_type_raw = row.get(transport_col_name)
                 start_point_raw = row.get(start_col_name)
                 end_point_raw = row.get(end_col_name)
                 if pd.isna(transport_type_raw) or pd.isna(start_point_raw) or pd.isna(end_point_raw):
@@ -1335,8 +1773,18 @@ class ExcelApp:
                 if not transport_type or not start_point or not end_point:
                     continue
 
-                resolved_start = self._resolve_road_transport_endpoint_details(transport_type, start_point)
-                resolved_end = self._resolve_road_transport_endpoint_details(transport_type, end_point)
+                resolved_start = self._resolve_road_transport_endpoint_details(
+                    transport_type,
+                    start_point,
+                    prefer_local_mapping=use_transport_cache,
+                    use_endpoint_cache=use_transport_cache,
+                )
+                resolved_end = self._resolve_road_transport_endpoint_details(
+                    transport_type,
+                    end_point,
+                    prefer_local_mapping=use_transport_cache,
+                    use_endpoint_cache=use_transport_cache,
+                )
                 resolved_start_point = resolved_start["query"]
                 resolved_end_point = resolved_end["query"]
                 route_cache_key = (
@@ -1360,7 +1808,12 @@ class ExcelApp:
                     "resolved_end": resolved_end,
                     "resolved_start_point": resolved_start_point,
                     "resolved_end_point": resolved_end_point,
-                    "ton_km_factor": calculate_ton_km_factor(row, weight_col_name, raw_material_col_names),
+                    "ton_km_factor": calculate_ton_km_factor(
+                        row,
+                        weight_col_name,
+                        raw_material_col_names,
+                        allocated_proportion_col_name,
+                    ),
                 }
                 pending_jobs.append(job)
                 if route_cache_key not in route_jobs:
@@ -1369,9 +1822,27 @@ class ExcelApp:
                 route_jobs[route_cache_key].append(job)
 
         if pending_jobs:
-            self._notify_status(
-                f"{sheet_name} 運輸距離待計算 {len(pending_jobs)} 筆，去重後 {len(route_keys)} 條路線。"
+            existing_message = (
+                "重新計算所有距離"
+                if force_recalculate_distances
+                else f"沿用既有距離 {skipped_existing_count} 筆"
             )
+            self._notify_status(
+                f"{sheet_name} 運輸距離待計算 {len(pending_jobs)} 筆，"
+                f"去重後 {len(route_keys)} 條路線，{existing_message}。"
+            )
+
+        def notify_route_status(completed_count, route_message=""):
+            message = (
+                f"計算 {sheet_name} 運輸距離... {completed_count}/{len(route_keys)} | "
+                f"快取 {stats['cache_hits']} | 外部查詢 {stats['external_queries']} | "
+                f"失敗 {stats['failed']}"
+            )
+            if stats["local_mapping_routes"]:
+                message += f" | 本地對照 {stats['local_mapping_routes']}"
+            if route_message:
+                message += f" | {route_message}"
+            self._notify_status(message)
 
         route_results = {}
         route_errors = {}
@@ -1385,22 +1856,63 @@ class ExcelApp:
             resolved_end = representative_job["resolved_end"]
             resolved_start_point = representative_job["resolved_start_point"]
             resolved_end_point = representative_job["resolved_end_point"]
-            self._notify_status(
-                f"計算 {sheet_name} 唯一路線... {route_idx}/{len(route_keys)} | "
-                f"{transport_type}: {start_point} -> {end_point}"
-            )
+            route_message = f"{transport_type}: {start_point} -> {end_point}"
+            if resolved_start.get("record") is not None or resolved_end.get("record") is not None:
+                stats["local_mapping_routes"] += 1
+            notify_route_status(route_idx - 1, route_message)
             try:
-                result = self._transport_route_cache.get(route_cache_key)
+                result = None
+                if use_transport_cache and not force_recalculate_distances:
+                    result = self._transport_route_cache.get(route_cache_key)
+                    if result is not None:
+                        stats["cache_hits"] += 1
+                    if result is None:
+                        result = self._get_persistent_route_result(route_cache_key)
+                        if result is not None:
+                            self._transport_route_cache[route_cache_key] = result
+                            stats["cache_hits"] += 1
+                    if result is None:
+                        cached_error = self._get_recent_persistent_route_error(route_cache_key)
+                        if cached_error:
+                            stats["cache_hits"] += 1
+                            stats["negative_cache_hits"] += 1
+                            stats["failed"] += 1
+                            route_errors[route_cache_key] = RuntimeError(
+                                f"最近失敗路線快取仍有效，略過外部查詢: {cached_error}"
+                            )
+                            notify_route_status(route_idx, route_message)
+                            continue
+
                 if result is None:
+                    mode = transport_type_to_mode(transport_type)
+                    network_required = (
+                        mode in {"driving", "driving-traffic", "walking", "cycling", "osrm"}
+                        or resolved_start.get("lat_lon") is None
+                        or resolved_end.get("lat_lon") is None
+                    )
+                    if network_required:
+                        stats["external_queries"] += 1
+                    else:
+                        stats["local_calculations"] += 1
+
                     if resolved_start.get("lat_lon") is not None or resolved_end.get("lat_lon") is not None:
-                        from_place = self._transport_place_from_endpoint_details(resolved_start, transport_type)
-                        to_place = self._transport_place_from_endpoint_details(resolved_end, transport_type)
+                        from_place = self._transport_place_from_endpoint_details(
+                            resolved_start,
+                            transport_type,
+                            use_cache=use_transport_cache,
+                        )
+                        to_place = self._transport_place_from_endpoint_details(
+                            resolved_end,
+                            transport_type,
+                            use_cache=use_transport_cache,
+                        )
                         result = compute_transport_distance(
-                            mode=transport_type_to_mode(transport_type),
+                            mode=mode,
                             from_lat=float(from_place["lat"]),
                             from_lon=float(from_place["lon"]),
                             to_lat=float(to_place["lat"]),
                             to_lon=float(to_place["lon"]),
+                            timeout_sec=self.runtime_config["transport_route_timeout_sec"],
                         )
                         result.metadata.update(
                             {
@@ -1416,9 +1928,10 @@ class ExcelApp:
                             transport_type=transport_type,
                             from_query=resolved_start_point,
                             to_query=resolved_end_point,
-                            geocode_cache=self._transport_place_cache,
+                            timeout_sec=self.runtime_config["transport_route_timeout_sec"],
+                            geocode_timeout_sec=self.runtime_config["transport_geocode_timeout_sec"],
+                            geocode_cache=self._transport_place_cache if use_transport_cache else None,
                         )
-                    self._transport_route_cache[route_cache_key] = result
                     result.metadata.update(
                         {
                             "original_from_query": start_point,
@@ -1427,9 +1940,17 @@ class ExcelApp:
                             "resolved_to_query": resolved_end_point,
                         }
                     )
+                    if use_transport_cache:
+                        self._transport_route_cache[route_cache_key] = result
+                        self._store_persistent_route_result(route_cache_key, result)
                 route_results[route_cache_key] = result
+                notify_route_status(route_idx, route_message)
             except Exception as exc:
+                stats["failed"] += 1
                 route_errors[route_cache_key] = exc
+                if use_transport_cache:
+                    self._store_persistent_route_error(route_cache_key, exc)
+                notify_route_status(route_idx, route_message)
 
         for route_cache_key in route_keys:
             self._check_cancel()
@@ -1448,18 +1969,26 @@ class ExcelApp:
             self._cache_endpoint_place(
                 first_job["start_point"],
                 result.metadata.get("from_place"),
+                persist=use_transport_cache,
+                save_immediately=False,
             )
             self._cache_endpoint_place(
                 first_job["resolved_start_point"],
                 result.metadata.get("from_place"),
+                persist=use_transport_cache,
+                save_immediately=False,
             )
             self._cache_endpoint_place(
                 first_job["end_point"],
                 result.metadata.get("to_place"),
+                persist=use_transport_cache,
+                save_immediately=False,
             )
             self._cache_endpoint_place(
                 first_job["resolved_end_point"],
                 result.metadata.get("to_place"),
+                persist=use_transport_cache,
+                save_immediately=False,
             )
 
             distance_km = round(result.distance_m / 1000.0, 4)
@@ -1480,15 +2009,38 @@ class ExcelApp:
 
                 updated_count += 1
 
+        if use_transport_cache and self._transport_distance_cache_dirty:
+            self._save_transport_distance_cache()
+
         self._notify_status(
-            f"{sheet_name} 運輸距離更新完成，共更新 {updated_count} 筆，沿用既有距離 {skipped_existing_count} 筆。"
+            f"{sheet_name} 運輸距離更新完成，共更新 {updated_count} 筆，"
+            f"沿用既有距離 {skipped_existing_count} 筆，快取命中 {stats['cache_hits']} 筆，"
+            f"外部查詢 {stats['external_queries']} 筆，失敗 {stats['failed']} 筆。"
         )
         return transport_tables
 
-    def _normalize_selected_carbon_stages(self, selected_stages=None):
+    @staticmethod
+    def normalize_carbon_boundary(carbon_boundary=None):
+        value = str(carbon_boundary or DEFAULT_CARBON_BOUNDARY).strip()
+        if value in CARBON_BOUNDARY_STAGE_MAP:
+            return value
+        if value in CARBON_BOUNDARY_KEYS_BY_LABEL:
+            return CARBON_BOUNDARY_KEYS_BY_LABEL[value]
+        raise ValueError(
+            "未知的產品碳足跡邊界模式，請選擇「搖籃到大門」或「搖籃到墳墓」。"
+        )
+
+    @staticmethod
+    def stages_for_carbon_boundary(carbon_boundary=None):
+        boundary = ExcelApp.normalize_carbon_boundary(carbon_boundary)
+        return list(CARBON_BOUNDARY_STAGE_MAP[boundary])
+
+    def _normalize_selected_carbon_stages(self, selected_stages=None, carbon_boundary=None):
         valid_stages = [stage for stage, _ in CARBON_STAGE_OPTIONS]
+        if carbon_boundary is not None:
+            return self.stages_for_carbon_boundary(carbon_boundary)
         if selected_stages is None:
-            return valid_stages
+            return self.stages_for_carbon_boundary(self.carbon_boundary)
 
         selected = []
         for stage in selected_stages:
@@ -1500,12 +2052,251 @@ class ExcelApp:
             raise ValueError("請至少勾選一個要計算碳排的階段。")
         return selected
 
-    def _process_file_impl(self, file_path=None, selected_stages=None, calculate_distances=True):
+    def _reset_process_review_artifacts(self, selected_stages, carbon_boundary):
+        self._calculation_audit_rows = []
+        self._validation_findings = []
+        boundary = self.normalize_carbon_boundary(carbon_boundary)
+        label = CARBON_BOUNDARY_LABELS[boundary]
+        self._add_validation_finding(
+            "INFO",
+            "CARBON_BOUNDARY_SELECTED",
+            f"本次產品碳足跡邊界為 {label}。",
+            recommendation="匯出資料須以此邊界判定納入階段與排除階段。",
+        )
+        excluded = [stage for stage, _ in CARBON_STAGE_OPTIONS if stage not in set(selected_stages)]
+        for stage in excluded:
+            self._add_validation_finding(
+                "INFO",
+                "STAGE_EXCLUDED_BY_BOUNDARY",
+                f"{stage} 未納入 {label} 邊界計算。",
+                stage=stage,
+                recommendation="若要供外部查證，請在報告中說明排除原因與邊界定義。",
+            )
+
+    def _add_validation_finding(
+        self,
+        severity,
+        code,
+        message,
+        *,
+        stage="",
+        sheet="",
+        row="",
+        recommendation="",
+    ):
+        self._validation_findings.append(
+            {
+                "severity": severity,
+                "code": code,
+                "message": message,
+                "stage": stage,
+                "sheet": sheet,
+                "row": row,
+                "recommendation": recommendation,
+            }
+        )
+
+    def _add_calculation_audit_row(self, **row):
+        self._calculation_audit_rows.append(row)
+
+    def _replace_workbook_sheet(self, workbook, sheet_name):
+        if sheet_name in workbook.sheetnames:
+            workbook.remove(workbook[sheet_name])
+        return workbook.create_sheet(sheet_name)
+
+    @staticmethod
+    def _excel_safe_value(value):
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (list, tuple, set)):
+            return ", ".join(str(item) for item in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return value
+
+    def _append_dict_rows(self, sheet, headers, rows):
+        sheet.append(headers)
+        for row in rows:
+            sheet.append([self._excel_safe_value(row.get(header, "")) for header in headers])
+
+    def _write_calculation_audit_sheet(self, workbook):
+        headers = [
+            "stage",
+            "source_sheet",
+            "source_row",
+            "activity_name",
+            "name_of_database",
+            "quantity_column",
+            "quantity",
+            "source_unit",
+            "factor_unit",
+            "conversion_factor",
+            "unspecified_factor",
+            "fossil_factor",
+            "biogenic_factor",
+            "land_transformation_factor",
+            "unspecified_kg_co2e",
+            "fossil_kg_co2e",
+            "biogenic_kg_co2e",
+            "land_transformation_kg_co2e",
+            "damage_assessment_formula",
+            "coefficient_formula",
+            "calculation_basis",
+            "status",
+        ]
+        sheet = self._replace_workbook_sheet(workbook, "Calculation_Audit")
+        self._append_dict_rows(sheet, headers, self._calculation_audit_rows)
+
+    def _write_validation_findings_sheet(self, workbook):
+        headers = [
+            "severity",
+            "code",
+            "message",
+            "stage",
+            "sheet",
+            "row",
+            "recommendation",
+        ]
+        sheet = self._replace_workbook_sheet(workbook, "Validation_Findings")
+        self._append_dict_rows(sheet, headers, self._validation_findings)
+
+    def _write_iso14067_checklist_sheet(self, workbook, selected_stages, carbon_boundary):
+        boundary = self.normalize_carbon_boundary(carbon_boundary)
+        boundary_label = CARBON_BOUNDARY_LABELS[boundary]
+        selected_stage_set = set(selected_stages)
+        excluded = [stage for stage, _ in CARBON_STAGE_OPTIONS if stage not in selected_stage_set]
+        rows = [
+            {
+                "item": "ISO 14067 聲明",
+                "status": "需人工確認",
+                "evidence": "本表為合理性檢核，不代表第三方查證或 ISO 14067 認證。",
+                "recommendation": "正式對外聲明前需由授權標準文件與查證單位確認。",
+            },
+            {
+                "item": "產品碳足跡邊界",
+                "status": "已設定",
+                "evidence": boundary_label,
+                "recommendation": "搖籃到大門包含 Raw Material、Manufacturing；搖籃到墳墓包含五階段。",
+            },
+            {
+                "item": "納入階段",
+                "status": "已設定",
+                "evidence": ", ".join(selected_stages),
+                "recommendation": "確認所有納入階段皆有活動數據、係數與計算紀錄。",
+            },
+            {
+                "item": "排除階段",
+                "status": "需人工確認" if excluded else "不適用",
+                "evidence": ", ".join(excluded) if excluded else "無",
+                "recommendation": "若為搖籃到大門，排除 Distribution、Usage、Recycling 應於報告揭露。",
+            },
+            {
+                "item": "功能單位 / 宣告單位",
+                "status": "需人工確認",
+                "evidence": "需對照 overview 與報告模板內容。",
+                "recommendation": "確認產品數量基準、宣告單位與客戶交付格式一致。",
+            },
+            {
+                "item": "資料期間與廠區",
+                "status": "需人工確認",
+                "evidence": "overview / INPUT 來源欄位已寫入處理流程。",
+                "recommendation": "確認 start_date、end_date、factory_site 與活動數據期間一致。",
+            },
+            {
+                "item": "排放係數來源",
+                "status": "需人工確認",
+                "evidence": "simapro10.2.0.0 / name of database 對應。",
+                "recommendation": "確認 database 名稱、版本、地區、單位與係數來源可追溯。",
+            },
+            {
+                "item": "allocation 方法",
+                "status": "需人工確認",
+                "evidence": "需對照活動數據中的 allocated proportion / allocation 欄位與公司分攤方法。",
+                "recommendation": "確認 allocation 方法、分攤基準、比例範圍與每筆分攤計算可追溯；不適用時也應明確標註。",
+            },
+            {
+                "item": "cut-off 準則",
+                "status": "需人工確認",
+                "evidence": "目前無法僅由輸出 workbook 判斷 cut-off 政策。",
+                "recommendation": "確認排除流、排除比例、門檻與理由符合公司/查證要求；未使用 cut-off 時應明確標註。",
+            },
+            {
+                "item": "DQR / 資料品質評分",
+                "status": "需人工確認",
+                "evidence": "需由公司資料品質方法、DQR 分數或 reviewer note 支持。",
+                "recommendation": "確認時間、地域、技術代表性、完整性與可靠性評估方法，並保存人工審查紀錄。",
+            },
+            {
+                "item": "資料缺口與排除流",
+                "status": "需人工確認",
+                "evidence": "Validation_Findings 工作表與人工盤查紀錄。",
+                "recommendation": "所有缺資料、缺係數、單位未定義、排除階段與估算假設都需留存處置理由。",
+            },
+            {
+                "item": "計算過程",
+                "status": "已輸出",
+                "evidence": "Calculation_Audit 工作表。",
+                "recommendation": "逐列檢查 quantity、factor、conversion_factor、component result。",
+            },
+            {
+                "item": "資料品質與異常",
+                "status": "已輸出",
+                "evidence": "Validation_Findings 工作表。",
+                "recommendation": "所有 WARNING / ERROR 應於交付前處理或留存人工確認理由。",
+            },
+        ]
+        sheet = self._replace_workbook_sheet(workbook, "ISO14067_Checklist")
+        self._append_dict_rows(sheet, ["item", "status", "evidence", "recommendation"], rows)
+
+    def _apply_boundary_to_workbook(self, workbook, selected_stages, carbon_boundary):
+        selected_stage_set = set(selected_stages)
+        boundary_label = CARBON_BOUNDARY_LABELS[self.normalize_carbon_boundary(carbon_boundary)]
+        for stage_name, _ in CARBON_STAGE_OPTIONS:
+            if stage_name in selected_stage_set or stage_name not in workbook.sheetnames:
+                continue
+            sheet = workbook[stage_name]
+            sheet["AB2"] = f"Excluded by boundary: {boundary_label}"
+            for cell in ("AC2", "AD2", "AE2", "AF2", "AG2"):
+                sheet[cell] = 0
+
+        if "overview" in workbook.sheetnames:
+            overview = workbook["overview"]
+            terms = [f"'{stage}'!AG2" for stage in selected_stages]
+            overview["H2"] = f"={'+'.join(terms)}" if terms else 0
+
+    def _write_process_review_sheets(self, workbook, selected_stages, carbon_boundary):
+        self._write_calculation_audit_sheet(workbook)
+        self._write_validation_findings_sheet(workbook)
+        self._write_iso14067_checklist_sheet(workbook, selected_stages, carbon_boundary)
+
+    def _process_file_impl(
+        self,
+        file_path=None,
+        selected_stages=None,
+        calculate_distances=True,
+        carbon_boundary=None,
+        use_transport_cache=True,
+        force_recalculate_distances=False,
+    ):
         """數據處理"""
         if file_path is not None:
             self.file_path = file_path
-        selected_stage_list = self._normalize_selected_carbon_stages(selected_stages)
+        active_boundary = self.normalize_carbon_boundary(carbon_boundary or self.carbon_boundary)
+        self.carbon_boundary = active_boundary
+        boundary_was_explicit = carbon_boundary is not None
+        selected_stage_list = self._normalize_selected_carbon_stages(
+            None if boundary_was_explicit else selected_stages,
+            carbon_boundary=active_boundary if boundary_was_explicit or selected_stages is None else None,
+        )
         selected_stage_set = set(selected_stage_list)
+        self._reset_process_review_artifacts(selected_stage_list, active_boundary)
         self.last_error = None
         self.was_cancelled = False
         self._check_cancel()
@@ -1526,20 +2317,26 @@ class ExcelApp:
             for stage_name in selected_stage_list:
                 stage_tables[stage_name] = self.read_multiple_tables(stage_name, self.file_path)
 
+            if calculate_distances and {"Raw Material", "Distribution"} & selected_stage_set:
+                self._notify_status("計算運輸距離：準備路線資料與快取...")
             if calculate_distances and "Raw Material" in selected_stage_set:
-                self._notify_status("更新 Raw Material 運輸距離...")
+                self._notify_status("計算 Raw Material 運輸距離...")
                 stage_tables["Raw Material"] = self.calculate_transport_distances(
                     result_workbook,
                     stage_tables["Raw Material"],
                     sheet_name="Raw Material",
                     table_indexes=[3, 4],
+                    use_transport_cache=use_transport_cache,
+                    force_recalculate_distances=force_recalculate_distances,
                 )
             if calculate_distances and "Distribution" in selected_stage_set:
-                self._notify_status("更新 Distribution 運輸距離...")
+                self._notify_status("計算 Distribution 運輸距離...")
                 stage_tables["Distribution"] = self.calculate_transport_distances(
                     result_workbook,
                     stage_tables["Distribution"],
                     sheet_name="Distribution",
+                    use_transport_cache=use_transport_cache,
+                    force_recalculate_distances=force_recalculate_distances,
                 )
             
             self.update_progress_smooth(10, 40, step=1, delay=0.05) # 階段2：讀取工作表B，處理工作表並計算數值，模擬進度從 10% 到 40%
@@ -1591,12 +2388,17 @@ class ExcelApp:
 
             self._notify_status("每個工作表的加總值寫入指定的單元格...")
             print("每個工作表的加總值寫入指定的單元格...")
-            # 將每個工作表的加總值寫入指定的單元格
+            # 將每個工作表的四項 GWP 加總值寫入指定的單元格
             self._write_report_stage_totals(report_sheet, stage_totals)
             self.update_progress_smooth(70, 95, step=1, delay=0.05) # 階段4：儲存結果，模擬進度從 70% 到 99%
             # 獲取當前的日期和時間，用於生成檔案名稱
             current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
             self._apply_factory_overview_info(result_workbook)
+            self._apply_boundary_to_workbook(
+                result_workbook,
+                selected_stage_list,
+                active_boundary,
+            )
             product_name_suffix = ""
             if "overview" in result_workbook.sheetnames:
                 product_name_suffix = str(result_workbook["overview"]["C17"].value or "").strip()
@@ -1627,6 +2429,11 @@ class ExcelApp:
             self.result_file = os.path.join(self.result_dir, self.result_file)
             self._check_cancel()
             self._sanitize_invalid_external_formulas(result_workbook)
+            self._write_process_review_sheets(
+                result_workbook,
+                selected_stage_list,
+                active_boundary,
+            )
             result_workbook.save(self.result_file)
             with suppress(Exception):
                 result_workbook.close()
@@ -1676,6 +2483,8 @@ class ExcelApp:
                 "result_file": self.result_file,
                 "report_file": self.report_file,
                 "selected_stages": selected_stage_list,
+                "carbon_boundary": active_boundary,
+                "carbon_boundary_label": CARBON_BOUNDARY_LABELS[active_boundary],
             }
         except UserCancelledError as e:
             self.was_cancelled = True
@@ -1683,6 +2492,17 @@ class ExcelApp:
             return {"ok": False, "cancelled": True, "error": str(e)}
 
         except Exception as e:
+            if self._is_permission_denied_error(e):
+                technical = traceback.format_exc()
+                err_msg = self._file_permission_denied_message(self.file_path)
+                self.last_error = err_msg
+                self.last_technical_summary = self.summarize_technical_details(technical)
+                return {
+                    "ok": False,
+                    "error_code": FILE_PERMISSION_DENIED_ERROR_CODE,
+                    "message": err_msg,
+                    "technical_details": technical,
+                }
             err_msg = f"{e}\n{traceback.format_exc()}"
             self.last_error = err_msg
             return {"ok": False, "error": err_msg}
@@ -1781,9 +2601,16 @@ class ExcelApp:
         根據不同表格使用不同的欄位進行計算
         並將數據進行單位換算
         """
-        total_by_column = {col: 0 for col in EMISSION_RESULT_COLUMNS}
-        start_col_idx = column_index_from_string(col_start)
-        damage_col_letter = self._excel_col_letter(start_col_idx + len(EMISSION_RESULT_COLUMNS))
+        calculation_fields = [
+            ("unspecified(kg CO2-eq)", "unspecified(kg CO2-eq)_result"),
+            ("fossil(kg CO2-eq)", "fossil(kg CO2-eq)_result"),
+            ("biogenic(kg CO2-eq)", "biogenic(kg CO2-eq)_result"),
+            ("land transformation (kg CO2-eq)", "land transformation (kg CO2-eq)_result"),
+        ]
+        total_unspecified = 0
+        total_fossil = 0
+        total_biogenic = 0
+        total_land_transformation = 0
         for i, (start_idx, sheet_data) in enumerate(sheet_tables):
             self._check_cancel()
             required_cols = ['name of database']
@@ -1814,6 +2641,37 @@ class ExcelApp:
 
             quantity_col_idx = list(sheet_data.columns).index(quantity_column) + 1
             quantity_col_letter = self._excel_col_letter(quantity_col_idx)
+            start_col_idx = column_index_from_string(col_start)
+            output_columns = {}
+            for offset, (output_name, _) in enumerate(calculation_fields):
+                output_col_idx, _ = self._find_table_column(sheet_data.columns, output_name)
+                if output_col_idx is not None:
+                    output_columns[output_name] = self._excel_col_letter(start_col_idx + offset)
+                else:
+                    output_columns[output_name] = self._excel_col_letter(start_col_idx + offset)
+                    self._warn(f"【{sheet_name} 第 {i+1} 個表格】找不到 {output_name} 欄位，略過該欄寫入。")
+                    self._add_validation_finding(
+                        "WARNING",
+                        "OUTPUT_COLUMN_MISSING",
+                        f"找不到 {output_name} 欄位，該分量不會寫回原表。",
+                        stage=sheet_name,
+                        sheet=sheet_name,
+                        recommendation="確認 PLCI template 是否包含四個碳排分量欄位。",
+                    )
+
+            damage_col_idx, _ = self._find_table_column(sheet_data.columns, "Damage Assessment")
+            damage_col_letter = self._excel_col_letter(start_col_idx + len(calculation_fields))
+            if damage_col_idx is None:
+                self._warn(f"【{sheet_name} 第 {i+1} 個表格】找不到 Damage Assessment 欄位，改寫入 {damage_col_letter} 欄。")
+                self._add_validation_finding(
+                    "WARNING",
+                    "DAMAGE_ASSESSMENT_COLUMN_MISSING",
+                    f"找不到 Damage Assessment 欄位，改寫入 {damage_col_letter} 欄。",
+                    stage=sheet_name,
+                    sheet=sheet_name,
+                    recommendation="確認 template 欄位位置，避免客戶格式欄位偏移。",
+                )
+
             coefficient_col_idx, _ = self._find_table_column(sheet_data.columns, "Coefficient value")
             coefficient_col_letter = (
                 self._excel_col_letter(coefficient_col_idx)
@@ -1822,131 +2680,230 @@ class ExcelApp:
             )
             if coefficient_col_letter is None:
                 self._warn(f"【{sheet_name} 第 {i+1} 個表格】找不到 Coefficient value 欄位，略過係數公式寫入。")
+                self._add_validation_finding(
+                    "WARNING",
+                    "COEFFICIENT_COLUMN_MISSING",
+                    "找不到 Coefficient value 欄位，略過係數公式寫入。",
+                    stage=sheet_name,
+                    sheet=sheet_name,
+                    recommendation="若需交付計算過程，建議保留 Coefficient value 欄位或使用 Calculation_Audit。",
+                )
+
+            merged_df["_conversion_factor"] = 1.0
+            merged_df["_factor_lookup_status"] = "OK"
+            merged_df["_calculation_status"] = "OK"
+            for _, result_col in calculation_fields:
+                merged_df[f"{result_col}_coefficient"] = pd.NA
             
             # 1) 保留原本表格內既有的 result（若有）
-            for emission_col in EMISSION_RESULT_COLUMNS:
-                result_col = f"{emission_col}_result"
-                if result_col in merged_df.columns:
-                    merged_df[result_col + "_manual"] = pd.to_numeric(
-                        merged_df[result_col],
-                        errors="coerce",
-                    )
-                elif emission_col in merged_df.columns:
-                    merged_df[result_col + "_manual"] = pd.to_numeric(
-                        merged_df[emission_col],
-                        errors="coerce",
-                    )
+            for output_name, result_col in calculation_fields:
+                if output_name in merged_df.columns:
+                    merged_df[result_col + "_manual"] = pd.to_numeric(merged_df[output_name], errors="coerce")
+                elif result_col in merged_df.columns:
+                    merged_df[result_col + "_manual"] = pd.to_numeric(merged_df[result_col], errors="coerce")
                 else:
                     merged_df[result_col + "_manual"] = pd.NA
 
             # 2) 初始化計算欄位（先用手動值當預設）
-            for emission_col in EMISSION_RESULT_COLUMNS:
-                result_col = f"{emission_col}_result"
-                merged_df[result_col] = merged_df[result_col + "_manual"]
+            for _, result_col in calculation_fields:
+                merged_df[result_col] = pd.to_numeric(
+                    merged_df[result_col + "_manual"],
+                    errors="coerce",
+                ).astype("float64")
 
             # 判斷工作表和工作表B的單位是否一致
             for idx, row in merged_df.iterrows():
                 self._check_cancel()
-                if pd.notna(row['Unit']) and pd.notna(row['unit']):
-                    if row['Unit'] != row['unit']:
-                        if row['Unit'] in ['g', 'kg', 'ton'] and row['unit'] in ['g', 'kg', 'ton']:
-                            if row['Unit'] == 'g' and row['unit'] == 'kg':
+                source_unit = row.get("Unit")
+                factor_unit = row.get("unit")
+                if pd.notna(source_unit) and pd.notna(factor_unit):
+                    if source_unit != factor_unit:
+                        if source_unit in ['g', 'kg', 'ton'] and factor_unit in ['g', 'kg', 'ton']:
+                            if source_unit == 'g' and factor_unit == 'kg':
                                 conversion_factor = 1 / 1000
-                            elif row['Unit'] == 'g' and row['unit'] == 'ton':
+                            elif source_unit == 'g' and factor_unit == 'ton':
                                 conversion_factor = 1 / 1000 / 1000 
-                            elif row['Unit'] == 'ton' and row['unit'] == 'kg':
+                            elif source_unit == 'ton' and factor_unit == 'kg':
                                 conversion_factor = 1 * 1000
-                            elif row['Unit'] == 'kg' and row['unit'] == 'ton':
+                            elif source_unit == 'kg' and factor_unit == 'ton':
                                 conversion_factor = 1 / 1000
-                            elif row['Unit'] == 'kg' and row['unit'] == 'g':
+                            elif source_unit == 'kg' and factor_unit == 'g':
                                 conversion_factor = 1 * 1000
-                            elif row['Unit'] == 'ton' and row['unit'] == 'g':
+                            elif source_unit == 'ton' and factor_unit == 'g':
                                 conversion_factor = 1 * 1000 * 1000
                             else:
                                 conversion_factor = 1
                         else:
                             conversion_factor = 1
+                            excel_row = start_idx + 4 + idx
+                            merged_df.at[idx, "_calculation_status"] = "WARNING"
+                            self._add_validation_finding(
+                                "WARNING",
+                                "UNIT_CONVERSION_UNCONFIRMED",
+                                f"單位換算未定義，已暫用 1：{source_unit} -> {factor_unit}",
+                                stage=sheet_name,
+                                sheet=sheet_name,
+                                row=str(excel_row),
+                                recommendation="新增明確單位換算規則，或人工確認此列計算是否可接受。",
+                            )
                     else:
                         conversion_factor = 1
                 else:
                     conversion_factor = 1
+                merged_df.at[idx, "_conversion_factor"] = conversion_factor
                 
                 # 檢查數值是否為數字類型，避免類似 TypeError 的錯誤
-                try:
-                    quantity = float(row[quantity_column])
-                except (ValueError, TypeError):
+                quantity = self._coerce_numeric(row[quantity_column])
+                if quantity is None:
+                    excel_row = start_idx + 4 + idx
+                    merged_df.at[idx, "_calculation_status"] = "WARNING"
+                    self._add_validation_finding(
+                        "WARNING",
+                        "QUANTITY_MISSING",
+                        f"數量欄位無法轉成數值：{quantity_column}",
+                        stage=sheet_name,
+                        sheet=sheet_name,
+                        row=str(excel_row),
+                        recommendation="確認活動數據數量欄位是否為數值，否則該列不會重新計算。",
+                    )
                     continue
 
-                # 係數若缺值，就不要覆蓋手動值（維持上面初始化的 manual）
-                for emission_col in EMISSION_RESULT_COLUMNS:
-                    coefficient_value = pd.to_numeric(
-                        row.get(f"{emission_col}_y"),
-                        errors="coerce",
+                # 係數查不到時不要覆蓋手動值（維持上面初始化的 manual）
+                if pd.isna(row.get('單位對照')):
+                    excel_row = start_idx + 4 + idx
+                    merged_df.at[idx, "_factor_lookup_status"] = "MISSING_FACTOR"
+                    merged_df.at[idx, "_calculation_status"] = "WARNING"
+                    self._add_validation_finding(
+                        "WARNING",
+                        "EMISSION_FACTOR_NOT_FOUND",
+                        f"name of database 無法對應 simapro10.2.0.0：{row.get('name of database')}",
+                        stage=sheet_name,
+                        sheet=sheet_name,
+                        row=str(excel_row),
+                        recommendation="確認 database 名稱、版本與單位對照表是否一致；必要時補齊係數來源。",
                     )
-                    if pd.isna(coefficient_value):
-                        continue
-                    merged_df.at[idx, f"{emission_col}_result"] = (
-                        quantity * float(coefficient_value) * conversion_factor
+                    continue
+
+                for output_name, result_col in calculation_fields:
+                    coefficient_source_col = (
+                        f"{output_name}_y"
+                        if f"{output_name}_y" in merged_df.columns
+                        else output_name
                     )
+                    coefficient_value = self._coerce_numeric(row.get(coefficient_source_col))
+                    if coefficient_value is None:
+                        coefficient_value = 0
+                    merged_df.at[idx, f"{result_col}_coefficient"] = coefficient_value
+                    merged_df.at[idx, result_col] = quantity * coefficient_value * conversion_factor
 
             
             # 更新原始的工作表中的相關欄位，並小數點後 10 位無條件捨去
             sheet = workbook[sheet_name]
-            for offset, emission_col in enumerate(EMISSION_RESULT_COLUMNS):
-                result_letter = self._excel_col_letter(start_col_idx + offset)
-                result_col = f"{emission_col}_result"
+            for output_name, result_col in calculation_fields:
+                output_col_letter = output_columns.get(output_name)
+                if output_col_letter is None:
+                    continue
                 for idx, value in enumerate(merged_df[result_col], start=start_idx + 3):
                     if pd.notna(value):
-                        truncated = math.trunc(value * 10**10) / 10**10
-                        sheet[f'{result_letter}{idx + 1}'] = truncated
+                        truncated = math.trunc(float(value) * 10**10) / 10**10
+                        sheet[f'{output_col_letter}{idx + 1}'] = truncated
 
-            # 假設 damage 欄位放在四個 GWP 欄位之後的下一欄
             num_rows = len(merged_df)
             for i in range(num_rows):
                 self._check_cancel()
                 # Excel 的列號從 1 開始，所以 row_num 需要調整
                 row_num = start_idx + 3 + i + 1  
-                first_emission_cell = f"{col_start}{row_num}"
-                last_emission_cell = f"{self._excel_col_letter(start_col_idx + len(EMISSION_RESULT_COLUMNS) - 1)}{row_num}"
+                result_cells = [
+                    f"{output_columns[output_name]}{row_num}"
+                    for output_name, _ in calculation_fields
+                    if output_name in output_columns
+                ]
                 # 將 Damage Assessment 欄位設為公式
                 damage_cell = f'{damage_col_letter}{row_num}'
-                sheet[damage_cell] = f"=SUM({first_emission_cell}:{last_emission_cell})"
+                sheet[damage_cell] = f"={'+'.join(result_cells)}" if result_cells else 0
                 if coefficient_col_letter is not None:
                     quantity_cell = f"{quantity_col_letter}{row_num}"
                     sheet[f"{coefficient_col_letter}{row_num}"] = f'=IFERROR({damage_cell}/{quantity_cell},"")'
+
+                audit_row = merged_df.iloc[i]
+                if pd.isna(audit_row.get("name of database")) and self._coerce_numeric(audit_row.get(quantity_column)) is None:
+                    continue
+                self._add_calculation_audit_row(
+                    stage=sheet_name,
+                    source_sheet=sheet_name,
+                    source_row=row_num,
+                    activity_name=audit_row.get("Name", audit_row.get("name(chinese)", "")),
+                    name_of_database=audit_row.get("name of database", ""),
+                    quantity_column=quantity_column,
+                    quantity=self._coerce_numeric(audit_row.get(quantity_column)),
+                    source_unit=audit_row.get("Unit", ""),
+                    factor_unit=audit_row.get("unit", ""),
+                    conversion_factor=audit_row.get("_conversion_factor", 1),
+                    unspecified_factor=audit_row.get("unspecified(kg CO2-eq)_result_coefficient", ""),
+                    fossil_factor=audit_row.get("fossil(kg CO2-eq)_result_coefficient", ""),
+                    biogenic_factor=audit_row.get("biogenic(kg CO2-eq)_result_coefficient", ""),
+                    land_transformation_factor=audit_row.get("land transformation (kg CO2-eq)_result_coefficient", ""),
+                    unspecified_kg_co2e=audit_row.get("unspecified(kg CO2-eq)_result", ""),
+                    fossil_kg_co2e=audit_row.get("fossil(kg CO2-eq)_result", ""),
+                    biogenic_kg_co2e=audit_row.get("biogenic(kg CO2-eq)_result", ""),
+                    land_transformation_kg_co2e=audit_row.get("land transformation (kg CO2-eq)_result", ""),
+                    damage_assessment_formula=f"={'+'.join(result_cells)}" if result_cells else "",
+                    coefficient_formula=(
+                        f'=IFERROR({damage_cell}/{quantity_col_letter}{row_num},"")'
+                        if coefficient_col_letter is not None
+                        else ""
+                    ),
+                    calculation_basis="component = quantity * emission_factor * conversion_factor",
+                    status=audit_row.get("_calculation_status", "OK"),
+                )
             
             self._notify_status("計算加總值並寫入每個表格的第一行...")
             # 計算加總值並寫入每個表格的第一行，並做小數點後 4 位四捨五入捨去
             table_totals = {
-                emission_col: round(merged_df[f"{emission_col}_result"].sum(), 10)
-                for emission_col in EMISSION_RESULT_COLUMNS
+                output_name: round(merged_df[result_col].sum(), 10)
+                for output_name, result_col in calculation_fields
             }
 
             # 計算加總值並寫入每階段的第一行
-            for emission_col, value in table_totals.items():
-                total_by_column[emission_col] += value
+            unspecified_total = table_totals["unspecified(kg CO2-eq)"]
+            fossil_total = table_totals["fossil(kg CO2-eq)"]
+            biogenic_total = table_totals["biogenic(kg CO2-eq)"]
+            land_transformation_total = table_totals["land transformation (kg CO2-eq)"]
+            total_unspecified += unspecified_total
+            total_fossil += fossil_total
+            total_biogenic += biogenic_total
+            total_land_transformation += land_transformation_total
 
             first_row_idx = start_idx + 1
-            for offset, emission_col in enumerate(EMISSION_RESULT_COLUMNS):
-                result_letter = self._excel_col_letter(start_col_idx + offset)
-                sheet[f'{result_letter}{first_row_idx}'] = table_totals[emission_col]
-            sheet[f'{damage_col_letter}{first_row_idx}'] = round(sum(table_totals.values()), 10)
+            for output_name, _ in calculation_fields:
+                output_col_letter = output_columns.get(output_name)
+                if output_col_letter is not None:
+                    sheet[f'{output_col_letter}{first_row_idx}'] = table_totals[output_name]
+            first_row_damage_cell = f'{damage_col_letter}{first_row_idx}'
+            first_row_result_cells = [
+                f"{output_columns[output_name]}{first_row_idx}"
+                for output_name, _ in calculation_fields
+                if output_name in output_columns
+            ]
+            sheet[first_row_damage_cell] = (
+                f"={'+'.join(first_row_result_cells)}"
+                if first_row_result_cells
+                else 0
+            )
         self._notify_status("寫入所有表格的加總值...")
-        # 在每個工作表的 AC/AD/AE/AF/AG 欄位中寫入所有表格的加總值
-        total_cells = {
-            "AC2": round(total_by_column[UNSPECIFIED_EMISSION_COLUMN], 4),
-            "AD2": round(total_by_column["fossil(kg CO2-eq)"], 4),
-            "AE2": round(total_by_column["biogenic(kg CO2-eq)"], 4),
-            "AF2": round(total_by_column["land transformation (kg CO2-eq)"], 4),
-            "AG2": round(sum(total_by_column.values()), 4),
-        }
-        for cell_ref, value in total_cells.items():
-            sheet[cell_ref] = value
-            sheet[cell_ref].number_format = '0.0000'
+        # 在每個工作表的 AC/AD/AE/AF 欄位中寫入所有表格的加總值
+        sheet[f'AB2'] = None
+        sheet[f'AC2'] = round(total_unspecified, 10)
+        sheet[f'AD2'] = round(total_fossil, 10)
+        sheet[f'AE2'] = round(total_biogenic, 10)
+        sheet[f'AF2'] = round(total_land_transformation, 10)
         # 在每個工作表的 AG 欄位中寫入 AC/AD/AE/AF 欄位的加總值
+        sheet[f'AG2'] = round(total_unspecified + total_fossil + total_biogenic + total_land_transformation, 10)
+        for summary_cell in ("AC2", "AD2", "AE2", "AF2", "AG2"):
+            sheet[summary_cell].number_format = "0.0000"
 
         # 返回每個工作表的加總值
-        return tuple(total_by_column[col] for col in EMISSION_RESULT_COLUMNS)
+        return total_unspecified, total_fossil, total_biogenic, total_land_transformation
     
     def find_insert_positions(self, worksheet):
         """
@@ -2650,7 +3607,13 @@ class ExcelApp:
                     timeout_sec=self.runtime_config["open_timeout_sec"],
                 )
                 self._emit_progress(10)
-                self._disable_refresh_on_file_open(workbook)
+                for conn in workbook.Connections:
+                    with suppress(Exception):
+                        if hasattr(conn, "OLEDBConnection") and hasattr(conn.OLEDBConnection, "RefreshOnFileOpen"):
+                            conn.OLEDBConnection.RefreshOnFileOpen = False
+                    with suppress(Exception):
+                        if hasattr(conn, "OLEDBConnection") and hasattr(conn.OLEDBConnection, "EnableRefresh"):
+                            conn.OLEDBConnection.EnableRefresh = False
 
                 ws = workbook.Worksheets("INPUT")
                 input_range = ws.Range("B1:B3")
@@ -2810,6 +3773,130 @@ class ExcelApp:
             missing_text = "、".join(missing_sheets)
             raise ValueError(f"報告來源檔案不是已處理盤查表單，缺少工作表：{missing_text}")
 
+    def _split_stage_text(self, value):
+        valid_stages = [stage for stage, _ in CARBON_STAGE_OPTIONS]
+        if value is None:
+            return []
+        parts = re.split(r"[,，、;；]+", str(value))
+        selected = []
+        for part in parts:
+            stage = part.strip()
+            if stage in valid_stages and stage not in selected:
+                selected.append(stage)
+        return selected
+
+    def _read_report_boundary_metadata(self, result_file):
+        boundary = DEFAULT_CARBON_BOUNDARY
+        boundary_label = CARBON_BOUNDARY_LABELS[boundary]
+        included_stages = self.stages_for_carbon_boundary(boundary)
+        boundary_total = None
+        workbook = None
+        try:
+            workbook = openpyxl.load_workbook(result_file, read_only=True, data_only=True)
+            if "ISO14067_Checklist" in workbook.sheetnames:
+                sheet = workbook["ISO14067_Checklist"]
+                for row in sheet.iter_rows(min_row=2, values_only=True):
+                    item, _status, evidence, _recommendation = (list(row) + [None, None, None, None])[:4]
+                    if item == "產品碳足跡邊界" and evidence:
+                        with suppress(ValueError):
+                            boundary = self.normalize_carbon_boundary(evidence)
+                            boundary_label = CARBON_BOUNDARY_LABELS[boundary]
+                    elif item == "納入階段" and evidence:
+                        parsed = self._split_stage_text(evidence)
+                        if parsed:
+                            included_stages = parsed
+            else:
+                inferred_stages = []
+                for stage, _ in CARBON_STAGE_OPTIONS:
+                    if stage not in workbook.sheetnames:
+                        continue
+                    marker = workbook[stage]["AB2"].value
+                    if isinstance(marker, str) and marker.startswith("Excluded by boundary:"):
+                        continue
+                    inferred_stages.append(stage)
+                if inferred_stages:
+                    included_stages = inferred_stages
+                if included_stages == self.stages_for_carbon_boundary("cradle_to_gate"):
+                    boundary = "cradle_to_gate"
+                    boundary_label = CARBON_BOUNDARY_LABELS[boundary]
+            if "overview" in workbook.sheetnames:
+                boundary_total = self._coerce_numeric(workbook["overview"]["H2"].value)
+            if boundary_total is None:
+                total = 0
+                found_total = False
+                for stage in included_stages:
+                    if stage not in workbook.sheetnames:
+                        continue
+                    value = self._coerce_numeric(workbook[stage]["AG2"].value)
+                    if value is None:
+                        continue
+                    total += value
+                    found_total = True
+                if found_total:
+                    boundary_total = total
+        except Exception as exc:
+            self._warn(f"無法讀取報告邊界 metadata，改用預設搖籃到墳墓：{exc}")
+            boundary = DEFAULT_CARBON_BOUNDARY
+            boundary_label = CARBON_BOUNDARY_LABELS[boundary]
+            included_stages = self.stages_for_carbon_boundary(boundary)
+        finally:
+            if workbook is not None:
+                with suppress(Exception):
+                    workbook.close()
+
+        valid_stage_set = {stage for stage, _ in CARBON_STAGE_OPTIONS}
+        included_stages = [stage for stage in included_stages if stage in valid_stage_set]
+        if not included_stages:
+            included_stages = self.stages_for_carbon_boundary(boundary)
+        excluded_stages = [stage for stage, _ in CARBON_STAGE_OPTIONS if stage not in set(included_stages)]
+        return {
+            "boundary": boundary,
+            "boundary_label": boundary_label,
+            "included_stages": included_stages,
+            "excluded_stages": excluded_stages,
+            "boundary_total": boundary_total,
+        }
+
+    def _report_boundary_context(self, boundary_metadata):
+        included_stages = boundary_metadata["included_stages"]
+        excluded_stages = boundary_metadata["excluded_stages"]
+        context = {
+            "carbon_boundary": boundary_metadata["boundary_label"],
+            "carbon_boundary_key": boundary_metadata["boundary"],
+            "carbon_boundary_label": boundary_metadata["boundary_label"],
+            "carbon_boundary_type": boundary_metadata["boundary"],
+            "included_stages_text": "、".join(included_stages),
+            "excluded_stages_text": "、".join(excluded_stages) if excluded_stages else "無",
+            "included_lifecycle_stages": "、".join(included_stages),
+            "excluded_lifecycle_stages": "、".join(excluded_stages) if excluded_stages else "無",
+            "boundary_scope_statement": (
+                f"本報告產品碳足跡邊界為{boundary_metadata['boundary_label']}，"
+                f"納入階段：{'、'.join(included_stages)}；"
+                f"排除階段：{('、'.join(excluded_stages) if excluded_stages else '無')}。"
+            ),
+            "iso14067_review_statement": "本報告為 ISO 14067 合理性檢核輔助，不代表第三方查證或 ISO 14067 認證。",
+            "boundary_total": (
+                f"{round(boundary_metadata['boundary_total'], 4)} kg CO2e"
+                if boundary_metadata.get("boundary_total") is not None
+                else ""
+            ),
+            "is_cradle_to_gate": boundary_metadata["boundary"] == "cradle_to_gate",
+            "is_cradle_to_grave": boundary_metadata["boundary"] == "cradle_to_grave",
+            "include_raw_material": "Raw Material" in included_stages,
+            "include_manufacturing": "Manufacturing" in included_stages,
+            "include_distribution": "Distribution" in included_stages,
+            "include_usage": "Usage" in included_stages,
+            "include_recycling": "Recycling" in included_stages,
+        }
+        included_set = set(included_stages)
+        for stage, _label in CARBON_STAGE_OPTIONS:
+            stage_key = re.sub(r'\W+', '_', stage).strip('_')
+            included = stage in included_set
+            context[f"{stage_key}_included_in_boundary"] = included
+            context[f"{stage_key}_boundary_status"] = "納入" if included else "排除"
+            context[f"{stage_key}_excluded_reason"] = "" if included else f"Excluded by boundary: {boundary_metadata['boundary_label']}"
+        return context
+
     def _generate_report_impl(self, template_choice, result_file=None):
         """
         數據處理完後產生完整報告書流程：
@@ -2857,15 +3944,15 @@ class ExcelApp:
                 if cache_ok is False:
                     return False
             except Exception as e:
-                self.last_error = f"更新報告來源公式快取失敗：{e}"
+                messagebox.showerror("錯誤", f"{e}")
                 return  False
 
         self._check_cancel()
         # 依據 template_choice 選擇不同模板
         template_filename = REPORT_TEMPLATE_FILENAMES.get(template_choice)
         if not template_filename:
-            self.last_error = "未知的報告模板選項"
-            return False
+            messagebox.showerror("錯誤", "未知的報告模板選項")
+            return
         template_file = self._get_required_resource_path(
             template_filename,
             "Word 報告模板",
@@ -2886,8 +3973,14 @@ class ExcelApp:
             self.update_progress_smooth(10, 20, step=1, delay=0.02)  # 第二階段完成：20%
 
         # === 2. 定義工作表名稱，讀取盤查表單存放資料至 context 清單 ===
-        sheet_names = ['Raw Material', 'Manufacturing', 'Distribution', 'Usage', 'Recycling']
-        transport_sheets = sheet_names
+        boundary_metadata = self._read_report_boundary_metadata(result_file)
+        sheet_names = boundary_metadata["included_stages"]
+        transport_sheets = [
+            stage
+            for stage in ['Raw Material', 'Manufacturing', 'Distribution']
+            if stage in set(sheet_names)
+        ]
+        boundary_context = self._report_boundary_context(boundary_metadata)
 
         self._notify_status("讀取數據處理後產生的檔案...")
         self._check_cancel()
@@ -2897,6 +3990,7 @@ class ExcelApp:
         common_context = {'today_date': today_date,
                         'year': datetime.today().strftime("%Y"),
                         'month': datetime.today().strftime("%m")}
+        common_context.update(boundary_context)
         if self.update_progress_smooth:
             self.update_progress_smooth(20, 30, step=1, delay=0.02)  # 第三階段完成：30%
         # 建立存放各筆資料的 context 清單
@@ -2910,9 +4004,9 @@ class ExcelApp:
                 'product_name': row['product_name'],
                 'product_module': row['product_module'],
                 'product_size': row['product_size'],
-                'Gross_weight': self._format_report_number(row['product_weight']),
-                'Net_weight': self._format_report_number(row['product_net_weight']),
-                'Power': self._format_report_number(row['product_on_mode_Power']),
+                'Gross_weight': row['product_weight'],
+                'Net_weight': row['product_net_weight'],
+                'Power': row['product_on_mode_Power'],
                 'start_date': row['start_date'].strftime('%Y年%m月%d日'),
                 'end_date': row['end_date'].strftime('%Y年%m月%d日'),
                 # 'warranty': row['warranty'],
@@ -2935,10 +4029,10 @@ class ExcelApp:
                 full_output_path = os.path.join(self.tmp_dir, full_output_name)
                 doc.save(full_output_path)
             except Exception as e:
-                self.last_error = f"生成報告時發生錯誤：{e}"
-                return False
+                messagebox.showerror("錯誤", f"生成報告時發生錯誤：{e}")
+                return
         else:
-            self.last_error = "匯入為空值，未生成 Word 文件"
+            messagebox.showwarning("警告", "匯入為空值，未生成 Word 文件")
             return False
         if self.update_progress_smooth:
             self.update_progress_smooth(40, 50, step=1, delay=0.02)  # 第五階段完成：50%
@@ -3032,12 +4126,19 @@ class ExcelApp:
             group_data.columns = group_data.iloc[0, :]
             group_data = group_data.iloc[1:, :].copy()
 
-            num_cols = [*EMISSION_RESULT_COLUMNS, 'Damage Assessment']
+            num_cols = [
+                'unspecified(kg CO2-eq)',
+                'fossil(kg CO2-eq)',
+                'biogenic(kg CO2-eq)',
+                'land transformation (kg CO2-eq)',
+                'Damage Assessment',
+            ]
+            for c in num_cols:
+                if c not in group_data.columns:
+                    group_data[c] = 0
             # 1) 型別轉換與空值補 0
             for c in num_cols:
                 self._check_cancel()
-                if c not in group_data.columns:
-                    group_data[c] = 0
                 group_data[c] = pd.to_numeric(group_data[c], errors='coerce').fillna(0)
             # 2) 過濾：只保留「至少一個數值欄位非 0」的列
             mask = group_data[num_cols].sum(axis=1) != 0
@@ -3048,30 +4149,22 @@ class ExcelApp:
             # 處理 name of database 欄位，将不同的值合并为一个字符串，使用分号分隔
             grouped_c = group_data.groupby('Name')['name of database'].apply(
                 lambda x: ';'.join(sorted(set(x.dropna())))).reset_index()
-            emission_values = [
-                group_data.groupby('Name')[emission_col].sum().reset_index()
-                for emission_col in EMISSION_RESULT_COLUMNS
-            ]
+            # 處理 unspecified(kg CO2-eq) 欄位，将它们加总
+            unspecified_values = group_data.groupby('Name')['unspecified(kg CO2-eq)'].sum().reset_index()
+            # 處理 fossil(kg CO2-eq) 欄位，将它们加总
+            fossil_values = group_data.groupby('Name')['fossil(kg CO2-eq)'].sum().reset_index()
+            # 處理 biogenic(kg CO2-eq) 欄位，将它们加总
+            biogenic_values = group_data.groupby('Name')['biogenic(kg CO2-eq)'].sum().reset_index()
+            # 處理 land transformation (kg CO2-eq) 欄位，将它们加总
+            land_values = group_data.groupby('Name')['land transformation (kg CO2-eq)'].sum().reset_index()
             # 處理 Damage Assessment 欄位，将它们加总
             summed_values = group_data.groupby('Name')['Damage Assessment'].sum().reset_index()
             
-            # 合并 grouped_c, GWP 分項, summed_values，以 'Name' 为键
-            data_frames = [grouped_c, *emission_values, summed_values]
-            if 'Coefficient value' in group_data.columns:
-                coefficient_values = group_data.groupby('Name')['Coefficient value'].apply(
-                    lambda x: next(
-                        (
-                            value
-                            for value in x
-                            if pd.notna(value) and str(value).strip() != ""
-                        ),
-                        "",
-                    )
-                ).reset_index()
-                data_frames.append(coefficient_values)
-            print(sheet_name, data_frames)
+            # 合并 grouped_c, fossil_values, biogenic_values, land_values, summed_values，以 'Name' 为键
+            data_frames = [grouped_c, unspecified_values, fossil_values, biogenic_values, land_values, summed_values]
             merged_data = reduce(lambda left,right: pd.merge(left, right, on='Name', how='outer'), data_frames)
             merged_data = merged_data.sort_values(by='Damage Assessment', ascending=False)
+            print(f"{sheet_name} group {j + 1}: summarized {len(merged_data)} rows")
             # 依據 'Damage Assessment' 列的數值大小降序排序
             
             # 将每个数据群组的结果添加到字典中
@@ -3119,6 +4212,17 @@ class ExcelApp:
                     errors='coerce',
                 ).fillna(0).sum()
          # 將碳排五階段統整的數值儲存至self.context
+        selected_stage_set = set(sheet_names)
+        for stage_name, _label in CARBON_STAGE_OPTIONS:
+            if stage_name in selected_stage_set:
+                continue
+            stage_key = re.sub(r'\W+', '_', stage_name).strip('_')
+            self.context[f'{stage_key}_unspecified'] = "0.0000"
+            self.context[f'{stage_key}_fossil'] = "0.0000"
+            self.context[f'{stage_key}_biogenic'] = "0.0000"
+            self.context[f'{stage_key}_land'] = "0.0000"
+            self.context[f'{stage_key}_sum'] = "0.0000"
+            self.context[f'{stage_key}_Total_percentage'] = "0%"
         sum_list = [] 
         for sheet in sheet_names:
             self._check_cancel()
@@ -3161,6 +4265,10 @@ class ExcelApp:
             self.context[f'Carbon_percentage_{idx}'] = f"{pct:.2f}%"
             self.context[f'Carbon_stage_{idx}'] = f"{sheet_key}階段"
             self.context[f'Carbon_name_{idx}'] = ";".join(names)
+        for idx in range(len(sorted_sums) + 1, 6):
+            self.context[f'Carbon_percentage_{idx}'] = ""
+            self.context[f'Carbon_stage_{idx}'] = ""
+            self.context[f'Carbon_name_{idx}'] = ""
         self.context['sum_percentage_unspecified'] = (
             f"{round(emission_totals[UNSPECIFIED_EMISSION_COLUMN] / total_damage_assessment * 100, 2)}%"
             if total_damage_assessment else "0%"
@@ -3189,7 +4297,8 @@ class ExcelApp:
             # 假設你已經有了每個工作表的 total_damage_assessment 值
             total_percentage = (
                 all_results[sheet]['all_data']['Damage Assessment'].sum() / total_damage_assessment * 100
-                if total_damage_assessment else 0
+                if total_damage_assessment
+                else 0
             )
             # 將數據添加到DataFrame中
             total_percentage_df = pd.concat([total_percentage_df, pd.DataFrame({'Sheet': [sheet], 'Total_Percentage': [total_percentage]})], ignore_index=True)
@@ -3201,6 +4310,9 @@ class ExcelApp:
             self._check_cancel()
             self.context[f'Sheet_name_{j+1}']       = row['Sheet']
             self.context[f'Total_percentage_{j+1}'] = f"{round(row['Total_Percentage'],2)}%"
+        for idx in range(len(total_percentage_df) + 1, 6):
+            self.context[f'Sheet_name_{idx}'] = ""
+            self.context[f'Total_percentage_{idx}'] = ""
 
     def generate_bar_chart(self, doc, all_results, sheet_names):
         """
@@ -3238,7 +4350,7 @@ class ExcelApp:
         for sheet in all_results:
             self._check_cancel()
             sheet_sum = all_results[sheet]['all_data']['Damage Assessment'].sum()
-            percentage = (sheet_sum / total_damage_assessment) * 100
+            percentage = (sheet_sum / total_damage_assessment) * 100 if total_damage_assessment else 0
             percentages.append(percentage)
             sheet_labels.append(sheet)
         # 繪製 bar_chart_1
@@ -3447,7 +4559,7 @@ class ExcelApp:
             self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width() / 2, yval, self._format_report_number(yval), 
+            plt.text(bar.get_x() + bar.get_width() / 2, yval, self._format_report_number(yval),
                     ha='center', va='bottom')
 
         # 美化與保存
@@ -3884,7 +4996,7 @@ class ExcelApp:
         ).fillna(0)
         elec_data = elec_data.sort_values(by="Damage Assessment", ascending=False)
 
-        # 清空以前的 Electric_* keys（若有的話），避免同一個物件重複產報告時殘留舊值。
+        # 清空以前的 Electric_* keys，避免同一個物件重複產報告時殘留舊值。
         for k in list(self.context):
             self._check_cancel()
             if k.startswith("Electric_"):
@@ -3984,42 +5096,34 @@ class ExcelApp:
         self._check_cancel()
         print("【Process_10】開始將前十大數據匯入 Word 文件")
         
-        top_rows = combined_all_data.head(10).reset_index(drop=True)
-        total_damage = pd.to_numeric(
-            combined_all_data.get("Damage Assessment", pd.Series(dtype=float)),
-            errors="coerce",
-        ).fillna(0).sum()
-
         # 1. 前十大 Name, name_of_database, Damage_Assessment 與 percentage
+        total_damage = combined_all_data["Damage Assessment"].sum() if "Damage Assessment" in combined_all_data.columns else 0
         for j in range(1, 11):
             self._check_cancel()
             idx = j - 1
-            if idx >= len(top_rows):
+            if idx >= len(combined_all_data):
                 self.context[f"Top10_Name_{j}"] = ""
                 self.context[f"Top10_name_of_database_{j}"] = ""
                 self.context[f"Top10_Damage_Assessment_{j}"] = ""
                 self.context[f"Top10_percentage_{j}"] = ""
                 continue
-
-            row = top_rows.iloc[idx]
-            damage_value = pd.to_numeric(row.get("Damage Assessment"), errors="coerce")
-            if pd.isna(damage_value):
-                damage_value = 0
-            self.context[f"Top10_Name_{j}"] = row.get("Name", "")
-            self.context[f"Top10_name_of_database_{j}"] = row.get("name of database", "")
-            self.context[f"Top10_Damage_Assessment_{j}"] = self._format_report_number(damage_value)
-            pct = damage_value / total_damage * 100 if total_damage else 0
-            self.context[f"Top10_percentage_{j}"] = f"{pct:.2f}%" if total_damage else ""
+            row = combined_all_data.iloc[idx]
+            # 名稱
+            self.context[f"Top10_Name_{j}"] = row["Name"]
+            # 對應的 database 字串
+            self.context[f"Top10_name_of_database_{j}"] = row["name of database"]
+            # Damage Assessment 四位小數
+            self.context[f"Top10_Damage_Assessment_{j}"] = f"{row['Damage Assessment']:.4f}"
+            # 百分比：該筆 / 總和 *100，保留兩位小數
+            pct = row["Damage Assessment"] / total_damage * 100 if total_damage else 0
+            self.context[f"Top10_percentage_{j}"] = f"{pct:.2f}%"
 
 
         # 2. 剩餘製程合計與百分比（從第 11 筆開始到最後）
-        remaining_sum = pd.to_numeric(
-            combined_all_data.get("Damage Assessment", pd.Series(dtype=float)).iloc[10:],
-            errors="coerce",
-        ).fillna(0).sum()
+        remaining_sum = combined_all_data["Damage Assessment"].iloc[10:].sum()
         remaining_pct = remaining_sum / total_damage * 100 if total_damage else 0
-        self.context["Remaining_processes_3"]   = self._format_report_number(remaining_sum)
-        self.context["Remaining_percentage_3"] = f"{remaining_pct:.2f}%" if total_damage else ""
+        self.context["Remaining_processes_3"]   = f"{remaining_sum:.4f}"
+        self.context["Remaining_percentage_3"] = f"{remaining_pct:.2f}%"
 
         print("【Process_10】已匯入前十大統計表格數值")
 
@@ -4051,7 +5155,7 @@ class ExcelApp:
         for i, bar in enumerate(bars):
             self._check_cancel()
             yval = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width() / 2, yval, self._format_report_number(yval), ha='center', va='bottom')
+            plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), ha='center', va='bottom')
 
         plt.xticks(rotation=90)
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
@@ -4205,17 +5309,16 @@ class ExcelApp:
         """
         self._check_cancel()
         print("【Process_13】開始生成運輸相關圖表並插入 Word 文件")
-        if Air_all_data.empty or "Damage Assessment" not in Air_all_data.columns:
-            print("No air transport data available.")
-            self.context['Chart_9'] = ""
-            return
-
         # 分析運輸數據
         name_values = Air_all_data['Name'].head(10)
         damage_values = Air_all_data['Damage Assessment'].head(10)
 
         remaining_name = 'Remaining processes'
         remaining_value = Air_all_data['Damage Assessment'][10:].sum()
+
+        if Air_all_data.empty:
+            print("No air transport data available.")
+            return
 
         # 生成長條圖
         name_values = Air_all_data['Name'].head(10).fillna(0)
@@ -4248,7 +5351,7 @@ class ExcelApp:
             self._check_cancel()
             bar.set_label(name_values.iloc[i])
             yval = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width() / 2, yval, self._format_report_number(yval), ha='center', va='bottom')
+            plt.text(bar.get_x() + bar.get_width() / 2, yval, round(yval, 4), ha='center', va='bottom')
 
         # 旋轉x軸標籤，以避免重叠
         plt.xticks(rotation=45)
